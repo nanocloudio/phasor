@@ -1,0 +1,23 @@
+# Phasor project configuration. See ../standards/{ci,tests,
+# test-tracking,fluxor-modules,dependencies}.md.
+
+[project]
+name    = "phasor"
+version = "0.0.1"
+
+# Fluxor supplies the module ABI source and host runtime through the local OCI
+# store. Phasor does not vendor Fluxor and does not publish a sibling runtime.
+[dependencies]
+fluxor = "0.0.1"
+
+[ci]
+targets = ["rp2350", "bcm2712", "wasm"]
+
+[ci.hygiene]
+forbid_inline_tests = ["modules"]
+mode                = "strict"
+
+# This glob is also the CI materialisation guard: a primary-only checkout has
+# no matching script, and the no-vacuous-phase rule fails the gate explicitly.
+[ci.test]
+scripts = ["tests/e2e/*.sh"]

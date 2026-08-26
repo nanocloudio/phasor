@@ -1,0 +1,19 @@
+version          = "0.0.1"
+hardware_targets = ["bcm2712", "wasm"]
+
+# Call frames a router forwarded.
+[[ports]]
+name         = "request_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 512
+
+# The answers: a time observation, or a refusal.
+[[ports]]
+name         = "reply_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 512
+
+[observability]
+exempt = "adapter whose evidence is the completions it emits"

@@ -1,0 +1,18 @@
+version          = "0.0.1"
+hardware_targets = ["rp2350", "bcm2712", "wasm"]
+
+[[ports]]
+name         = "report"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 128
+
+[[ports]]
+name         = "exit"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+[observability]
+exempt = "finite conformance fixture; its report and exit ports are the asserted evidence"

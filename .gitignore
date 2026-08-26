@@ -1,0 +1,13 @@
+# Planning and design history is maintained independently.
+/.context/
+
+# Shadow-tracked behavioural material. See ../standards/test-tracking.md.
+/tests/
+/examples/
+/.git-shadow/
+
+# Generated build and local state.
+/target/
+/.fluxor.lock.lock
+*.local
+.DS_Store

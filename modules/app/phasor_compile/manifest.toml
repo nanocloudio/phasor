@@ -1,0 +1,35 @@
+version          = "0.0.1"
+hardware_targets = ["bcm2712", "wasm"]
+
+# One input stream ending in HUP is one source; the output is the unit image
+# the front end produced, which is content-addressed and safe to carry anywhere.
+[[ports]]
+name         = "source_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 2048
+
+[[ports]]
+name         = "image_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 65536
+
+# Why a compile failed, as numbers: a code, a severity, a span, and the
+# arguments that make it specific. What it reads as is decided at the edge.
+[[ports]]
+name         = "diagnostic"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 64
+
+[[ports]]
+name         = "exit"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+[observability]
+exempt = "stream component whose evidence is the image it emits and its exit status"

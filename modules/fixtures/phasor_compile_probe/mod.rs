@@ -1,0 +1,514 @@
+//! On-graph conformance probe for the whole front end.
+//!
+//! Each bounded step takes one source through scanning, parsing, lowering, and
+//! verification, and checks the unit image that comes out. Nothing reaches the
+//! check unless the verifier admitted it, because the lowering publishes
+//! nothing else.
+
+#![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "the Fluxor ABI source is mounted as one surface and this fixture consumes a subset"
+)]
+
+use core::ffi::c_void;
+
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
+mod abi;
+use abi::SyscallTable;
+
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+
+#[path = "../../common/arena.rs"]
+mod arena;
+#[path = "../../common/bytecode.rs"]
+mod bytecode;
+#[path = "../../common/diagnostic.rs"]
+mod diagnostic;
+#[path = "../../common/digest.rs"]
+mod digest;
+#[path = "../../common/emit.rs"]
+mod emit;
+#[path = "../../common/feature.rs"]
+mod feature;
+#[path = "../../common/lex.rs"]
+mod lex;
+#[path = "../../common/lower.rs"]
+mod lower;
+#[path = "../../common/numeric.rs"]
+mod numeric;
+#[path = "../../common/parse.rs"]
+mod parse;
+#[path = "../../common/softfloat.rs"]
+mod softfloat;
+#[path = "../../common/source.rs"]
+mod source;
+#[path = "../../common/unicode_id.rs"]
+mod unicode_id;
+#[path = "../../common/value.rs"]
+mod value;
+#[path = "../../common/verify.rs"]
+mod verify;
+
+use arena::{Arena, Node, NodeKind};
+use bytecode::{
+    decode, Constant, ConstantKind, ExceptionRegion, ExportRecord, Function, ImportRecord, Opcode,
+    Unit,
+};
+use diagnostic::code;
+use emit::Patch;
+use lex::Lexer;
+use lower::{
+    lower_expression, Binding as LexicalBinding, Pending as PendingFunction, Scope,
+    Storage as LowerStorage,
+};
+use parse::Parser;
+use source::{Limits, LineStart, LineTable};
+
+const CASE_COUNT: u16 = 26;
+const FUEL: u32 = 200_000;
+
+const NODE_CAPACITY: usize = 128;
+const LIST_CAPACITY: usize = 128;
+const NUMBER_CAPACITY: usize = 32;
+const SCRATCH_CAPACITY: usize = 64;
+const LINE_CAPACITY: usize = 16;
+const CODE_CAPACITY: usize = 512;
+const IMAGE_CAPACITY: usize = 2048;
+const CONSTANT_CAPACITY: usize = 32;
+const DATA_CAPACITY: usize = 512;
+const POINT_CAPACITY: usize = 32;
+const PATCH_CAPACITY: usize = 32;
+const LABEL_CAPACITY: usize = 32;
+const STATE_CAPACITY: usize = 512;
+
+/// Every buffer the front end needs, owned by the module.
+const UNIT_CODE_CAPACITY: usize = 8192;
+const UNIT_POINT_CAPACITY: usize = 256;
+const FUNCTION_CAPACITY: usize = 64;
+const EXCEPTION_CAPACITY: usize = 64;
+const SCOPE_CAPACITY: usize = 128;
+const LEXICAL_CAPACITY: usize = 256;
+const PENDING_CAPACITY: usize = 64;
+const IMPORT_CAPACITY: usize = 32;
+const EXPORT_CAPACITY: usize = 32;
+struct Storage {
+    nodes: [Node; NODE_CAPACITY],
+    lists: [u32; LIST_CAPACITY],
+    numbers: [f64; NUMBER_CAPACITY],
+    scratch: [u32; SCRATCH_CAPACITY],
+    starts: [LineStart; LINE_CAPACITY],
+    code: [u8; CODE_CAPACITY],
+    image: [u8; IMAGE_CAPACITY],
+    constants: [Constant; CONSTANT_CAPACITY],
+    constant_data: [u8; DATA_CAPACITY],
+    safe_points: [u32; POINT_CAPACITY],
+    patches: [Patch; PATCH_CAPACITY],
+    labels: [u32; LABEL_CAPACITY],
+    state: [i32; STATE_CAPACITY],
+    unit_code: [u8; UNIT_CODE_CAPACITY],
+    unit_safe_points: [u32; UNIT_POINT_CAPACITY],
+    functions: [Function; FUNCTION_CAPACITY],
+    exceptions: [ExceptionRegion; EXCEPTION_CAPACITY],
+    scopes: [Scope; SCOPE_CAPACITY],
+    lexical: [LexicalBinding; LEXICAL_CAPACITY],
+    pending: [PendingFunction; PENDING_CAPACITY],
+    imports: [ImportRecord; IMPORT_CAPACITY],
+    exports: [ExportRecord; EXPORT_CAPACITY],
+}
+
+/// What one compilation produced.
+#[derive(Clone, Copy)]
+struct Outcome {
+    length: usize,
+    diagnostic: u16,
+}
+
+/// Compile one source all the way to a verified image.
+fn compile(storage: &mut Storage, source: &[u8]) -> Outcome {
+    let table = LineTable::new(&mut storage.starts);
+    let Ok(lexer) = Lexer::new(source, Limits::CEILING, table, FUEL) else {
+        return Outcome {
+            length: 0,
+            diagnostic: code::SOURCE_TOO_LARGE,
+        };
+    };
+    let syntax = Arena::new(&mut storage.nodes, &mut storage.lists, &mut storage.numbers);
+    let mut parser = Parser::new(lexer, syntax, &mut storage.scratch, Limits::CEILING);
+    let root = match parser.parse_unit() {
+        Ok(root) => root,
+        Err(diagnostic) => {
+            return Outcome {
+                length: 0,
+                diagnostic: diagnostic.code(),
+            }
+        }
+    };
+
+    let mut lowering = LowerStorage {
+        code: &mut storage.code,
+        image: &mut storage.image,
+        constants: &mut storage.constants,
+        constant_data: &mut storage.constant_data,
+        safe_points: &mut storage.safe_points,
+        patches: &mut storage.patches,
+        labels: &mut storage.labels,
+        verifier_state: &mut storage.state,
+        unit_code: &mut storage.unit_code,
+        unit_safe_points: &mut storage.unit_safe_points,
+        functions: &mut storage.functions,
+        exceptions: &mut storage.exceptions,
+        scopes: &mut storage.scopes,
+        bindings: &mut storage.lexical,
+        pending: &mut storage.pending,
+        imports: &mut storage.imports,
+        exports: &mut storage.exports,
+    };
+    match lower_expression(source, parser.arena(), root, &mut lowering) {
+        Ok(compiled) => Outcome {
+            length: compiled.length,
+            diagnostic: 0,
+        },
+        Err(diagnostic) => Outcome {
+            length: 0,
+            diagnostic: diagnostic.code(),
+        },
+    }
+}
+
+/// Compile and hand the verified image to `check`.
+fn compiled(storage: &mut Storage, source: &[u8], check: impl Fn(&Unit<'_>) -> bool) -> bool {
+    let outcome = compile(storage, source);
+    if outcome.diagnostic != 0 {
+        return false;
+    }
+    let Some(bytes) = storage.image.get(..outcome.length) else {
+        return false;
+    };
+    match Unit::parse(bytes) {
+        Ok(unit) => check(&unit),
+        Err(_) => false,
+    }
+}
+
+/// The opcodes of the entry function, up to `out.len()`.
+fn opcodes(unit: &Unit<'_>, out: &mut [Opcode]) -> usize {
+    let Some(function) = unit.function(0) else {
+        return 0;
+    };
+    let Some(code) = unit.code(&function) else {
+        return 0;
+    };
+    let mut offset = 0u32;
+    let mut count = 0usize;
+    while (offset as usize) < code.len() && count < out.len() {
+        let Ok(instruction) = decode(code, offset) else {
+            return count;
+        };
+        out[count] = instruction.opcode;
+        count += 1;
+        offset += instruction.length;
+    }
+    count
+}
+
+fn opcodes_are(unit: &Unit<'_>, expected: &[Opcode]) -> bool {
+    let mut buffer = [Opcode::Return; 32];
+    let count = opcodes(unit, &mut buffer);
+    buffer.get(..count) == Some(expected)
+}
+
+#[allow(
+    clippy::match_same_arms,
+    reason = "each case is an independent assertion and merging arms would hide which one failed"
+)]
+fn run_case(storage: &mut Storage, case: u16) -> bool {
+    match case {
+        0 => compiled(storage, b"1 + 2", |unit| {
+            opcodes_are(
+                unit,
+                &[
+                    Opcode::LdaSmi,
+                    Opcode::Star,
+                    Opcode::LdaSmi,
+                    Opcode::Add,
+                    Opcode::Return,
+                ],
+            )
+        }),
+        1 => compiled(storage, b"-1", |unit| {
+            opcodes_are(unit, &[Opcode::LdaSmi, Opcode::Negate, Opcode::Return])
+        }),
+        2 => compiled(storage, b"1 ? 2 : 3", |unit| {
+            opcodes_are(
+                unit,
+                &[
+                    Opcode::LdaSmi,
+                    Opcode::JumpIfToBooleanFalse,
+                    Opcode::LdaSmi,
+                    Opcode::Jump,
+                    Opcode::LdaSmi,
+                    Opcode::Return,
+                ],
+            )
+        }),
+        3 => compiled(storage, b"a && b", |unit| {
+            opcodes_are(
+                unit,
+                &[
+                    Opcode::LdaGlobal,
+                    Opcode::JumpIfToBooleanFalse,
+                    Opcode::LdaGlobal,
+                    Opcode::Return,
+                ],
+            )
+        }),
+        4 => compiled(storage, b"a ?? b", |unit| {
+            opcodes_are(
+                unit,
+                &[
+                    Opcode::LdaGlobal,
+                    Opcode::JumpIfNotNullish,
+                    Opcode::LdaGlobal,
+                    Opcode::Return,
+                ],
+            )
+        }),
+        5 => compiled(storage, b"a.b", |unit| {
+            opcodes_are(
+                unit,
+                &[
+                    Opcode::LdaGlobal,
+                    Opcode::Star,
+                    Opcode::GetNamedProperty,
+                    Opcode::Return,
+                ],
+            )
+        }),
+        6 => compiled(storage, b"a = 1", |unit| {
+            opcodes_are(unit, &[Opcode::LdaSmi, Opcode::StaGlobal, Opcode::Return])
+        }),
+
+        // Constructs that must reach a verified image.
+        7 => compiled(storage, b"a[b] = c", |unit| unit.header().code_length > 0),
+        8 => compiled(storage, b"a += 1", |unit| unit.header().code_length > 0),
+        9 => compiled(storage, b"a ||= b", |unit| unit.header().code_length > 0),
+        10 => compiled(storage, b"x++", |unit| unit.header().code_length > 0),
+        11 => compiled(storage, b"[1, 2, , 3]", |unit| {
+            unit.header().code_length > 0
+        }),
+        12 => compiled(storage, b"({a: 1, [b]: 2, c})", |unit| {
+            unit.header().code_length > 0
+        }),
+        13 => compiled(storage, b"`a${b}c`", |unit| unit.header().code_length > 0),
+        14 => compiled(storage, b"f(1, 2)", |unit| unit.header().code_length > 0),
+        15 => compiled(storage, b"new A(1).b", |unit| unit.header().code_length > 0),
+        16 => compiled(storage, b"a?.b", |unit| unit.header().code_length > 0),
+        17 => compiled(storage, b"delete a.b", |unit| unit.header().code_length > 0),
+
+        // Constants: interned once, and carrying the right values.
+        18 => compiled(storage, b"a + a + a", |unit| {
+            unit.header().constant_count == 1
+        }),
+        19 => compiled(storage, b"1.5", |unit| match unit.constant(0) {
+            Some(constant) => constant.value().to_bits() == 1.5f64.to_bits(),
+            None => false,
+        }),
+        20 => compiled(storage, b"'ab'", |unit| {
+            let Some(constant) = unit.constant(0) else {
+                return false;
+            };
+            let mut units = [0u16; 8];
+            unit.constant_units(&constant, &mut units) == Some(2)
+                && units[0] == u16::from(b'a')
+                && units[1] == u16::from(b'b')
+        }),
+
+        // The same source compiles to the same bytes, so identity is content.
+        21 => {
+            let first = compile(storage, b"f(1) + `x${y}`");
+            let mut digest_first = digest::Digest([0; 32]);
+            if first.diagnostic == 0 {
+                if let Some(bytes) = storage.image.get(..first.length) {
+                    digest_first = digest::digest(bytes);
+                }
+            }
+            let second = compile(storage, b"f(1) + `x${y}`");
+            let mut digest_second = digest::Digest([1; 32]);
+            if second.diagnostic == 0 {
+                if let Some(bytes) = storage.image.get(..second.length) {
+                    digest_second = digest::digest(bytes);
+                }
+            }
+            first.diagnostic == 0
+                && second.diagnostic == 0
+                && first.length == second.length
+                && digest_first == digest_second
+        }
+        // A BigInt literal carries its digits and the radix they were written
+        // in, and becomes an exact integer when the image runs.
+        22 => compiled(storage, b"1n", |unit| {
+            unit.constant(0)
+                .is_some_and(|constant| matches!(constant.kind, ConstantKind::BigInt))
+        }),
+        // A spread walks whatever its operand iterates, so it compiles.
+        23 => compiled(storage, b"[...a]", |unit| unit.header().code_length > 0),
+        24 => compiled(storage, b"f(...a)", |unit| unit.header().code_length > 0),
+        // Object spread is admitted: the runtime copies the properties.
+        25 => compiled(storage, b"({...a})", |unit| unit.header().code_length > 0),
+
+        _ => true,
+    }
+}
+
+#[repr(C)]
+struct State {
+    syscalls: *const SyscallTable,
+    report_out: i32,
+    exit_out: i32,
+    storage: Storage,
+    case: u16,
+    failures: u16,
+    /// The first case that failed, which is what a report names.
+    first_failure: u16,
+    phase: u8,
+}
+
+#[no_mangle]
+#[link_section = ".text.module_state_size"]
+pub extern "C" fn module_state_size() -> u32 {
+    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
+}
+
+#[no_mangle]
+#[link_section = ".text.module_init"]
+pub extern "C" fn module_init(_syscalls: *const c_void) {}
+
+#[no_mangle]
+#[link_section = ".text.module_new"]
+pub extern "C" fn module_new(
+    _in_chan: i32,
+    out_chan: i32,
+    _ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
+) -> i32 {
+    if state.is_null() || syscalls.is_null() {
+        return -1;
+    }
+    if state_size < core::mem::size_of::<State>() {
+        return -2;
+    }
+    unsafe {
+        let table = syscalls.cast::<SyscallTable>();
+        let state = state.cast::<State>();
+        core::ptr::addr_of_mut!((*state).syscalls).write(table);
+        core::ptr::addr_of_mut!((*state).report_out).write(out_chan);
+        core::ptr::addr_of_mut!((*state).exit_out).write(dev_channel_port(&*table, 1, 1));
+        core::ptr::addr_of_mut!((*state).case).write(0);
+        core::ptr::addr_of_mut!((*state).failures).write(0);
+        core::ptr::addr_of_mut!((*state).first_failure).write(u16::MAX);
+        core::ptr::addr_of_mut!((*state).phase).write(0);
+        let storage = core::ptr::addr_of_mut!((*state).storage);
+        core::ptr::write_bytes(storage.cast::<u8>(), 0, core::mem::size_of::<Storage>());
+    }
+    0
+}
+
+#[no_mangle]
+#[link_section = ".text.module_step"]
+pub extern "C" fn module_step(state: *mut u8) -> i32 {
+    if state.is_null() {
+        return -1;
+    }
+    let state = unsafe { &mut *state.cast::<State>() };
+    if state.syscalls.is_null() {
+        return -2;
+    }
+    let syscalls = unsafe { &*state.syscalls };
+
+    if state.phase == 2 {
+        return 1;
+    }
+    if state.case < CASE_COUNT {
+        let case = state.case;
+        if !run_case(&mut state.storage, case) {
+            state.failures = state.failures.saturating_add(1);
+            if state.first_failure == u16::MAX {
+                state.first_failure = case;
+            }
+        }
+        state.case = state.case.saturating_add(1);
+        return 0;
+    }
+
+    if state.phase == 0 {
+        // A failure names the first case that failed, so a report is enough
+        // to find it without instrumenting the module again.
+        let mut buffer = [0u8; 64];
+        let report: &[u8] = if state.failures == 0 {
+            b"phasor-compile-probe: 26 passed\n"
+        } else {
+            let prefix = b"phasor-compile-probe: failed at ";
+            let mut length = 0usize;
+            while length < prefix.len() {
+                buffer[length] = prefix[length];
+                length += 1;
+            }
+            let mut digits = [0u8; 5];
+            let mut count = 0usize;
+            let mut value = state.first_failure;
+            loop {
+                digits[count] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+                count += 1;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            while count > 0 {
+                count -= 1;
+                buffer[length] = digits[count];
+                length += 1;
+            }
+            buffer[length] = b'\n';
+            length += 1;
+            buffer.get(..length).unwrap_or(&[])
+        };
+        // A graph that gives the probe no report port still runs it; the
+        // outcome then shows in the module's own completion status.
+        if state.report_out >= 0 {
+            let written = unsafe {
+                (syscalls.channel_write)(state.report_out, report.as_ptr(), report.len())
+            };
+            if written != i32::try_from(report.len()).unwrap_or(i32::MAX) {
+                return 0;
+            }
+        }
+        state.phase = 1;
+    }
+
+    if state.exit_out >= 0 {
+        let code = i32::from(state.failures != 0).to_le_bytes();
+        let written =
+            unsafe { (syscalls.channel_write)(state.exit_out, code.as_ptr(), code.len()) };
+        if written != i32::try_from(code.len()).unwrap_or(i32::MAX) {
+            return 0;
+        }
+    }
+    state.phase = 2;
+    // Completing is the pass signal for a graph with no port to report on; a
+    // failure is a module error, which the kernel reports either way.
+    if state.failures == 0 {
+        1
+    } else {
+        -3
+    }
+}
+
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");

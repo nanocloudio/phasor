@@ -1,0 +1,35 @@
+version          = "0.0.1"
+hardware_targets = ["bcm2712", "wasm"]
+
+# Call frames from an isolate.
+[[ports]]
+name         = "call_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 512
+
+# Completion frames from an adapter, answering what this router forwarded.
+[[ports]]
+name         = "reply_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 512
+
+# Completion frames back to the isolate.
+[[ports]]
+name         = "completion_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 512
+
+# Call frames on to the adapter that serves the binding.
+[[ports]]
+name         = "request_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 512
+
+[observability]
+exempt = "protocol component whose evidence is the completions it emits and the calls it refuses"

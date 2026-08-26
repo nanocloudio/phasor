@@ -1,0 +1,27 @@
+version = "0.0.1"
+
+# The oracle stages a whole case and a machine in module state, so it declares
+# only the targets with room for them.
+hardware_targets = ["bcm2712", "wasm"]
+
+[[ports]]
+name         = "cases_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 65536
+
+[[ports]]
+name         = "report"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+[[ports]]
+name         = "exit"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+[observability]
+exempt = "conformance fixture; its verdict stream and exit port are the recorded evidence"

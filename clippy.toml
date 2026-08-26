@@ -1,0 +1,8 @@
+# Phasor's production sources are PIC module sources compiled directly rather
+# than through a root Cargo workspace.
+msrv = "1.81"
+
+disallowed-macros = [
+    { path = "std::println", reason = "production modules are no_std and emit through Fluxor observability" },
+    { path = "std::eprintln", reason = "production modules are no_std and emit through Fluxor observability" },
+]

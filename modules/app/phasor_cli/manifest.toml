@@ -1,0 +1,50 @@
+version          = "0.0.1"
+hardware_targets = ["bcm2712", "wasm"]
+
+# What a phase produced: the text of a result, passed through as it is.
+[[ports]]
+name         = "result_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 1024
+
+# Diagnostic frames from a compiler, a linker, or an isolate.
+[[ports]]
+name         = "diagnostic_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 512
+
+# Why a run produced no value: a termination or a rejection, from the isolate.
+# A port of its own rather than a second writer on the first: a port has one
+# writer, and which phase said something is worth keeping.
+[[ports]]
+name         = "runtime_in"
+index        = 2
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 512
+
+[[ports]]
+name         = "stdout"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 1024
+
+[[ports]]
+name         = "stderr"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 1024
+
+[[ports]]
+name         = "exit"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+[observability]
+exempt = "edge component whose evidence is the text it writes and its exit status"

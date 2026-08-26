@@ -1,0 +1,53 @@
+version          = "0.0.1"
+hardware_targets = ["bcm2712", "wasm"]
+
+# One input stream ending in HUP is one unit image, wherever it was compiled.
+# The buffer holds a whole image: a payload larger than one buffer stalls the
+# writer against a reader that is only stepped on events, and the pair hangs.
+[[ports]]
+name         = "image_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 65536
+
+# Completion frames answering the calls this isolate made.
+[[ports]]
+name         = "completion_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 512
+
+[[ports]]
+name         = "result_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 256
+
+# Call frames the program produced: a binding index, a correlation identifier,
+# a trace context, and the digest of the payload. No address, no credential.
+[[ports]]
+name         = "call_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 512
+
+# Why a run produced no value: a termination, a rejection, or an image that
+# could not be admitted. Numbers, not words.
+[[ports]]
+name         = "diagnostic"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 64
+
+[[ports]]
+name         = "exit"
+index        = 3
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+[observability]
+exempt = "stream component whose evidence is the result it emits and its exit status"
