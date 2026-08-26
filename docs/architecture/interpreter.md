@@ -39,11 +39,14 @@ accumulator, and a fuel budget, all over caller-provided storage. Execution is a
 loop over verified instructions, so no instruction re-checks what the verifier
 proved: an operand index is used directly.
 
-Every operation the language defines as calling something is performed by
-pushing a frame and continuing the same loop. That covers an accessor, a
-`valueOf` reached through `ToPrimitive`, and a native method. There is no host
-recursion for a JavaScript call, so a deep call chain is bounded by the admitted
-frame count rather than by the machine's own stack.
+A call written in bytecode pushes a frame and continues the same loop, so a
+deep JavaScript call chain is bounded by the admitted frame count rather than
+by the machine's own stack. A call a *native* makes — an accessor, a sort
+comparator, a `valueOf` reached through `ToPrimitive`, a promise reaction —
+nests a bounded inner loop instead: it still pushes ordinary frames, spends
+the same fuel, and charges what it burns against the outer slice, and how many
+such loops one host stack may nest is itself a declared bound, so nesting ends
+as `StackOverflow` rather than wherever the platform's stack happens to.
 
 Fuel is spent per instruction. Exhausting it stops execution with a termination
 the program cannot catch, as do a full frame stack, a full register file, and an

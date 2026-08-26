@@ -180,15 +180,37 @@ pub fn write(heap: &mut Heap<'_>, value: &Number) -> Result<Handle, BigIntError>
     Ok(handle)
 }
 
-/// The value a digit sequence in `radix` denotes.
-pub fn from_digits(digits: &[u8], radix: u32, negative: bool) -> Result<Number, BigIntError> {
-    if !(2..=36).contains(&radix) {
-        return Err(BigIntError::Malformed);
+/// A numeral built one digit at a time, for a reader that does not hold the
+/// text contiguously.
+///
+/// Taking digits as they are read is what keeps a numeral exact: there is no
+/// buffer to fill, so the limb bound is the only limit, and a numeral past it
+/// is `TooLarge` rather than a shorter number that looks like an answer.
+#[derive(Clone, Copy)]
+pub struct Accumulator {
+    value: Number,
+    radix: u32,
+    digits: usize,
+}
+
+impl Accumulator {
+    /// A numeral in `radix`, with no digits yet.
+    pub const fn new(radix: u32) -> Self {
+        Self {
+            value: Number::ZERO,
+            radix,
+            digits: 0,
+        }
     }
-    let mut value = Number::ZERO;
-    for &byte in digits {
+
+    /// Take one digit. A separator is skipped and counts as no digit; a
+    /// character the radix does not admit is `Malformed`.
+    pub fn push(&mut self, byte: u8) -> Result<(), BigIntError> {
+        if !(2..=36).contains(&self.radix) {
+            return Err(BigIntError::Malformed);
+        }
         if byte == b'_' {
-            continue;
+            return Ok(());
         }
         let digit = match byte {
             b'0'..=b'9' => u32::from(byte - b'0'),
@@ -196,15 +218,45 @@ pub fn from_digits(digits: &[u8], radix: u32, negative: bool) -> Result<Number, 
             b'A'..=b'Z' => u32::from(byte - b'A') + 10,
             _ => return Err(BigIntError::Malformed),
         };
-        if digit >= radix {
+        if digit >= self.radix {
             return Err(BigIntError::Malformed);
         }
-        multiply_small(&mut value, radix)?;
-        add_small(&mut value, digit)?;
+        multiply_small(&mut self.value, self.radix)?;
+        add_small(&mut self.value, digit)?;
+        self.digits += 1;
+        Ok(())
     }
-    value.negative = negative && !value.is_zero();
-    value.trim();
-    Ok(value)
+
+    /// How many digits have been taken, separators aside. A numeral with none
+    /// is not a numeral, which only the caller knows how to answer.
+    pub const fn digits(&self) -> usize {
+        self.digits
+    }
+
+    /// The number the digits denote.
+    pub fn finish(mut self) -> Number {
+        self.value.trim();
+        self.value
+    }
+
+    /// The number the digits denote, negated where the text said so. Zero has
+    /// no sign.
+    pub fn finish_signed(mut self, negative: bool) -> Number {
+        self.value.negative = negative && !self.value.is_zero();
+        self.finish()
+    }
+}
+
+/// The value a digit sequence in `radix` denotes.
+pub fn from_digits(digits: &[u8], radix: u32, negative: bool) -> Result<Number, BigIntError> {
+    if !(2..=36).contains(&radix) {
+        return Err(BigIntError::Malformed);
+    }
+    let mut accumulator = Accumulator::new(radix);
+    for &byte in digits {
+        accumulator.push(byte)?;
+    }
+    Ok(accumulator.finish_signed(negative))
 }
 
 /// The value an integral `f64` denotes.

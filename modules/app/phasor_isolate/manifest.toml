@@ -18,6 +18,15 @@ direction    = "input"
 content_type = "OctetStream"
 buffer_size  = 512
 
+# Task control: cancellation, the deadline, and the reported time, as small
+# fixed records. A graph that wires nothing here runs tasks to their budgets.
+[[ports]]
+name         = "control_in"
+index        = 2
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 64
+
 [[ports]]
 name         = "result_out"
 direction    = "output"
@@ -50,4 +59,12 @@ content_type = "OctetStream"
 buffer_size  = 16
 
 [observability]
-exempt = "stream component whose evidence is the result it emits and its exit status"
+metrics = [
+  "outcome_finished",
+  "outcome_stopped",
+  "outcome_rejected",
+  "fuel_spent",
+  "collections",
+  "calls_made",
+  "completions_applied",
+]

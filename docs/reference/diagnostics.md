@@ -154,6 +154,7 @@ token that revealed it, so an invalid assignment target spans the target.
 | `0x0214` | `illegal-break-or-continue` | error | none |
 | `0x0215` | `return-outside-function` | error | none |
 | `0x0216` | `strict-assignment-to-restricted-name` | error | none |
+| `0x0217` | `strict-invalid-parameter` | error | none |
 
 Enumerated arguments:
 

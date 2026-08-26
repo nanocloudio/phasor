@@ -186,6 +186,74 @@ pub mod native {
     /// The thrower behind `Function.prototype.caller` and `.arguments`:
     /// reading or writing either is a type error.
     pub const THROW_TYPE_ERROR: u32 = 167;
+    /// `Function.prototype` called as a function: any arguments, undefined.
+    pub const FUNCTION_PROTOTYPE: u32 = 168;
+
+    /// What a native reports as its `length`: the parameter count the
+    /// specification declares for it.
+    ///
+    /// A bound function never reaches here: `bind` settles its `length` from
+    /// the target's own. A host binding takes whatever its manifest declares,
+    /// which this cannot know, so it falls to one.
+    pub const fn arity(id: u32) -> u32 {
+        match id {
+            // Nothing declared: a method that reads only its receiver, an
+            // iterator step, or a constructor that takes no argument.
+            self::OBJECT_TO_STRING
+            | self::OBJECT_VALUE_OF
+            | self::ARRAY_TO_STRING
+            | self::ERROR_TO_STRING
+            | self::SYMBOL
+            | self::SYMBOL_TO_STRING
+            | self::SYMBOL_DESCRIPTION
+            | self::FUNCTION_PROTOTYPE
+            | self::THROW_TYPE_ERROR
+            | self::BIG_INT_TO_STRING
+            | self::BIG_INT_VALUE_OF
+            | self::REG_EXP_TO_STRING
+            | self::NAMESPACE_GET
+            | self::ARRAY_OF
+            | self::ARRAY_POP
+            | self::ARRAY_SHIFT
+            | self::ARRAY_REVERSE
+            | self::ARRAY_VALUES
+            | self::ARRAY_KEYS
+            | self::ARRAY_ENTRIES
+            | self::STRING_TO_UPPER_CASE
+            | self::STRING_TO_LOWER_CASE
+            | self::STRING_TRIM
+            | self::STRING_TO_STRING
+            | self::STRING_VALUES
+            | self::NUMBER_VALUE_OF
+            | self::BOOLEAN_TO_STRING
+            | self::BOOLEAN_VALUE_OF
+            | self::ITERATOR_NEXT
+            | self::ITERATOR_SELF => 0,
+            // Two declared.
+            self::PROMISE_THEN
+            | self::REG_EXP
+            | self::OBJECT_ASSIGN
+            | self::OBJECT_SET_PROTOTYPE_OF
+            | self::OBJECT_CREATE
+            | self::OBJECT_IS
+            | self::OBJECT_GET_OWN_PROPERTY_DESCRIPTOR
+            | self::ARRAY_SLICE
+            | self::STRING_SLICE
+            | self::STRING_SUBSTRING
+            | self::STRING_SPLIT
+            | self::STRING_REPLACE
+            | self::PARSE_INT
+            | self::MATH_POW
+            | self::MATH_MIN
+            | self::MATH_MAX
+            | self::MATH_HYPOT
+            | self::FUNCTION_PROTOTYPE_APPLY => 2,
+            // Three declared.
+            self::OBJECT_DEFINE_PROPERTY => 3,
+            // One declared, which is what the great majority take.
+            _ => 1,
+        }
+    }
 
     /// The first identifier a host binding takes. A binding's own index is
     /// added to it, so every admitted binding is its own callable function.
@@ -263,6 +331,7 @@ pub struct Realm {
     pub iterator_prototype: Handle,
     /// `Symbol.iterator`, the name a program asks an object to iterate by.
     pub iterator_symbol: Handle,
+    pub has_instance_symbol: Handle,
 }
 
 impl Realm {
@@ -300,7 +369,15 @@ impl Realm {
 pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, ObjectError> {
     // The intrinsic prototypes come first, because everything else has one.
     let object_prototype = object::create(heap, Value::NULL)?;
-    let function_prototype = object::create(heap, Value::object(object_prototype))?;
+    // The function prototype is itself callable — a function that accepts
+    // any arguments and answers undefined — which is what the specification
+    // makes it.
+    let function_prototype = object::create_native(
+        heap,
+        Value::object(object_prototype),
+        native::FUNCTION_PROTOTYPE,
+        0,
+    )?;
     let array_prototype = object::create(heap, Value::object(object_prototype))?;
 
     let method_attributes = attribute::WRITABLE | attribute::CONFIGURABLE;
@@ -503,6 +580,7 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
     // handle to, so a program can only reach it through the name it is given.
     let symbol_prototype = object::create(heap, Value::object(object_prototype))?;
     let iterator_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.iterator")?;
+    let has_instance_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.hasInstance")?;
     let symbol_constructor =
         object::create_native(heap, Value::object(function_prototype), native::SYMBOL, 0)?;
     method(
@@ -535,6 +613,14 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
         symbol_constructor,
         b"iterator",
         Value::symbol(iterator_symbol),
+        0,
+    )?;
+    define(
+        heap,
+        atoms,
+        symbol_constructor,
+        b"hasInstance",
+        Value::symbol(has_instance_symbol),
         0,
     )?;
     define(
@@ -654,6 +740,16 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
         function_prototype,
         iterator_symbol,
     )?;
+    // The string prototype's own `length` is zero: it is the empty string's
+    // shape, whatever carries it.
+    define(
+        heap,
+        atoms,
+        string_prototype,
+        b"length",
+        Value::number(0.0),
+        0,
+    )?;
     build_number_intrinsics(
         heap,
         atoms,
@@ -684,6 +780,7 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
         regexp_prototype,
         iterator_prototype,
         iterator_symbol,
+        has_instance_symbol,
     })
 }
 
@@ -1083,7 +1180,11 @@ fn build_math(
         (&b"PI"[..], core::f64::consts::PI),
         (&b"E"[..], core::f64::consts::E),
         (&b"LN2"[..], core::f64::consts::LN_2),
+        (&b"LN10"[..], core::f64::consts::LN_10),
+        (&b"LOG2E"[..], core::f64::consts::LOG2_E),
+        (&b"LOG10E"[..], core::f64::consts::LOG10_E),
         (&b"SQRT2"[..], core::f64::consts::SQRT_2),
+        (&b"SQRT1_2"[..], core::f64::consts::FRAC_1_SQRT_2),
     ] {
         define(heap, atoms, math, name, Value::number(value), 0)?;
     }

@@ -73,6 +73,9 @@ pub mod code {
     pub const RETURN_OUTSIDE_FUNCTION: u16 = 0x0215;
     /// Strict code refuses to assign `eval` or `arguments`.
     pub const STRICT_ASSIGNMENT_TO_RESTRICTED_NAME: u16 = 0x0216;
+    /// A strict function refuses a parameter named `eval` or `arguments`,
+    /// and refuses two parameters with one name.
+    pub const STRICT_INVALID_PARAMETER: u16 = 0x0217;
 
     // Bytecode emission and verification, 0x0400-0x04FF.
     pub const UNKNOWN_OPCODE: u16 = 0x0400;

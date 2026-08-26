@@ -5,7 +5,14 @@ Source: `modules/common/policy.rs`, `modules/common/vm.rs`.
 This document defines what an isolate is admitted against, the states it moves
 through, the outcomes a task can end with, and how a task is stopped.
 `phasor_isolate` takes an image on one port, answers on another, puts its
-calls on a third, and says on a fourth why a run produced no value.
+calls on a third, and says on a fourth why a run produced no value. A control
+port carries cancellation, the deadline, and the reported time as small fixed
+records: a cancel is sticky and stops the task at its next safe point, and a
+deadline passes only when a reported time reaches it, so a graph that wires no
+clock has no deadline. When the task ends, the isolate emits its counters —
+outcome, fuel spent, collections, calls and completions — to the telemetry
+ring, gated on a subscribed consumer, and never a source, a value, or a
+payload.
 
 ## 1. One isolate is one Agent
 
@@ -88,9 +95,10 @@ which phase spoke is worth keeping.
 The instruction budget is a parameter, `steps`, rather than a constant: a graph
 that runs bigger programs says how much bigger. The frame and register tables
 are compiled in, and they are what a program's recursion depth is bounded by —
-a JavaScript call is a frame in this table, never a host stack frame, so a
-runaway recursion is `StackOverflow` at a declared depth rather than a stack
-that ran into something.
+a call written in bytecode is a frame in this table, and a call a native makes
+nests a bounded inner loop with a declared depth of its own, so a runaway
+recursion is `StackOverflow` at a declared depth rather than a stack that ran
+into something.
 
 ## 5. Slices, cancellation, and deadlines
 

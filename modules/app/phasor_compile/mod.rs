@@ -35,6 +35,8 @@ mod digest;
 mod dtoa;
 #[path = "../../common/emit.rs"]
 mod emit;
+#[path = "../../common/evalsite.rs"]
+mod evalsite;
 #[path = "../../common/feature.rs"]
 mod feature;
 #[path = "../../common/lex.rs"]
@@ -126,6 +128,7 @@ const LEXICAL_CAPACITY: usize = 1024;
 const PENDING_CAPACITY: usize = 256;
 const IMPORT_CAPACITY: usize = 64;
 const EXPORT_CAPACITY: usize = 64;
+const EVAL_SITE_CAPACITY: usize = 2048;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
@@ -155,6 +158,7 @@ struct State {
     pending: [PendingFunction; PENDING_CAPACITY],
     imports: [ImportRecord; IMPORT_CAPACITY],
     exports: [ExportRecord; EXPORT_CAPACITY],
+    eval_sites: [u8; EVAL_SITE_CAPACITY],
     /// Whether the source is a script or a module.
     goal: u8,
     /// Why a compile failed, ready to hand to whatever renders it.
@@ -233,6 +237,7 @@ fn compile(state: &mut State) -> bool {
             pending: &mut state.pending,
             imports: &mut state.imports,
             exports: &mut state.exports,
+            eval_sites: &mut state.eval_sites,
         };
         let compiled = if module {
             lower_module(source, parser.arena(), root, &mut storage)

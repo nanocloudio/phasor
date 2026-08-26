@@ -16,7 +16,7 @@ use crate::digest::{Digest, Hasher};
 /// Bumped whenever the meaning of any existing encoding changes. It is one
 /// input to the format digest, which is what an image is actually admitted
 /// against.
-pub const FORMAT_TAG: [u8; 8] = *b"PHBC0001";
+pub const FORMAT_TAG: [u8; 8] = *b"PHBC0002";
 
 /// Magic bytes at the head of a unit image.
 pub const UNIT_MAGIC: [u8; 4] = *b"PHBC";
@@ -120,6 +120,31 @@ pub enum Opcode {
     ToNumeric = 0x36,
     ToString = 0x37,
     ToPropertyKey = 0x38,
+    /// Require the object in the operand register to be coercible, then turn
+    /// the accumulator into a property key. This is the reference order: a
+    /// read through nothing is a type error before the key's own `toString`
+    /// runs, and the key it produces is coerced exactly once.
+    ToPropertyKeyChecked = 0x39,
+
+    // The tail of this range carries a binding operation and four property
+    // operations: their own ranges are full, and an opcode's value says
+    // nothing about what it is about.
+    /// Store the accumulator into an existing global property, refusing —
+    /// with a reference error — a name the global object does not have.
+    /// This is what assignment means in strict code: it never creates.
+    StaGlobalStrict = 0x3A,
+    /// Define an accessor property: the closure in the accumulator becomes
+    /// the getter or the setter for the named key on the object in the
+    /// operand register, merging with an accessor already there.
+    DefineNamedGetter = 0x3B,
+    DefineNamedSetter = 0x3C,
+    /// The keyed forms take the key from a register.
+    DefineKeyedGetter = 0x3D,
+    DefineKeyedSetter = 0x3E,
+    /// Give the closure in the accumulator its `name`, from a key constant:
+    /// what the specification calls named evaluation. A closure that already
+    /// carries a name keeps it.
+    NameClosure = 0x3F,
 
     // Comparisons.
     TestEqual = 0x40,
@@ -258,6 +283,13 @@ impl Opcode {
             0x36 => Self::ToNumeric,
             0x37 => Self::ToString,
             0x38 => Self::ToPropertyKey,
+            0x39 => Self::ToPropertyKeyChecked,
+            0x3A => Self::StaGlobalStrict,
+            0x3B => Self::DefineNamedGetter,
+            0x3C => Self::DefineNamedSetter,
+            0x3D => Self::DefineKeyedGetter,
+            0x3E => Self::DefineKeyedSetter,
+            0x3F => Self::NameClosure,
             0x40 => Self::TestEqual,
             0x41 => Self::TestNotEqual,
             0x42 => Self::TestStrictEqual,
@@ -357,7 +389,9 @@ impl Opcode {
             | Self::LdaGlobal
             | Self::LdaGlobalOrUndefined
             | Self::StaGlobal
+            | Self::StaGlobalStrict
             | Self::DeclareGlobal
+            | Self::NameClosure
             | Self::DeleteNamedProperty => Signature::new(1, [Constant, NONE, NONE]),
             Self::Ldar
             | Self::Star
@@ -399,16 +433,21 @@ impl Opcode {
             | Self::JumpIfNotNullish => Signature::new(1, [Jump, NONE, NONE]),
 
             Self::Mov => Signature::new(2, [Register, Register, NONE]),
-            Self::GetNamedProperty | Self::SetNamedProperty | Self::DefineNamedProperty => {
-                Signature::new(2, [Register, Constant, NONE])
-            }
-            Self::SetKeyedProperty | Self::DefineKeyedProperty => {
-                Signature::new(2, [Register, Register, NONE])
-            }
+            Self::GetNamedProperty
+            | Self::SetNamedProperty
+            | Self::DefineNamedProperty
+            | Self::DefineNamedGetter
+            | Self::DefineNamedSetter => Signature::new(2, [Register, Constant, NONE]),
+            Self::SetKeyedProperty
+            | Self::DefineKeyedProperty
+            | Self::DefineKeyedGetter
+            | Self::DefineKeyedSetter => Signature::new(2, [Register, Register, NONE]),
             Self::LdaContextSlot | Self::StaContextSlot | Self::InitContextSlot => {
                 Signature::new(2, [Count, Depth, NONE])
             }
-            Self::SetPrototype => Signature::new(1, [Register, NONE, NONE]),
+            Self::SetPrototype | Self::ToPropertyKeyChecked => {
+                Signature::new(1, [Register, NONE, NONE])
+            }
             Self::CreateClosure => Signature::new(1, [Immediate, NONE, NONE]),
             Self::CreateRegExp => Signature::new(1, [Constant, NONE, NONE]),
             Self::LdaImport => Signature::new(1, [Immediate, NONE, NONE]),
@@ -735,6 +774,10 @@ pub struct Header {
     pub import_count: u32,
     /// Names this unit makes available to other modules.
     pub export_count: u32,
+    /// Bytes of eval-site records: for each direct `eval` call, the bindings
+    /// visible at that point, so a host compiling the eval source can resolve
+    /// them into the caller's environments.
+    pub eval_site_length: u32,
 }
 
 /// Flags a unit carries.
@@ -787,6 +830,7 @@ pub struct Unit<'a> {
     safe_points_at: usize,
     imports_at: usize,
     exports_at: usize,
+    eval_sites_at: usize,
 }
 
 /// Why an image is not a usable unit.
@@ -814,6 +858,7 @@ impl Unit<'static> {
             flags: 0,
             import_count: 0,
             export_count: 0,
+            eval_site_length: 0,
         },
         functions_at: 0,
         constants_at: 0,
@@ -823,6 +868,7 @@ impl Unit<'static> {
         safe_points_at: 0,
         imports_at: 0,
         exports_at: 0,
+        eval_sites_at: 0,
     };
 }
 
@@ -856,6 +902,7 @@ impl<'a> Unit<'a> {
             flags: read_u32(bytes, 96)?,
             import_count: read_u32(bytes, 100)?,
             export_count: read_u32(bytes, 104)?,
+            eval_site_length: read_u32(bytes, 108)?,
         };
 
         let functions_at = HEADER_SIZE;
@@ -878,7 +925,8 @@ impl<'a> Unit<'a> {
         )?;
         let imports_at = advance(safe_points_at, header.safe_point_count as usize, 4)?;
         let exports_at = advance(imports_at, header.import_count as usize, IMPORT_RECORD_SIZE)?;
-        let end = advance(exports_at, header.export_count as usize, EXPORT_RECORD_SIZE)?;
+        let eval_sites_at = advance(exports_at, header.export_count as usize, EXPORT_RECORD_SIZE)?;
+        let end = advance(eval_sites_at, header.eval_site_length as usize, 1)?;
         if end > bytes.len() {
             return Err(ImageError::Truncated);
         }
@@ -897,11 +945,21 @@ impl<'a> Unit<'a> {
             safe_points_at,
             imports_at,
             exports_at,
+            eval_sites_at,
         })
     }
 
     pub const fn header(&self) -> &Header {
         &self.header
+    }
+
+    /// The eval-site records, as the blob the compiler wrote. The machine
+    /// never reads these; they are for the host that compiles an eval source
+    /// against the scope the call site could see.
+    pub fn eval_sites(&self) -> &'a [u8] {
+        self.bytes
+            .get(self.eval_sites_at..self.eval_sites_at + self.header.eval_site_length as usize)
+            .unwrap_or(&[])
     }
 
     /// The logical digest of the whole image, which is its identity.

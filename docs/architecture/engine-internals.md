@@ -71,8 +71,10 @@ is specified in [collection.md](collection.md).
 
 The machine is rebuilt over module-owned storage every step and restores its
 saved state, which is what lets one task span many bounded steps without a
-thread. A JavaScript call pushes a frame rather than recursing on the host
-stack, so recursion depth is a declared bound. Jobs run one at a time to
+thread. A call written in bytecode pushes a frame rather than recursing on the
+host stack, so JavaScript recursion depth is a declared bound; a call a native
+makes nests a bounded inner loop whose depth is a declared bound of its own and
+whose work is charged to the same fuel and the same slice. Jobs run one at a time to
 completion; promises settle through a bounded queue; host calls leave as typed
 records and return as completions that settle the promise they belong to.
 Dynamic source — `eval` and the `Function` constructor — pauses the machine

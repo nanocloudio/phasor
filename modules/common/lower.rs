@@ -17,7 +17,7 @@
 //! name found nowhere becomes a global, resolved by the isolate.
 
 use crate::arena::{binary_operator as binop, declaration, flag, unary_operator as unop};
-use crate::arena::{property_key, Arena, Node, NodeKind, NONE};
+use crate::arena::{property_key, property_kind, Arena, Node, NodeKind, NONE};
 use crate::bytecode::Unit;
 use crate::bytecode::{
     function_flag, unit_flag, Constant, ConstantKind, ExceptionRegion, ExportRecord, Function,
@@ -25,6 +25,7 @@ use crate::bytecode::{
 };
 use crate::diagnostic::{code, Diagnostic, Severity};
 use crate::emit::{BuildError, CodeBuilder, Label, Patch, UnitWriter};
+use crate::evalsite::{EvalBinding, FLAG_STRICT, FLAG_TRUNCATED};
 use crate::lex::{cook, Token, TokenKind};
 
 /// Storage the lowering writes into. Every buffer is caller-provided, so the
@@ -52,6 +53,8 @@ pub struct Storage<'a> {
     /// What a module imports and exports, when the source is one.
     pub imports: &'a mut [ImportRecord],
     pub exports: &'a mut [ExportRecord],
+    /// Eval-site records: the bindings each direct `eval` call could see.
+    pub eval_sites: &'a mut [u8],
 }
 
 /// What the lowering produced.
@@ -100,6 +103,9 @@ pub mod binding_kind {
     /// A name another module exports, which is read through that module every
     /// time and may not be assigned here.
     pub const IMPORT: u8 = 4;
+    /// A named function expression's own name, which its body reads but may
+    /// not reassign: a sloppy write is ignored, as an immutable binding is.
+    pub const SELF: u8 = 5;
 }
 
 /// One name a scope declares.
@@ -162,7 +168,37 @@ fn lower_script_inner(
     storage: &mut Storage<'_>,
     verify_image: bool,
 ) -> Result<Compiled, Diagnostic> {
-    lower_inner(source, arena, root, storage, verify_image, false)
+    lower_inner(
+        source,
+        arena,
+        root,
+        storage,
+        verify_image,
+        false,
+        &[],
+        false,
+        false,
+    )
+}
+
+/// Compile one parsed source as the body of a direct `eval`.
+///
+/// `scope` is what the call site could see, decoded from the caller image's
+/// eval-site record: free names resolve against it before falling to the
+/// global object, so the compiled unit runs over the caller's environments.
+/// `strict` is the strictness of the code the call was written in, which the
+/// eval source inherits before its own directive says anything.
+pub fn lower_eval(
+    source: &[u8],
+    arena: &Arena<'_>,
+    root: u32,
+    storage: &mut Storage<'_>,
+    scope: &[EvalBinding<'_>],
+    strict: bool,
+) -> Result<Compiled, Diagnostic> {
+    lower_inner(
+        source, arena, root, storage, true, false, scope, strict, true,
+    )
 }
 
 /// Compile one parsed module into a verified unit image.
@@ -176,9 +212,13 @@ pub fn lower_module(
     root: u32,
     storage: &mut Storage<'_>,
 ) -> Result<Compiled, Diagnostic> {
-    lower_inner(source, arena, root, storage, true, true)
+    lower_inner(source, arena, root, storage, true, true, &[], false, false)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one internal seam carries every compilation goal — script, module, and eval with its scope and strictness — and a parameter struct would only rename the arity"
+)]
 fn lower_inner(
     source: &[u8],
     arena: &Arena<'_>,
@@ -186,6 +226,9 @@ fn lower_inner(
     storage: &mut Storage<'_>,
     verify_image: bool,
     module: bool,
+    eval_scope: &[EvalBinding<'_>],
+    strict: bool,
+    eval_goal: bool,
 ) -> Result<Compiled, Diagnostic> {
     let mut program = Program {
         constants: storage.constants,
@@ -207,6 +250,11 @@ fn lower_inner(
         pending: storage.pending,
         pending_count: 0,
         pending_next: 0,
+        eval_sites: storage.eval_sites,
+        eval_site_length: 0,
+        eval_site_count: 0,
+        eval_scope,
+        eval_goal,
         imports: storage.imports,
         import_count: 0,
         exports: storage.exports,
@@ -223,7 +271,7 @@ fn lower_inner(
         Body::Script(root),
         NONE,
         script,
-        false,
+        strict,
         &mut program,
         storage.code,
         storage.safe_points,
@@ -296,6 +344,14 @@ fn lower_inner(
         .get(..program.export_count)
         .ok_or_else(|| failure(code::CODE_TOO_LARGE))?;
     let flags = if program.module { unit_flag::MODULE } else { 0 };
+    let eval_sites = if program.eval_site_count == 0 {
+        &[]
+    } else {
+        program
+            .eval_sites
+            .get(..program.eval_site_length)
+            .unwrap_or(&[])
+    };
 
     let length = UnitWriter::new(storage.image)
         .write_module(
@@ -309,6 +365,7 @@ fn lower_inner(
             imports,
             exports,
             flags,
+            eval_sites,
         )
         .map_err(build_failure)?;
 
@@ -403,6 +460,15 @@ struct Program<'a> {
     pending: &'a mut [Pending],
     pending_count: usize,
     pending_next: usize,
+    eval_sites: &'a mut [u8],
+    eval_site_length: usize,
+    eval_site_count: u32,
+    /// Bindings the caller's eval-site record says are visible: what this
+    /// compilation is an eval inside of.
+    eval_scope: &'a [EvalBinding<'a>],
+    /// Whether the source is the body of a direct eval, whose strict form
+    /// keeps its `var` declarations to itself.
+    eval_goal: bool,
     imports: &'a mut [ImportRecord],
     import_count: usize,
     exports: &'a mut [ExportRecord],
@@ -521,6 +587,13 @@ struct Target {
 struct Finaliser {
     node: u32,
     context_depth: u32,
+    /// How deeply the owning `try` is nested, which decides which exception
+    /// regions an inline copy of this finaliser is excluded from.
+    try_depth: u32,
+    /// The scope the `try` was entered in. An inline copy lowers in it, so a
+    /// name resolves at the depth the exit's pops leave behind, not at the
+    /// depth of whatever scope the exit was written inside.
+    scope: u32,
 }
 
 /// Lower one function record: its scope, its prologue, its body, and its exit.
@@ -569,6 +642,17 @@ fn emit_function(
                 (node.first, node.second, false)
             } else if matches!(node.kind, NodeKind::Script) {
                 declare_lexical(arena, source, node.first, node.second, scope, program, true)?;
+                // Strict eval code keeps its `var`s: they are bindings of the
+                // eval's own scope, not properties of the global object and
+                // not writes into the caller.
+                if program.eval_goal
+                    && (enclosing_strict
+                        || directive_prologue_is_strict(arena, source, node.first, node.second))
+                {
+                    // Declaring is what marks the scope a context, so an
+                    // eval that hoists nothing claims none and pushes none.
+                    hoist_vars(arena, node.first, node.second, scope, program)?;
+                }
                 // A script that is one expression compiles to exactly that
                 // expression: there is nothing for a completion value to
                 // outlive, so it needs no register of its own.
@@ -606,7 +690,7 @@ fn emit_function(
                         Binding {
                             start: name.first,
                             end: name.second,
-                            kind: binding_kind::FUNCTION,
+                            kind: binding_kind::SELF,
                             slot: 0,
                         },
                     )?;
@@ -698,28 +782,49 @@ fn emit_function(
 
     // A directive prologue makes the body strict code: leading statements
     // that are string literals, one of which reads exactly `use strict`.
-    if !strict && statement_count != u32::MAX {
-        for &statement in arena.list(statements, statement_count) {
-            let Some(node) = arena.node(statement) else {
+    if !strict
+        && statement_count != u32::MAX
+        && directive_prologue_is_strict(arena, source, statements, statement_count)
+    {
+        strict = true;
+    }
+
+    // A strict function refuses a parameter named `eval` or `arguments`, and
+    // refuses two parameters with one name — early errors, before anything
+    // runs.
+    if strict && parameters > 0 {
+        let record = program.scope(scope);
+        let first = record.first as usize + usize::from(self_name);
+        let mut index = 0usize;
+        while index < parameters as usize {
+            let Some(binding) = program.bindings.get(first + index) else {
                 break;
             };
-            if !matches!(node.kind, NodeKind::ExpressionStatement) {
-                break;
-            }
-            let Some(expression) = arena.node(node.first) else {
-                break;
-            };
-            if !matches!(expression.kind, NodeKind::String) {
-                break;
-            }
-            // The node's inner span is the literal's text without its quotes.
-            let text = source
-                .get(expression.first as usize..expression.second as usize)
+            let name = source
+                .get(binding.start as usize..binding.end as usize)
                 .unwrap_or(&[]);
-            if text == b"use strict" {
-                strict = true;
-                break;
+            if name == b"eval" || name == b"arguments" {
+                return Err(Diagnostic::at(
+                    code::STRICT_INVALID_PARAMETER,
+                    Severity::Error,
+                    binding.start,
+                ));
             }
+            let mut earlier = 0usize;
+            while earlier < index {
+                let Some(other) = program.bindings.get(first + earlier) else {
+                    break;
+                };
+                if source.get(other.start as usize..other.end as usize) == Some(name) {
+                    return Err(Diagnostic::at(
+                        code::STRICT_INVALID_PARAMETER,
+                        Severity::Error,
+                        binding.start,
+                    ));
+                }
+                earlier += 1;
+            }
+            index += 1;
         }
     }
 
@@ -741,6 +846,7 @@ fn emit_function(
             arena,
             builder: &mut builder,
             program,
+            function_index: index,
             registers: 0,
             high_water: if uses_arguments {
                 MAX_CALL_ARGUMENTS
@@ -756,6 +862,9 @@ fn emit_function(
             target_count: 0,
             finalisers: [Finaliser::EMPTY; MAX_FINALISERS],
             finaliser_count: 0,
+            try_depth: 0,
+            holes: [(0, 0, 0); MAX_HOLES],
+            hole_count: 0,
             in_function: matches!(body, Body::Function(_)),
             strict,
             completion: 0,
@@ -805,6 +914,9 @@ fn emit_function(
                         lowering.emit(Opcode::PushContext, &[i64::from(slots)]);
                         lowering.context_depth = 1;
                         lowering.max_context_depth = 1;
+                        // A `var` exists as `undefined` before anything runs;
+                        // only the lexical declarations keep their dead zone.
+                        lowering.initialise_hoisted(scope);
                     }
                     lowering.script_prologue(statements, statement_count);
                     let completion = lowering.allocate();
@@ -1232,6 +1344,8 @@ const MAX_CALL_ARGUMENTS: u32 = 16;
 const MAX_TARGETS: usize = 32;
 /// `finally` blocks open at once.
 const MAX_FINALISERS: usize = 16;
+/// Inline finaliser copies one function may hold.
+const MAX_HOLES: usize = 48;
 
 impl Target {
     const EMPTY: Self = Self {
@@ -1252,6 +1366,8 @@ impl Finaliser {
     const EMPTY: Self = Self {
         node: NONE,
         context_depth: 0,
+        try_depth: 0,
+        scope: NONE,
     };
 }
 
@@ -1260,6 +1376,9 @@ struct Lowering<'a, 'b, 'c, 'p> {
     arena: &'a Arena<'b>,
     builder: &'a mut CodeBuilder<'c>,
     program: &'a mut Program<'p>,
+    /// The unit index of the function being emitted, which an eval-site
+    /// record names.
+    function_index: u32,
     /// Registers currently held by enclosing expressions.
     registers: u32,
     /// Highest register count reached, which the function declares.
@@ -1273,6 +1392,14 @@ struct Lowering<'a, 'b, 'c, 'p> {
     target_count: usize,
     finalisers: [Finaliser; MAX_FINALISERS],
     finaliser_count: usize,
+    /// How many `try` statements enclose the position being lowered.
+    try_depth: u32,
+    /// Ranges holding an inline finaliser copy, each tagged with its owning
+    /// `try`'s depth: a region belonging to a `try` nested that deep or
+    /// deeper must not cover the copy, or a throwing `finally` would run
+    /// itself again.
+    holes: [(u32, u32, u32); MAX_HOLES],
+    hole_count: usize,
     /// Whether `return` is admitted here.
     in_function: bool,
     /// Whether this body is strict code, which the functions written inside
@@ -1378,6 +1505,19 @@ impl Lowering<'_, '_, '_, '_> {
             }
             scope = record.parent;
         }
+        // A name the eval site's record says is visible resolves into the
+        // caller's environments: its depth is counted from the call site's
+        // innermost context, which is exactly where this code's own chain
+        // ran out.
+        for binding in self.program.eval_scope {
+            if binding.name == text {
+                return Resolved::Slot {
+                    depth: depth + binding.depth,
+                    slot: binding.slot,
+                    kind: u8::try_from(binding.kind).unwrap_or(binding_kind::VARIABLE),
+                };
+            }
+        }
         Resolved::Global
     }
 
@@ -1420,12 +1560,23 @@ impl Lowering<'_, '_, '_, '_> {
                     self.fail(node, code::ASSIGNMENT_TO_CONSTANT);
                     return;
                 }
+                if kind == binding_kind::SELF {
+                    // A named function expression's own name is immutable:
+                    // the write is evaluated and discarded.
+                    return;
+                }
                 self.note_depth(depth);
                 self.emit(Opcode::StaContextSlot, &[i64::from(slot), i64::from(depth)]);
             }
             Resolved::Global => {
                 let constant = self.identifier_constant(node);
-                self.emit(Opcode::StaGlobal, &[i64::from(constant)]);
+                // Strict code assigns only what exists; sloppy code creates.
+                let opcode = if self.strict {
+                    Opcode::StaGlobalStrict
+                } else {
+                    Opcode::StaGlobal
+                };
+                self.emit(opcode, &[i64::from(constant)]);
             }
         }
     }
@@ -1686,6 +1837,8 @@ impl Lowering<'_, '_, '_, '_> {
                 let function = self.queue_function(statement);
                 self.emit(Opcode::CreateClosure, &[i64::from(function)]);
                 let name = self.node(node.first);
+                let constant = self.identifier_constant(&name);
+                self.emit(Opcode::NameClosure, &[i64::from(constant)]);
                 self.initialise_name(&name);
             }
             index += 1;
@@ -1891,9 +2044,12 @@ impl Lowering<'_, '_, '_, '_> {
             if matches!(node.kind, NodeKind::Function) && node.first != NONE {
                 let function = self.queue_function(items[index]);
                 self.emit(Opcode::CreateClosure, &[i64::from(function)]);
+                // Stored wherever the name resolves: the global object for a
+                // script, the eval's own scope when strict eval hoisted it.
                 let name = self.node(node.first);
                 let constant = self.identifier_constant(&name);
-                self.emit(Opcode::StaGlobal, &[i64::from(constant)]);
+                self.emit(Opcode::NameClosure, &[i64::from(constant)]);
+                self.store_name(&name);
             }
             index += 1;
         }
@@ -1923,6 +2079,12 @@ impl Lowering<'_, '_, '_, '_> {
                     };
                     let record = self.node(declarator);
                     let name = self.node(record.first);
+                    // A `var` that resolves — to the eval's own hoisted scope,
+                    // or to a binding the eval site can see — is that binding:
+                    // it declares nothing on the global object.
+                    if matches!(self.resolve(name.first, name.second), Resolved::Slot { .. }) {
+                        continue;
+                    }
                     let constant = self.identifier_constant(&name);
                     self.emit(Opcode::DeclareGlobal, &[i64::from(constant)]);
                 }
@@ -1987,6 +2149,26 @@ impl Lowering<'_, '_, '_, '_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Give every `var`-kind slot of `scope` its starting `undefined`.
+    fn initialise_hoisted(&mut self, scope: u32) {
+        let record = self.program.scope(scope);
+        let first = record.first as usize;
+        let mut index = 0u32;
+        while index < record.count {
+            let Some(binding) = self.program.bindings.get(first + index as usize).copied() else {
+                break;
+            };
+            if matches!(
+                binding.kind,
+                binding_kind::VARIABLE | binding_kind::FUNCTION
+            ) {
+                self.emit(Opcode::LdaUndefined, &[]);
+                self.emit(Opcode::InitContextSlot, &[i64::from(binding.slot), 0]);
+            }
+            index += 1;
         }
     }
 
@@ -2057,6 +2239,7 @@ impl Lowering<'_, '_, '_, '_> {
                 self.emit(Opcode::LdaUndefined, &[]);
             } else {
                 self.expression(record.second);
+                self.name_closure(record.second, &name);
             }
             if node.third == declaration::VAR {
                 self.store_name(&name);
@@ -2603,7 +2786,26 @@ impl Lowering<'_, '_, '_, '_> {
             }
             let saved = self.finaliser_count;
             self.finaliser_count = index;
+            // The copy runs after this exit has left every `try` inward of
+            // the finaliser's own, so no region that deep may cover it — and
+            // it lowers in the scope the `try` was entered in, matching the
+            // contexts the pops above left standing.
+            let outer_scope = self.scope;
+            self.scope = finaliser.scope;
+            let from = self.builder.length();
             self.statement(finaliser.node);
+            let to = self.builder.length();
+            self.scope = outer_scope;
+            match self.holes.get_mut(self.hole_count) {
+                Some(slot) => {
+                    *slot = (finaliser.try_depth, from, to);
+                    self.hole_count += 1;
+                }
+                None => {
+                    let node = Node::new(NodeKind::Null, 0, 0);
+                    self.fail(&node, code::EXPRESSION_TOO_DEEP);
+                }
+            }
             self.finaliser_count = saved;
         }
         while self.context_depth > context_depth {
@@ -2652,6 +2854,7 @@ impl Lowering<'_, '_, '_, '_> {
         let normal = self.builder.label();
         let mut normal_used = false;
         let mark = self.registers;
+        self.try_depth += 1;
 
         if has_finally {
             match self.finalisers.get_mut(self.finaliser_count) {
@@ -2659,6 +2862,8 @@ impl Lowering<'_, '_, '_, '_> {
                     *slot = Finaliser {
                         node: node.third,
                         context_depth: self.context_depth,
+                        try_depth: self.try_depth,
+                        scope: self.scope,
                     };
                     self.finaliser_count += 1;
                 }
@@ -2677,6 +2882,23 @@ impl Lowering<'_, '_, '_, '_> {
         if !self.builder.terminated() {
             self.builder.jump(Opcode::Jump, normal);
             normal_used = true;
+        }
+
+        // An empty protected range can throw nothing: no region, no handler,
+        // and no catch code nothing could reach.
+        if region_start == region_end {
+            if has_finally {
+                self.finaliser_count = self.finaliser_count.saturating_sub(1);
+            }
+            if normal_used {
+                self.builder.bind(normal);
+                if has_finally {
+                    self.statement(node.third);
+                }
+            }
+            self.try_depth = self.try_depth.saturating_sub(1);
+            self.release(mark);
+            return;
         }
 
         // The handler is where a throw inside the protected range continues.
@@ -2784,11 +3006,43 @@ impl Lowering<'_, '_, '_, '_> {
                 self.statement(node.third);
             }
         }
+        self.try_depth = self.try_depth.saturating_sub(1);
         self.release(mark);
     }
 
     /// Record one exception region, in the order the verifier requires.
     fn record_region(
+        &mut self,
+        start: u32,
+        end: u32,
+        handler: u32,
+        register: u32,
+        context_depth: u32,
+    ) -> bool {
+        // The range is split around every inline finaliser copy whose owning
+        // `try` is this one or one outside it: the copy runs after the exit
+        // has left this `try`, so a throw from it belongs to whatever
+        // encloses the owner, never to this region.
+        let mut cursor = start;
+        let mut hole = 0usize;
+        while hole < self.hole_count {
+            let (owner_depth, from, to) = self.holes[hole];
+            hole += 1;
+            if owner_depth > self.try_depth || to <= cursor || from >= end {
+                continue;
+            }
+            if from > cursor && self.push_region(cursor, from, handler, register, context_depth) {
+                return true;
+            }
+            cursor = cursor.max(to);
+        }
+        if cursor < end && self.push_region(cursor, end, handler, register, context_depth) {
+            return true;
+        }
+        false
+    }
+
+    fn push_region(
         &mut self,
         start: u32,
         end: u32,
@@ -3096,9 +3350,9 @@ impl Lowering<'_, '_, '_, '_> {
                 }
                 property_key::NUMBER => {
                     // A numeric key is its Number value's canonical text, which
-                    // the isolate produces; the constant carries the value.
-                    let text = self.span(node.start, node.end);
-                    let value = numeric_text(text);
+                    // the isolate produces; the constant carries the value the
+                    // lexer read, whatever form the source wrote it in.
+                    let value = self.arena.number(node.first);
                     self.number_constant(value)
                 }
                 _ => self.text_constant(&node, ConstantKind::Key, TokenKind::Identifier),
@@ -3150,6 +3404,12 @@ impl Lowering<'_, '_, '_, '_> {
             NodeKind::Function => {
                 let function = self.queue_function(index);
                 self.emit(Opcode::CreateClosure, &[i64::from(function)]);
+                // A named function expression carries its own name.
+                if node.first != NONE && !node.has(flag::ARROW) {
+                    let name = self.node(node.first);
+                    let constant = self.identifier_constant(&name);
+                    self.emit(Opcode::NameClosure, &[i64::from(constant)]);
+                }
             }
             NodeKind::RegExp => {
                 let constant = self.regexp_constant(&node);
@@ -3192,16 +3452,51 @@ impl Lowering<'_, '_, '_, '_> {
         }
         // The pattern is source text, and its own escapes belong to the pattern
         // grammar rather than to the string grammar, so it is copied as it was
-        // written.
+        // written — decoded from the transport's UTF-8 into the code units
+        // JavaScript strings are made of, a pair for anything beyond one.
         let mut units = [0u16; 512];
         let mut count = 0usize;
-        for &byte in self.span(node.first, node.second) {
-            if count >= units.len() {
+        let text = self.span(node.first, node.second);
+        let mut at = 0usize;
+        while at < text.len() {
+            let byte = text.get(at).copied().unwrap_or(0);
+            let tail =
+                |offset: usize| u32::from(text.get(at + offset).copied().unwrap_or(0) & 0x3F);
+            let (scalar, width) = if byte < 0x80 {
+                (u32::from(byte), 1)
+            } else if byte & 0xE0 == 0xC0 && at + 1 < text.len() {
+                ((u32::from(byte & 0x1F) << 6) | tail(1), 2)
+            } else if byte & 0xF0 == 0xE0 && at + 2 < text.len() {
+                ((u32::from(byte & 0x0F) << 12) | (tail(1) << 6) | tail(2), 3)
+            } else if byte & 0xF8 == 0xF0 && at + 3 < text.len() {
+                (
+                    (u32::from(byte & 0x07) << 18) | (tail(1) << 12) | (tail(2) << 6) | tail(3),
+                    4,
+                )
+            } else {
+                (u32::from(byte), 1)
+            };
+            at += width;
+            let needed = if scalar > 0xFFFF { 2 } else { 1 };
+            if count + needed > units.len() {
                 self.fail(node, code::TOO_MANY_CONSTANTS);
                 return 0;
             }
-            units[count] = u16::from(byte);
-            count += 1;
+            if scalar > 0xFFFF {
+                let value = scalar - 0x1_0000;
+                if let Some(slot) = units.get_mut(count) {
+                    *slot = 0xD800 | u16::try_from(value >> 10).unwrap_or(0);
+                }
+                if let Some(slot) = units.get_mut(count + 1) {
+                    *slot = 0xDC00 | u16::try_from(value & 0x3FF).unwrap_or(0);
+                }
+                count += 2;
+            } else {
+                if let Some(slot) = units.get_mut(count) {
+                    *slot = u16::try_from(scalar).unwrap_or(0);
+                }
+                count += 1;
+            }
         }
         let mut length = 2usize;
         let mut index = 0usize;
@@ -3420,6 +3715,37 @@ impl Lowering<'_, '_, '_, '_> {
                         &[i64::from(object), i64::from(key)],
                     );
                 }
+                NodeKind::Property if child.third != property_kind::DATA => {
+                    // An accessor: the closure in the accumulator becomes the
+                    // getter or the setter, merging with the accessor half
+                    // already defined for the key.
+                    let key = self.node(child.first);
+                    let getter = child.third == property_kind::GETTER;
+                    if matches!(key.kind, NodeKind::ComputedKey) {
+                        let inner = self.registers;
+                        let key_register = self.allocate();
+                        self.expression(key.first);
+                        self.emit(Opcode::ToPropertyKey, &[]);
+                        self.emit(Opcode::Star, &[i64::from(key_register)]);
+                        self.expression(child.second);
+                        let opcode = if getter {
+                            Opcode::DefineKeyedGetter
+                        } else {
+                            Opcode::DefineKeyedSetter
+                        };
+                        self.emit(opcode, &[i64::from(object), i64::from(key_register)]);
+                        self.release(inner);
+                    } else {
+                        let constant = self.key_constant(child.first);
+                        self.expression(child.second);
+                        let opcode = if getter {
+                            Opcode::DefineNamedGetter
+                        } else {
+                            Opcode::DefineNamedSetter
+                        };
+                        self.emit(opcode, &[i64::from(object), i64::from(constant)]);
+                    }
+                }
                 NodeKind::Property => {
                     let key = self.node(child.first);
                     if matches!(key.kind, NodeKind::ComputedKey) {
@@ -3446,6 +3772,13 @@ impl Lowering<'_, '_, '_, '_> {
                     } else {
                         let constant = self.key_constant(child.first);
                         self.expression(child.second);
+                        // The name is the key, whatever the key was written
+                        // as: `NameClosure` renders the constant exactly as a
+                        // property key renders, so a numeric key names its
+                        // function by the number's own text.
+                        if self.is_anonymous_function(child.second) {
+                            self.emit(Opcode::NameClosure, &[i64::from(constant)]);
+                        }
                         self.emit(
                             Opcode::DefineNamedProperty,
                             &[i64::from(object), i64::from(constant)],
@@ -3486,9 +3819,13 @@ impl Lowering<'_, '_, '_, '_> {
         }
 
         if let Some(label) = skip {
-            // The accumulator already holds the nullish object, which is the
-            // value of a short-circuited chain.
+            // A short-circuited chain's value is `undefined`, whichever of
+            // `null` or `undefined` cut it short.
+            let done = self.builder.label();
+            self.builder.jump(Opcode::Jump, done);
             self.builder.bind(label);
+            self.emit(Opcode::LdaUndefined, &[]);
+            self.builder.bind(done);
         }
         let _ = index;
         self.release(mark);
@@ -3559,12 +3896,135 @@ impl Lowering<'_, '_, '_, '_> {
             count += 1;
         }
 
+        // A call written as the bare name `eval`, where nothing shadows it,
+        // is a direct eval: the site records what was visible here, so a host
+        // can compile the source against this exact scope.
+        if matches!(callee_node.kind, NodeKind::Identifier)
+            && self.span(callee_node.first, callee_node.second) == b"eval"
+            && matches!(
+                self.resolve(callee_node.first, callee_node.second),
+                Resolved::Global
+            )
+        {
+            self.record_eval_site();
+        }
         self.builder.safe_point();
         self.emit(
             Opcode::Call,
             &[i64::from(callee), i64::from(receiver), i64::from(count)],
         );
         self.release(mark);
+    }
+
+    /// Record the bindings visible here, keyed by the function and the
+    /// position of the `Call` about to be emitted.
+    ///
+    /// The record is advisory: when it does not fit — too many bindings, or
+    /// a full table — the site is left without one, and an eval with no
+    /// record to compile against runs as global code.
+    fn record_eval_site(&mut self) {
+        let pc = self.builder.length();
+        let start = if self.program.eval_site_length == 0 {
+            // The blob opens with its site count.
+            if self.program.eval_sites.len() < 4 {
+                return;
+            }
+            self.program.eval_sites[0..4].copy_from_slice(&0u32.to_le_bytes());
+            4
+        } else {
+            self.program.eval_site_length
+        };
+        let mut at = start;
+        let mut flags = if self.strict { FLAG_STRICT } else { 0 };
+        let header_at = at;
+        at += 16;
+        if at > self.program.eval_sites.len() {
+            return;
+        }
+        let mut written = 0u32;
+
+        // Walk the scope chain exactly as `resolve` does, first match by
+        // name winning, then append what this compilation's own eval scope
+        // carried, so an eval inside an eval still sees the whole chain.
+        let mut scope = self.scope;
+        let mut depth = 0u32;
+        while scope != NONE {
+            let record = self.program.scope(scope);
+            let first = record.first as usize;
+            let mut index = 0u32;
+            while index < record.count {
+                let Some(binding) = self.program.bindings.get(first + index as usize) else {
+                    break;
+                };
+                let (name_start, name_end, slot, kind) =
+                    (binding.start, binding.end, binding.slot, binding.kind);
+                index += 1;
+                let name: &[u8] = self
+                    .source
+                    .get(name_start as usize..name_end as usize)
+                    .unwrap_or(&[]);
+                if name.is_empty() || site_holds(self.program.eval_sites, header_at + 16, at, name)
+                {
+                    continue;
+                }
+                if written >= MAX_EVAL_BINDINGS
+                    || !push_site_binding(
+                        self.program.eval_sites,
+                        &mut at,
+                        slot,
+                        depth,
+                        u32::from(kind),
+                        name,
+                    )
+                {
+                    flags |= FLAG_TRUNCATED;
+                    break;
+                }
+                written += 1;
+            }
+            if record.context {
+                depth += 1;
+            }
+            scope = record.parent;
+        }
+        if flags & FLAG_TRUNCATED == 0 {
+            for binding in self.program.eval_scope {
+                if site_holds(self.program.eval_sites, header_at + 16, at, binding.name) {
+                    continue;
+                }
+                if written >= MAX_EVAL_BINDINGS
+                    || !push_site_binding(
+                        self.program.eval_sites,
+                        &mut at,
+                        binding.slot,
+                        depth + binding.depth,
+                        binding.kind,
+                        binding.name,
+                    )
+                {
+                    flags |= FLAG_TRUNCATED;
+                    break;
+                }
+                written += 1;
+            }
+        }
+        if flags & FLAG_TRUNCATED != 0 {
+            // Half a scope is worse than none: the site keeps no record.
+            return;
+        }
+
+        let header = self.program.eval_sites.get_mut(header_at..header_at + 16);
+        let Some(header) = header else {
+            return;
+        };
+        header[0..4].copy_from_slice(&self.function_index.to_le_bytes());
+        header[4..8].copy_from_slice(&pc.to_le_bytes());
+        header[8..12].copy_from_slice(&flags.to_le_bytes());
+        header[12..16].copy_from_slice(&written.to_le_bytes());
+        self.program.eval_site_count += 1;
+        let count = self.program.eval_site_count;
+        self.program.eval_sites[0..4].copy_from_slice(&count.to_le_bytes());
+        self.program.eval_site_length = at;
     }
 
     fn construct(&mut self, node: &Node) {
@@ -3697,12 +4157,15 @@ impl Lowering<'_, '_, '_, '_> {
         }
     }
 
-    fn update(&mut self, index: u32, node: &Node) {
+    fn update(&mut self, _index: u32, node: &Node) {
         let target = self.node(node.first);
         let mark = self.registers;
+        // The reference is evaluated once and reused for the read and the
+        // write, exactly as a compound assignment does.
+        let reference = self.prepare_reference(&target);
         let old = self.allocate();
 
-        self.expression(node.first);
+        self.read_reference(&target, &reference);
         self.emit(Opcode::ToNumeric, &[]);
         self.emit(Opcode::Star, &[i64::from(old)]);
         let opcode = if node.third == unop::INCREMENT {
@@ -3711,7 +4174,7 @@ impl Lowering<'_, '_, '_, '_> {
             Opcode::Dec
         };
         self.emit(opcode, &[]);
-        self.store(&target, index);
+        self.write_reference(&target, &reference);
         if !node.has(flag::PREFIX) {
             self.emit(Opcode::Ldar, &[i64::from(old)]);
         }
@@ -3847,15 +4310,24 @@ impl Lowering<'_, '_, '_, '_> {
         let target = self.node(node.first);
         if node.third == binop::ASSIGN {
             self.expression(node.second);
+            if matches!(target.kind, NodeKind::Identifier) {
+                self.name_closure(node.second, &target);
+            }
             self.store(&target, node.first);
             return;
         }
+
+        // A compound or logical assignment evaluates its reference once: the
+        // base and the key are computed here and reused for the read and the
+        // write, so a side effect in either runs exactly once.
+        let mark = self.registers;
+        let reference = self.prepare_reference(&target);
 
         if matches!(
             node.third,
             binop::LOGICAL_AND | binop::LOGICAL_OR | binop::NULLISH
         ) {
-            self.expression(node.first);
+            self.read_reference(&target, &reference);
             let label = self.builder.label();
             let opcode = match node.third {
                 binop::LOGICAL_AND => Opcode::JumpIfToBooleanFalse,
@@ -3864,14 +4336,17 @@ impl Lowering<'_, '_, '_, '_> {
             };
             self.builder.jump(opcode, label);
             self.expression(node.second);
-            self.store(&target, node.first);
+            if matches!(target.kind, NodeKind::Identifier) {
+                self.name_closure(node.second, &target);
+            }
+            self.write_reference(&target, &reference);
             self.builder.bind(label);
+            self.release(mark);
             return;
         }
 
         // Compound assignment: read the target, apply the operator, store back.
-        let mark = self.registers;
-        self.expression(node.first);
+        self.read_reference(&target, &reference);
         let left = self.allocate();
         self.emit(Opcode::Star, &[i64::from(left)]);
         self.expression(node.second);
@@ -3900,9 +4375,165 @@ impl Lowering<'_, '_, '_, '_> {
             }
         };
         self.emit(opcode, &[i64::from(left)]);
+        self.write_reference(&target, &reference);
         self.release(mark);
-        self.store(&target, node.first);
     }
+
+    /// Name the closure the accumulator holds, when the expression that just
+    /// produced it was an anonymous function: what the specification calls
+    /// named evaluation.
+    fn name_closure(&mut self, value_node: u32, name_node: &Node) {
+        if !self.is_anonymous_function(value_node) {
+            return;
+        }
+        let constant = self.identifier_constant(name_node);
+        self.emit(Opcode::NameClosure, &[i64::from(constant)]);
+    }
+
+    /// Whether an expression is a function written with no name of its own,
+    /// which is what named evaluation applies to.
+    fn is_anonymous_function(&self, value_node: u32) -> bool {
+        let value = self.node(value_node);
+        matches!(value.kind, NodeKind::Function) && value.first == NONE
+    }
+
+    /// Evaluate a target's base and key once, into registers a read and a
+    /// write both use. A plain name needs no registers at all.
+    fn prepare_reference(&mut self, target: &Node) -> Reference {
+        match target.kind {
+            NodeKind::Member => {
+                let object = self.allocate();
+                self.expression(target.first);
+                self.emit(Opcode::Star, &[i64::from(object)]);
+                Reference {
+                    object,
+                    key: self.key_constant(target.second),
+                }
+            }
+            NodeKind::Index => {
+                let object = self.allocate();
+                self.expression(target.first);
+                self.emit(Opcode::Star, &[i64::from(object)]);
+                let key = self.allocate();
+                self.expression(target.second);
+                // The base must be coercible before the key is, and the key
+                // is coerced exactly once: the read and the write both take
+                // the property key this leaves.
+                self.emit(Opcode::ToPropertyKeyChecked, &[i64::from(object)]);
+                self.emit(Opcode::Star, &[i64::from(key)]);
+                Reference { object, key }
+            }
+            _ => Reference { object: 0, key: 0 },
+        }
+    }
+
+    fn read_reference(&mut self, target: &Node, reference: &Reference) {
+        match target.kind {
+            NodeKind::Member => self.emit(
+                Opcode::GetNamedProperty,
+                &[i64::from(reference.object), i64::from(reference.key)],
+            ),
+            NodeKind::Index => {
+                self.emit(Opcode::Ldar, &[i64::from(reference.key)]);
+                self.emit(Opcode::GetKeyedProperty, &[i64::from(reference.object)]);
+            }
+            _ => self.expression_target_read(target),
+        }
+    }
+
+    fn expression_target_read(&mut self, target: &Node) {
+        match target.kind {
+            NodeKind::Identifier => self.load_name(target),
+            _ => self.fail(target, code::LOWERING_NOT_ADMITTED),
+        }
+    }
+
+    fn write_reference(&mut self, target: &Node, reference: &Reference) {
+        match target.kind {
+            NodeKind::Member => self.emit(
+                Opcode::SetNamedProperty,
+                &[i64::from(reference.object), i64::from(reference.key)],
+            ),
+            NodeKind::Index => self.emit(
+                Opcode::SetKeyedProperty,
+                &[i64::from(reference.object), i64::from(reference.key)],
+            ),
+            _ => self.store_name(target),
+        }
+    }
+}
+
+/// A prepared assignment target: the base register and, for an indexed
+/// target, the key register — for a named one, the key constant.
+struct Reference {
+    object: u32,
+    key: u32,
+}
+
+/// Whether a statement list opens with a `use strict` directive.
+fn directive_prologue_is_strict(arena: &Arena<'_>, source: &[u8], list: u32, length: u32) -> bool {
+    for &statement in arena.list(list, length) {
+        let Some(node) = arena.node(statement) else {
+            break;
+        };
+        if !matches!(node.kind, NodeKind::ExpressionStatement) {
+            break;
+        }
+        let Some(expression) = arena.node(node.first) else {
+            break;
+        };
+        if !matches!(expression.kind, NodeKind::String) {
+            break;
+        }
+        // The node's inner span is the literal's text without its quotes.
+        let text = source
+            .get(expression.first as usize..expression.second as usize)
+            .unwrap_or(&[]);
+        if text == b"use strict" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Bindings one eval-site record may hold.
+const MAX_EVAL_BINDINGS: u32 = 64;
+
+/// Whether a name is already recorded in the site being built.
+fn site_holds(blob: &[u8], bindings_at: usize, end: usize, name: &[u8]) -> bool {
+    let mut at = bindings_at;
+    while at + 16 <= end {
+        let length =
+            u32::from_le_bytes([blob[at + 12], blob[at + 13], blob[at + 14], blob[at + 15]])
+                as usize;
+        if blob.get(at + 16..at + 16 + length) == Some(name) {
+            return true;
+        }
+        at += 16 + length;
+    }
+    false
+}
+
+/// Append one binding record, answering whether it fit.
+fn push_site_binding(
+    blob: &mut [u8],
+    at: &mut usize,
+    slot: u32,
+    depth: u32,
+    kind: u32,
+    name: &[u8],
+) -> bool {
+    let needed = 16 + name.len();
+    let Some(target) = blob.get_mut(*at..*at + needed) else {
+        return false;
+    };
+    target[0..4].copy_from_slice(&slot.to_le_bytes());
+    target[4..8].copy_from_slice(&depth.to_le_bytes());
+    target[8..12].copy_from_slice(&kind.to_le_bytes());
+    target[12..16].copy_from_slice(&u32::try_from(name.len()).unwrap_or(0).to_le_bytes());
+    target[16..].copy_from_slice(name);
+    *at += needed;
+    true
 }
 
 /// The first occurrence of `needle` in `haystack`, as a source position.
@@ -3918,28 +4549,4 @@ fn find_text(haystack: &[u8], needle: &[u8]) -> Option<u32> {
         index += 1;
     }
     None
-}
-
-/// The Number value a numeric property key's source text denotes.
-fn numeric_text(text: &[u8]) -> f64 {
-    let mut integer_end = text.len();
-    let mut index = 0usize;
-    while index < text.len() {
-        if text[index] == b'.' {
-            integer_end = index;
-            break;
-        }
-        index += 1;
-    }
-    let integer = text.get(..integer_end).unwrap_or(&[]);
-    let fraction = if integer_end < text.len() {
-        text.get(integer_end + 1..).unwrap_or(&[])
-    } else {
-        &[]
-    };
-    crate::numeric::decimal_value(crate::numeric::DecimalLiteral {
-        integer,
-        fraction,
-        exponent: 0,
-    })
 }

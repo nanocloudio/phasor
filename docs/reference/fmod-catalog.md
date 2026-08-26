@@ -11,7 +11,7 @@ frames are bounded binary records with explicit lengths and checked offsets.
 |---|---|---|---|---|
 | `phasor_compile` | Transformer | `source_in` | `image_out`, `diagnostic`, `exit` | Lexing, parsing, early errors, bytecode emission, verification, image serialisation. A parameter says whether the source is a script or a module |
 | `phasor_link` | Transformer | `unit_in` | `closure_out`, `exit` | Module closure: admitting each image, resolving every specifier and imported name, ordering the closure, writing the container |
-| `phasor_isolate` | EventHandler | `image_in`, `completion_in` | `result_out`, `call_out`, `diagnostic`, `exit` | Realm, machine, objects, heap, collection, jobs, promises, pending calls, module evaluation |
+| `phasor_isolate` | EventHandler | `image_in`, `completion_in`, `control_in` | `result_out`, `call_out`, `diagnostic`, `exit` | Realm, machine, objects, heap, collection, jobs, promises, pending calls, module evaluation |
 | `phasor_host_router` | Protocol | `call_in`, `reply_in` | `completion_out`, `request_out` | Binding admission, routing, correlation, bounded in-flight table |
 | `phasor_cli` | Cli | `result_in`, `diagnostic_in`, `runtime_in` | `stdout`, `stderr`, `exit` | Human framing: the only place that turns a diagnostic's numbers into words |
 | `phasor_time` | Adapter | `request_in` | `reply_out` | A time observation, in the unit a parameter names, under a quota it sets |
@@ -66,7 +66,7 @@ Every fmod's work is bounded per step and its state carries the rest.
 |---|---|
 | `phasor_compile` | source bytes staged per step, syntax nodes, constants, code bytes |
 | `phasor_link` | modules in a closure, bytes of stream and closure |
-| `phasor_isolate` | `steps` a program may run, instructions per slice, jobs per slice, collection slice, calls in flight, steps a call may wait |
+| `phasor_isolate` | `steps` a program may run, `call_wait` steps before an unanswered call times out, instructions per slice, jobs per slice, collection slice, calls in flight |
 | `phasor_host_router` | calls in flight, frames staged per output |
 | `phasor_fault_host`, `phasor_time`, `phasor_entropy` | replies staged, and the quota an adapter was given |
 | `phasor_cli` | bytes of result and of rendered text |

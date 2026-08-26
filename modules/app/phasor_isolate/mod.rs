@@ -108,11 +108,14 @@ const POLL_OUTPUT: u32 = 0x02;
 
 const IMAGE_CAPACITY: usize = 64 * 1024;
 const RESULT_CAPACITY: usize = 128;
-const ARENA_BYTES: usize = 64 * 1024;
-const SLOT_COUNT: usize = 1536;
-const WORKLIST: usize = 512;
-const ATOM_ENTRIES: usize = 512;
-const ATOM_HANDLES: usize = 384;
+// Sized for the application-class targets this fmod declares: a program that
+// holds a few thousand properties is ordinary, and refusing it would be a
+// policy choice no deployment asked for.
+const ARENA_BYTES: usize = 256 * 1024;
+const SLOT_COUNT: usize = 8192;
+const WORKLIST: usize = 2048;
+const ATOM_ENTRIES: usize = 1024;
+const ATOM_HANDLES: usize = 768;
 /// How deep a program may call, and how many registers those calls may hold.
 /// A call is a frame here rather than a host stack frame, so this number is
 /// what a program's recursion is bounded by: deep enough for ordinary nesting,
@@ -124,8 +127,9 @@ const JOB_COUNT: usize = 32;
 const BINDING_COUNT: usize = 1;
 const PENDING_COUNT: usize = 4;
 const IN_FLIGHT_MAX: u32 = 4;
-/// Roots a collection stages before it starts.
-const ROOT_COUNT: usize = 2048;
+/// Roots a collection stages before it starts: the registers in use, the
+/// frames, the interned handles, and the realm all fit with room over.
+const ROOT_COUNT: usize = 8192;
 /// Cells or bytes one collection slice works through.
 const COLLECTION_SLICE: u32 = 512;
 /// Free arena below which the isolate collects rather than waiting to fail.
@@ -139,9 +143,17 @@ const STEPS: u32 = 20_000_000;
 const SLICE: u64 = 4096;
 /// Jobs one module step may run, so a flood of reactions still yields.
 const JOB_SLICE: u32 = 16;
-/// Steps a call may wait for an answer before the isolate times it out. A
-/// provider that never answers must not hold a task open forever.
+/// Steps a call may wait for an answer before the isolate times it out, when
+/// the graph names no other number. A provider that never answers must not
+/// hold a task open forever, and a deployment that knows its providers says
+/// how long waiting is reasonable.
 const WAIT_LIMIT: u32 = 5_000;
+/// One control record: a kind, three bytes of padding, and a value.
+/// Kind 1 asks the task to stop at its next safe point; kind 2 sets the
+/// deadline, in the host's own time units; kind 3 reports the current time in
+/// those units. A deadline passes only when a reported time reaches it, so a
+/// graph that wires no clock has no deadline.
+const CONTROL_FRAME: usize = 12;
 /// Modules one closure may hold, and imports it may have in total.
 const MAX_MODULES: usize = 16;
 const MAX_IMPORTS: usize = 128;
@@ -188,7 +200,20 @@ struct State {
     call_out: i32,
     diagnostic_out: i32,
     exit_out: i32,
+    control_in: i32,
     steps: u32,
+    call_wait: u32,
+    /// What the control port has asked for, applied to the machine each step.
+    cancel_requested: bool,
+    deadline: u64,
+    now: u64,
+    control_frame: [u8; CONTROL_FRAME],
+    control_filled: usize,
+    /// Counters for the telemetry ring, in `[observability].metrics` order.
+    fuel_spent: u64,
+    collections: u32,
+    calls_made: u32,
+    completions_applied: u32,
     image: [u8; IMAGE_CAPACITY],
     result: [u8; RESULT_CAPACITY],
     arena: [u8; ARENA_BYTES],
@@ -493,6 +518,18 @@ fn advance(state: &mut State) -> Advance {
     }
     machine.restore_all(&state.saves);
     machine.retain(state.result_value);
+    // What the control port asked for reaches the machine here, every step:
+    // a cancel is sticky, and a deadline passes when a reported time reaches
+    // it. The machine observes both only at safe points.
+    if state.cancel_requested {
+        machine.control().cancel();
+    }
+    if state.deadline != 0 {
+        machine.control().set_deadline(state.deadline);
+    }
+    if state.now != 0 {
+        machine.control().observe(state.now);
+    }
 
     let mut outcome = Advance::Running;
     let mut progressed = false;
@@ -504,6 +541,7 @@ fn advance(state: &mut State) -> Advance {
         state.wire.filled = 0;
         if let Some(record) = CompletionRecord::decode(&state.wire.completion) {
             let _ = machine.apply_completion(&record);
+            state.completions_applied = state.completions_applied.saturating_add(1);
             progressed = true;
         }
     }
@@ -655,6 +693,8 @@ fn advance(state: &mut State) -> Advance {
         if at != staged {
             state.wire.staged = at;
             machine.take_calls();
+            let staged_now = u32::try_from((at - staged) / CALL_FRAME).unwrap_or(0);
+            state.calls_made = state.calls_made.saturating_add(staged_now);
             progressed = true;
         }
     }
@@ -664,7 +704,7 @@ fn advance(state: &mut State) -> Advance {
     // an ordinary rejection saying why.
     if outcome == Advance::Running && !progressed && bindings_in_flight(&machine) > 0 {
         state.wire.waited = state.wire.waited.saturating_add(1);
-        if state.wire.waited > WAIT_LIMIT {
+        if state.wire.waited > state.call_wait {
             let mut requests = [0u64; PENDING_COUNT];
             let count = machine.outstanding(&mut requests);
             for &request in requests.get(..count).unwrap_or(&[]) {
@@ -713,6 +753,8 @@ fn advance(state: &mut State) -> Advance {
         }
     }
 
+    state.fuel_spent = u64::from(steps).saturating_sub(machine.fuel());
+    state.collections = machine.collections();
     state.saves = machine.save();
     outcome
 }
@@ -868,6 +910,7 @@ pub extern "C" fn module_new(
         core::ptr::addr_of_mut!((*state).call_out).write(dev_channel_port(&*table, 1, 1));
         core::ptr::addr_of_mut!((*state).diagnostic_out).write(dev_channel_port(&*table, 1, 2));
         core::ptr::addr_of_mut!((*state).exit_out).write(dev_channel_port(&*table, 1, 3));
+        core::ptr::addr_of_mut!((*state).control_in).write(dev_channel_port(&*table, 0, 2));
         apply_params(&mut *state, params, params_len);
     }
     0
@@ -878,6 +921,9 @@ define_params! {
 
     1, steps, u32, 20_000_000
         => |s, d, len| { s.steps = p_u32(d, len, 0, 20_000_000); };
+
+    2, call_wait, u32, 5_000
+        => |s, d, len| { s.call_wait = p_u32(d, len, 0, WAIT_LIMIT); };
 }
 
 /// Take the graph's parameters, or the defaults where it gave none.
@@ -893,6 +939,87 @@ unsafe fn apply_params(state: &mut State, params: *const u8, params_len: usize) 
         parse_tlv(state, params, params_len);
     } else {
         set_defaults(state);
+    }
+}
+
+/// Emit the task's counters to the telemetry ring, once, when it ends.
+///
+/// Emission is gated on a subscribed consumer, so an unobserved graph pays
+/// nothing. What leaves is numbers about the run — outcomes, fuel, collection
+/// and call counts — never source, values, or payloads.
+fn emit_telemetry(state: &mut State, syscalls: &SyscallTable) {
+    unsafe {
+        if !dev_telemetry_enabled(syscalls) {
+            return;
+        }
+        let me = dev_self_index(syscalls);
+        if me < 0 {
+            return;
+        }
+        let midx = me as u16;
+        let t = dev_micros(syscalls);
+        let counter = abi::contracts::telemetry::METRIC_COUNTER;
+        let outcome_finished = u64::from(!state.failed && !state.rejected);
+        let outcome_stopped = u64::from(state.failed);
+        let outcome_rejected = u64::from(state.rejected);
+        for (id, value) in [
+            (0u16, outcome_finished),
+            (1, outcome_stopped),
+            (2, outcome_rejected),
+            (3, state.fuel_spent),
+            (4, u64::from(state.collections)),
+            (5, u64::from(state.calls_made)),
+            (6, u64::from(state.completions_applied)),
+        ] {
+            dev_telemetry_metric(syscalls, -1, midx, t, counter, id, value);
+        }
+    }
+}
+
+/// Drain whole control records, staging a partial read until it completes.
+fn drain_control(state: &mut State, syscalls: &SyscallTable) {
+    if state.control_in < 0 {
+        return;
+    }
+    loop {
+        let poll = unsafe { (syscalls.channel_poll)(state.control_in, POLL_INPUT) };
+        if poll <= 0 || (poll as u32) & POLL_INPUT == 0 {
+            return;
+        }
+        let offset = state.control_filled;
+        let remaining = CONTROL_FRAME - offset;
+        let read = unsafe {
+            (syscalls.channel_read)(
+                state.control_in,
+                state.control_frame.as_mut_ptr().add(offset),
+                remaining,
+            )
+        };
+        if read <= 0 {
+            return;
+        }
+        state.control_filled += usize::try_from(read).unwrap_or(0).min(remaining);
+        if state.control_filled < CONTROL_FRAME {
+            continue;
+        }
+        state.control_filled = 0;
+        let kind = state.control_frame[0];
+        let value = u64::from_le_bytes([
+            state.control_frame[4],
+            state.control_frame[5],
+            state.control_frame[6],
+            state.control_frame[7],
+            state.control_frame[8],
+            state.control_frame[9],
+            state.control_frame[10],
+            state.control_frame[11],
+        ]);
+        match kind {
+            1 => state.cancel_requested = true,
+            2 => state.deadline = value,
+            3 => state.now = value,
+            _ => {}
+        }
     }
 }
 
@@ -1002,6 +1129,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.phase == 3 {
         return 1;
     }
+    drain_control(state, syscalls);
 
     if state.phase == 0 {
         if !stage_image(state, syscalls) {
@@ -1093,6 +1221,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 return 0;
             }
         }
+        emit_telemetry(state, syscalls);
         state.phase = 3;
         // A program that stopped, threw, or was refused is an outcome: the exit
         // status says what happened and the diagnostic says why. A module error

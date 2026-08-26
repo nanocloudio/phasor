@@ -60,6 +60,8 @@ mod dtoa;
 mod emit;
 #[path = "../../common/env.rs"]
 mod env;
+#[path = "../../common/evalsite.rs"]
+mod evalsite;
 #[path = "../../common/feature.rs"]
 mod feature;
 #[path = "../../common/gc.rs"]
@@ -104,11 +106,12 @@ mod vm;
 use arena::{Arena, Node};
 use bytecode::{Constant, ExceptionRegion, ExportRecord, Function, ImportRecord, Unit};
 use emit::Patch;
+use evalsite::EvalBinding;
 use heap::{Heap, Slot};
 use job::{Job, Queue};
 use lex::Lexer;
 use lower::{
-    lower_script, Binding as LexicalBinding, Pending as PendingFunction, Scope,
+    lower_eval, lower_script, Binding as LexicalBinding, Pending as PendingFunction, Scope,
     Storage as LowerStorage,
 };
 use parse::Parser;
@@ -128,7 +131,11 @@ const PRELUDE_CAPACITY: usize = 8 * 1024;
 const SOURCE_CAPACITY: usize = PRELUDE_CAPACITY + 1 + CASE_CAPACITY;
 const HEADER: usize = 6;
 
-/// Instructions one case may run, and lexer fuel for one compile.
+/// Instructions one case may run, and lexer fuel for one compile. A handful
+/// of sweeping cases exhaust this deliberately: five walk a whole plane of
+/// code units through a one-shot `eval` apiece, and two declare thousands of
+/// identifiers in one source. They stop on the bound and the baseline records
+/// the stop, which is truer of this engine than a number chosen to hide it.
 const STEPS: u64 = 5_000_000;
 const FUEL: u32 = 40_000_000;
 /// Jobs drained per round after the body finishes, and the rounds admitted.
@@ -158,6 +165,7 @@ const LEXICAL_CAPACITY: usize = 2048;
 const PENDING_CAPACITY: usize = 384;
 const IMPORT_CAPACITY: usize = 8;
 const EXPORT_CAPACITY: usize = 8;
+const EVAL_SITE_CAPACITY: usize = 2048;
 
 /// Machine storage, larger than the isolate's: a conformance case is allowed
 /// to be greedier than a deployed program.
@@ -205,6 +213,7 @@ struct Storage {
     pending: [PendingFunction; PENDING_CAPACITY],
     imports: [ImportRecord; IMPORT_CAPACITY],
     exports: [ExportRecord; EXPORT_CAPACITY],
+    eval_sites: [u8; EVAL_SITE_CAPACITY],
     arena: [u8; ARENA_BYTES],
     slots: [Slot; SLOT_COUNT],
     worklist: [u32; WORKLIST],
@@ -244,7 +253,14 @@ fn digest_of(bytes: &[u8]) -> u64 {
 }
 
 /// Compile one source into `image`, answering the image length.
-fn compile_into(storage: &mut FrontEnd<'_>, source: &[u8], image: &mut [u8]) -> Option<usize> {
+fn compile_into(
+    storage: &mut FrontEnd<'_>,
+    source: &[u8],
+    image: &mut [u8],
+    direct: bool,
+    scope: &[EvalBinding<'_>],
+    strict: bool,
+) -> Option<usize> {
     let table = LineTable::new(storage.starts);
     let lexer = Lexer::new(source, Limits::CEILING, table, FUEL).ok()?;
     let syntax = Arena::new(storage.nodes, storage.lists, storage.numbers);
@@ -268,8 +284,14 @@ fn compile_into(storage: &mut FrontEnd<'_>, source: &[u8], image: &mut [u8]) -> 
         pending: storage.pending,
         imports: storage.imports,
         exports: storage.exports,
+        eval_sites: storage.eval_sites,
     };
-    let compiled = lower_script(source, parser.arena(), root, &mut lowering).ok()?;
+    let compiled = if direct {
+        lower_eval(source, parser.arena(), root, &mut lowering, scope, strict)
+    } else {
+        lower_script(source, parser.arena(), root, &mut lowering)
+    }
+    .ok()?;
     Some(compiled.length)
 }
 
@@ -296,6 +318,7 @@ struct FrontEnd<'a> {
     pending: &'a mut [PendingFunction; PENDING_CAPACITY],
     imports: &'a mut [ImportRecord; IMPORT_CAPACITY],
     exports: &'a mut [ExportRecord; EXPORT_CAPACITY],
+    eval_sites: &'a mut [u8; EVAL_SITE_CAPACITY],
 }
 
 /// Compile and run one assembled source.
@@ -328,6 +351,7 @@ fn execute(storage: &mut Storage, source: &[u8]) -> Ran {
             pending: &mut storage.pending,
             imports: &mut storage.imports,
             exports: &mut storage.exports,
+            eval_sites: &mut storage.eval_sites,
         };
         match lower_script(source, parser.arena(), root, &mut lowering) {
             Ok(compiled) => compiled.length,
@@ -343,6 +367,11 @@ fn execute(storage: &mut Storage, source: &[u8]) -> Ran {
     // storage with the unit attached, and the eval is entered as a frame. A
     // repeated source reuses its slot, so a loop over one eval is bounded.
     let mut eval_count = 0usize;
+    // When every slot is taken, the oldest is replaced round-robin. A unit a
+    // program still holds a closure into would then be wrong, not unsafe —
+    // the corpus's sweeping cases eval thousands of one-shot sources and hold
+    // nothing, which is what the rotation is for.
+    let mut evict_next = 0usize;
     let mut saves: Option<vm::Saves> = None;
     let mut kept_realm: Option<realm::Realm> = None;
     let mut enter: Option<u32> = None;
@@ -352,6 +381,7 @@ fn execute(storage: &mut Storage, source: &[u8]) -> Ran {
         // What to do next, decided while the machine exists and acted on
         // after its borrows end.
         let mut compile_request: Option<usize> = None;
+        let mut compile_site: Option<(u32, u32, u32)> = None;
         {
             let Ok(unit) = Unit::parse(storage.image.get(..length).unwrap_or(&[])) else {
                 return Ran::Refused;
@@ -360,8 +390,12 @@ fn execute(storage: &mut Storage, source: &[u8]) -> Ran {
             units[0] = unit;
             let mut slot = 0usize;
             while slot < eval_count {
-                let held = storage.eval_lengths[slot];
-                let image = storage.eval_images[slot].get(..held).unwrap_or(&[]);
+                let held = storage.eval_lengths.get(slot).copied().unwrap_or(0);
+                let image = storage
+                    .eval_images
+                    .get(slot)
+                    .and_then(|image| image.get(..held))
+                    .unwrap_or(&[]);
                 let Ok(parsed) = Unit::parse(image) else {
                     return Ran::Stopped;
                 };
@@ -501,6 +535,7 @@ fn execute(storage: &mut Storage, source: &[u8]) -> Ran {
                         }
                         if fits {
                             compile_request = Some(at);
+                            compile_site = machine.pending_eval_site();
                         } else {
                             fail_pending = true;
                         }
@@ -529,19 +564,34 @@ fn execute(storage: &mut Storage, source: &[u8]) -> Ran {
         // The machine's borrows have ended; compile the staged source.
         if let Some(source_length) = compile_request {
             let source = storage.eval_source.get(..source_length).unwrap_or(&[]);
-            let digest = digest_of(source);
+            // A direct eval compiles against its site's scope, so the slot's
+            // identity is the source AND the site: the same text at another
+            // site is another unit.
+            let mut digest = digest_of(source);
+            if let Some((module, function, pc)) = compile_site {
+                digest ^= digest_of(&module.to_le_bytes())
+                    .rotate_left(1)
+                    .wrapping_add(u64::from(function) << 32 | u64::from(pc));
+            }
             let mut found = None;
             let mut slot = 0usize;
             while slot < eval_count {
-                if storage.eval_digests[slot] == digest {
+                if storage.eval_digests.get(slot).copied() == Some(digest) {
                     found = Some(slot);
                     break;
                 }
                 slot += 1;
             }
+            let target_slot = if eval_count >= EVAL_SLOTS {
+                let slot = evict_next;
+                evict_next = (evict_next + 1) % EVAL_SLOTS;
+                slot
+            } else {
+                eval_count
+            }
+            .min(EVAL_SLOTS - 1);
             match found {
                 Some(slot) => enter = Some(u32::try_from(slot + 1).unwrap_or(0)),
-                None if eval_count >= EVAL_SLOTS => fail_pending = true,
                 None => {
                     let mut front = FrontEnd {
                         starts: &mut storage.starts,
@@ -565,14 +615,73 @@ fn execute(storage: &mut Storage, source: &[u8]) -> Ran {
                         pending: &mut storage.pending,
                         imports: &mut storage.imports,
                         exports: &mut storage.exports,
+                        eval_sites: &mut storage.eval_sites,
                     };
                     let source = storage.eval_source.get(..source_length).unwrap_or(&[]);
-                    match compile_into(&mut front, source, &mut storage.eval_images[eval_count]) {
+                    // The caller's recorded scope, when the pause was a
+                    // recorded direct-eval site.
+                    let (done, rest) = storage.eval_images.split_at_mut(target_slot);
+                    let mut scope = [EvalBinding {
+                        name: &[],
+                        slot: 0,
+                        depth: 0,
+                        kind: 0,
+                    }; 64];
+                    let mut scope_count = 0usize;
+                    let mut strict = false;
+                    let mut direct = false;
+                    if let Some((module, function, pc)) = compile_site {
+                        let image: &[u8] = if module == 0 {
+                            storage.image.get(..length).unwrap_or(&[])
+                        } else if (module as usize - 1) < target_slot {
+                            let held = storage
+                                .eval_lengths
+                                .get(module as usize - 1)
+                                .copied()
+                                .unwrap_or(0);
+                            done.get(module as usize - 1)
+                                .and_then(|slot| slot.get(..held))
+                                .unwrap_or(&[])
+                        } else {
+                            // The pausing unit is at or past the slot being
+                            // replaced; its record is out of reach here, and
+                            // the eval runs as global code.
+                            &[]
+                        };
+                        if let Ok(unit) = Unit::parse(image) {
+                            if let Some(site) = evalsite::find(unit.eval_sites(), function, pc) {
+                                direct = true;
+                                strict = site.flags & evalsite::FLAG_STRICT != 0;
+                                if site.flags & evalsite::FLAG_TRUNCATED == 0 {
+                                    scope_count = site.bindings(&mut scope);
+                                }
+                            }
+                        }
+                    }
+                    let out = rest.first_mut();
+                    let Some(out) = out else {
+                        fail_pending = true;
+                        continue;
+                    };
+                    match compile_into(
+                        &mut front,
+                        source,
+                        out,
+                        direct,
+                        scope.get(..scope_count).unwrap_or(&[]),
+                        strict,
+                    ) {
                         Some(compiled) => {
-                            storage.eval_lengths[eval_count] = compiled;
-                            storage.eval_digests[eval_count] = digest;
-                            eval_count += 1;
-                            enter = Some(u32::try_from(eval_count).unwrap_or(0));
+                            if let Some(slot) = storage.eval_lengths.get_mut(target_slot) {
+                                *slot = compiled;
+                            }
+                            if let Some(slot) = storage.eval_digests.get_mut(target_slot) {
+                                *slot = digest;
+                            }
+                            if target_slot == eval_count {
+                                eval_count += 1;
+                            }
+                            enter = Some(u32::try_from(target_slot + 1).unwrap_or(0));
                         }
                         None => fail_pending = true,
                     }

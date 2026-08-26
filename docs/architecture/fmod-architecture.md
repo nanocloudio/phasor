@@ -161,22 +161,24 @@ own those meanings.
 
 ## Artifact transport
 
-Every variable-size source, unit, image, host payload, structured clone,
-diagnostic block, and result uses fixed-maximum atomic records:
+Every variable-size artefact — a source, a unit image, a linked closure, a
+result — travels as one ordered stream on a channel of its own, ended by the
+writer's hang-up. The channel gives the transport its guarantees: one writer,
+ordered delivery, and atomic record writes, so a backpressured writer retries
+an entire record rather than a suffix, and partial reads are staged until a
+whole record exists.
 
-```text
-Begin { transfer, total_bytes, logical_digest, limits }
-Chunk { transfer, offset, length, bytes }
-Commit { transfer, logical_digest }
-Abort { transfer, reason }
-```
+The receiver declares its capacity and fails closed: a stream larger than the
+declared maximum is drained and refused, never truncated into a shorter
+artefact. Nothing acts on a partial stream — an image is staged whole before
+admission, and admission verifies the digest the artefact carries before
+anything runs, so an artefact that changed in transit is refused by identity
+rather than trusted by arrival. Fixed-size records — call frames, completion
+frames, diagnostic frames, control records — are read whole for the same
+reason: a partial record is not a record.
 
-The receiver reserves the admitted total before accepting `Begin`, rejects
-overlap, gaps, overflow, and wrong digests, and exposes nothing before a valid
-`Commit`. Partial channel reads are staged until one complete record exists.
-Because Fluxor writes are atomic, a backpressured writer retries the entire
-record, not a suffix. Compiler and linker construction state may advance before
-output; only publication is transactional.
+Compiler and linker construction state may advance before output; only
+publication crosses a channel.
 
 ## Failure model
 

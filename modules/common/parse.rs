@@ -11,7 +11,7 @@
 //! expressions, are rejected by name rather than mis-parsed.
 
 use crate::arena::{binary_operator as binop, flag, unary_operator as unop};
-use crate::arena::{declaration, property_key, Arena, Full, Node, NodeKind};
+use crate::arena::{declaration, property_key, property_kind, Arena, Full, Node, NodeKind};
 use crate::diagnostic::{arena as arena_argument, code, syntax_feature, Diagnostic, Severity};
 use crate::lex::{Goal, Keyword, Lexer, Punctuator, Token, TokenKind};
 use crate::source::Limits;
@@ -990,44 +990,29 @@ impl<'s, 't, 'a, 'k> Parser<'s, 't, 'a, 'k> {
                 .push(Node::new(NodeKind::Spread, token.start, end).with_payload(value, 0, 0));
         }
 
-        let key = match token.kind {
-            TokenKind::Punctuator(Punctuator::OpenBracket) => {
+        // `get name(...)` and `set name(...)` define accessors; `get` and
+        // `set` followed by anything else are ordinary property names.
+        if matches!(token.kind, TokenKind::Identifier)
+            && !token.escaped
+            && matches!(self.token_text(&token), b"get" | b"set")
+        {
+            let after = self.peek_after(&token)?;
+            let names_property = matches!(
+                after.kind,
+                TokenKind::Identifier
+                    | TokenKind::Keyword(_)
+                    | TokenKind::String
+                    | TokenKind::Number
+                    | TokenKind::Punctuator(Punctuator::OpenBracket)
+            );
+            if names_property {
+                let getter = self.token_text(&token) == b"get";
                 self.bump(&token);
-                let expression = self.parse_assignment()?;
-                let _ = self.expect(Punctuator::CloseBracket, code::EXPECTED_CLOSE_BRACKET)?;
-                let end = self.previous_end;
-                self.push(
-                    Node::new(NodeKind::ComputedKey, token.start, end)
-                        .with_payload(expression, 0, 0),
-                )?
+                return self.parse_accessor(getter);
             }
-            TokenKind::Identifier
-            | TokenKind::Keyword(_)
-            | TokenKind::String
-            | TokenKind::Number => {
-                self.bump(&token);
-                let written = match token.kind {
-                    TokenKind::String => property_key::STRING,
-                    TokenKind::Number => property_key::NUMBER,
-                    _ => property_key::IDENTIFIER,
-                };
-                self.push(
-                    Node::new(NodeKind::PropertyName, token.start, token.end).with_payload(
-                        token.inner_start,
-                        token.inner_end,
-                        written,
-                    ),
-                )?
-            }
-            _ => {
-                return Err(Diagnostic::new(
-                    code::EXPECTED_PROPERTY_NAME,
-                    Severity::Error,
-                    token.start,
-                    token.end.saturating_sub(token.start),
-                ));
-            }
-        };
+        }
+
+        let key = self.parse_property_key(&token)?;
 
         let next = self.peek(Goal::Div)?;
         match next.kind {
@@ -1070,6 +1055,94 @@ impl<'s, 't, 'a, 'k> Parser<'s, 't, 'a, 'k> {
                 )
             }
         }
+    }
+
+    /// One accessor property: the key, an empty or one-name parameter list,
+    /// and a body, carried as an anonymous function the property points at.
+    fn parse_accessor(&mut self, getter: bool) -> Result<u32, Diagnostic> {
+        let token = self.peek(Goal::RegExp)?;
+        let key = self.parse_property_key(&token)?;
+
+        let mark = self.mark();
+        self.push_child(0)?;
+        self.expect(Punctuator::OpenParen, code::UNEXPECTED_TOKEN)?;
+        if !getter {
+            let parameter = self.parse_parameter()?;
+            self.push_child(parameter)?;
+        }
+        self.expect(Punctuator::CloseParen, code::UNEXPECTED_TOKEN)?;
+        let body = self.parse_block()?;
+        if let Some(slot) = self.scratch.get_mut(mark) {
+            *slot = body;
+        }
+        let (list, length) = self.close_list(mark)?;
+        let start = self.node_start(key);
+        let function = self.push(
+            Node::new(NodeKind::Function, start, self.previous_end).with_payload(
+                crate::arena::NONE,
+                list,
+                length,
+            ),
+        )?;
+        self.leave();
+        let kind = if getter {
+            property_kind::GETTER
+        } else {
+            property_kind::SETTER
+        };
+        self.push(
+            Node::new(NodeKind::Property, start, self.previous_end)
+                .with_payload(key, function, kind),
+        )
+    }
+
+    /// One property key: a computed key in brackets, or a name written as
+    /// an identifier, a keyword, a string, or a number.
+    fn parse_property_key(&mut self, token: &Token) -> Result<u32, Diagnostic> {
+        let key = match token.kind {
+            TokenKind::Punctuator(Punctuator::OpenBracket) => {
+                self.bump(token);
+                let expression = self.parse_assignment()?;
+                let _ = self.expect(Punctuator::CloseBracket, code::EXPECTED_CLOSE_BRACKET)?;
+                let end = self.previous_end;
+                self.push(
+                    Node::new(NodeKind::ComputedKey, token.start, end)
+                        .with_payload(expression, 0, 0),
+                )?
+            }
+            TokenKind::Identifier
+            | TokenKind::Keyword(_)
+            | TokenKind::String
+            | TokenKind::Number => {
+                self.bump(token);
+                let written = match token.kind {
+                    TokenKind::String => property_key::STRING,
+                    TokenKind::Number => property_key::NUMBER,
+                    _ => property_key::IDENTIFIER,
+                };
+                // A numeric key carries the value the lexer read, not the text
+                // it was written as: what the property is called is that
+                // number's own rendering, which `0x10` and `1e3` do not spell.
+                let (first, second) = if written == property_key::NUMBER {
+                    (self.push_number(token.number)?, 0)
+                } else {
+                    (token.inner_start, token.inner_end)
+                };
+                self.push(
+                    Node::new(NodeKind::PropertyName, token.start, token.end)
+                        .with_payload(first, second, written),
+                )?
+            }
+            _ => {
+                return Err(Diagnostic::new(
+                    code::EXPECTED_PROPERTY_NAME,
+                    Severity::Error,
+                    token.start,
+                    token.end.saturating_sub(token.start),
+                ));
+            }
+        };
+        Ok(key)
     }
 
     /// A template literal: alternating elements and substitutions, beginning
@@ -1452,7 +1525,10 @@ impl<'s, 't, 'a, 'k> Parser<'s, 't, 'a, 'k> {
     fn peek_after(&mut self, token: &Token) -> Result<Token, Diagnostic> {
         self.pending = None;
         self.lexer.seek(token.end);
-        let next = self.lexer.next(Goal::RegExp)?;
+        // Both callers hand this an identifier, and after an identifier the
+        // lexical goal is division: `r /= 2` continues the expression, and a
+        // `/` here is never the start of a regular-expression literal.
+        let next = self.lexer.next(Goal::Div)?;
         self.lexer.seek(token.start);
         self.pending = None;
         let again = self.lexer.next(Goal::RegExp)?;
@@ -1654,8 +1730,27 @@ impl<'s, 't, 'a, 'k> Parser<'s, 't, 'a, 'k> {
                 self.parse_expression()?
             };
 
-            // `in` and `of` turn the header into an iteration.
+            // A bare-name head swallows `in` as the operator it also is:
+            // `for (q in o)` parses as one binary expression. When that
+            // expression sits right before the closing parenthesis, it is
+            // the iteration header, split back into its two halves — unless
+            // it was written in parentheses of its own, where `for ((q in o))`
+            // is a head with no `;` and so no statement at all.
             let next = self.peek(Goal::Div)?;
+            if next.kind == TokenKind::Punctuator(Punctuator::CloseParen)
+                && !self.is_parenthesised(initialiser)
+            {
+                if let Some(node) = self.arena.node(initialiser).copied() {
+                    if matches!(node.kind, NodeKind::Binary) && node.third == binop::IN {
+                        self.bump(&next);
+                        let body = self.parse_statement()?;
+                        return self.push(
+                            Node::new(NodeKind::ForInOf, keyword.start, self.previous_end)
+                                .with_payload(node.first, node.second, body),
+                        );
+                    }
+                }
+            }
             let is_of = matches!(next.kind, TokenKind::Identifier)
                 && !next.escaped
                 && self.token_text(&next) == b"of";

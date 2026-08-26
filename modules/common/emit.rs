@@ -356,6 +356,7 @@ impl<'a> UnitWriter<'a> {
             &[],
             &[],
             0,
+            &[],
         )
     }
 
@@ -377,6 +378,7 @@ impl<'a> UnitWriter<'a> {
         imports: &[ImportRecord],
         exports: &[ExportRecord],
         flags: u32,
+        eval_sites: &[u8],
     ) -> Result<usize, BuildError> {
         self.put(&UNIT_MAGIC);
         self.put(&format_digest().0);
@@ -391,7 +393,7 @@ impl<'a> UnitWriter<'a> {
         self.put_u32(flags);
         self.put_u32(u32::try_from(imports.len()).unwrap_or(u32::MAX));
         self.put_u32(u32::try_from(exports.len()).unwrap_or(u32::MAX));
-        self.put_u32(0);
+        self.put_u32(u32::try_from(eval_sites.len()).unwrap_or(u32::MAX));
         debug_assert_eq!(self.cursor, HEADER_SIZE);
 
         for function in functions {
@@ -447,6 +449,8 @@ impl<'a> UnitWriter<'a> {
             self.put_u32(record.name);
             self.put_u32(record.slot);
         }
+
+        self.put(eval_sites);
 
         if self.failed {
             return Err(BuildError::Full);

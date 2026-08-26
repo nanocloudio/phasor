@@ -35,6 +35,8 @@ mod dtoa;
 mod emit;
 #[path = "../../common/env.rs"]
 mod env;
+#[path = "../../common/evalsite.rs"]
+mod evalsite;
 #[path = "../../common/feature.rs"]
 mod feature;
 #[path = "../../common/gc.rs"]
@@ -134,6 +136,7 @@ const LEXICAL_CAPACITY: usize = 256;
 const PENDING_CAPACITY: usize = 64;
 const IMPORT_CAPACITY: usize = 32;
 const EXPORT_CAPACITY: usize = 32;
+const EVAL_SITE_CAPACITY: usize = 2048;
 /// Where a match backtracks, what it must put back, and the units it runs over.
 const CHOICE_COUNT: usize = 256;
 const UNDO_COUNT: usize = 256;
@@ -161,6 +164,7 @@ struct Storage {
     pending: [PendingFunction; PENDING_CAPACITY],
     imports: [ImportRecord; IMPORT_CAPACITY],
     exports: [ExportRecord; EXPORT_CAPACITY],
+    eval_sites: [u8; EVAL_SITE_CAPACITY],
     arena: [u8; ARENA_BYTES],
     choices: [Choice; CHOICE_COUNT],
     undo: [(u8, u32); UNDO_COUNT],
@@ -205,6 +209,7 @@ fn evaluates(storage: &mut Storage, source: &[u8], expected: &[u8]) -> bool {
             pending: &mut storage.pending,
             imports: &mut storage.imports,
             exports: &mut storage.exports,
+            eval_sites: &mut storage.eval_sites,
         };
         match lower_expression(source, parser.arena(), root, &mut lowering) {
             Ok(compiled) => compiled.length,
@@ -373,6 +378,7 @@ fn run_chain(
             pending: &mut storage.pending,
             imports: &mut storage.imports,
             exports: &mut storage.exports,
+            eval_sites: &mut storage.eval_sites,
         };
         lower_expression(source, parser.arena(), root, &mut lowering)
             .ok()
@@ -484,6 +490,7 @@ fn ends(storage: &mut Storage, source: &[u8], ending: Ending) -> bool {
             pending: &mut storage.pending,
             imports: &mut storage.imports,
             exports: &mut storage.exports,
+            eval_sites: &mut storage.eval_sites,
         };
         match lower_expression(source, parser.arena(), root, &mut lowering) {
             Ok(compiled) => compiled.length,

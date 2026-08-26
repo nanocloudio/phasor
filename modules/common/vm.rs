@@ -218,6 +218,11 @@ pub struct Snapshot {
     /// The source of an eval the machine is paused on, waiting for the host
     /// to compile it into a unit.
     pending_eval: Value,
+    pending_eval_module: u32,
+    pending_eval_function: u32,
+    pending_eval_pc: u32,
+    pending_eval_environment: Value,
+    pending_eval_this: Value,
     outbox_length: usize,
 }
 
@@ -236,6 +241,11 @@ impl Default for Snapshot {
             trace: 0,
             retained: Value::UNDEFINED,
             pending_eval: Value::UNDEFINED,
+            pending_eval_module: u32::MAX,
+            pending_eval_function: u32::MAX,
+            pending_eval_pc: u32::MAX,
+            pending_eval_environment: Value::UNDEFINED,
+            pending_eval_this: Value::UNDEFINED,
             outbox_length: 0,
         }
     }
@@ -320,6 +330,20 @@ pub struct Vm<'a, 'u, 'h, 'atoms> {
     /// The source of an eval the machine is paused on, waiting for the host
     /// to compile it into a unit.
     pending_eval: Value,
+    /// Which call paused for the eval: the module, function, and pc of the
+    /// `Call` instruction, or `u32::MAX` when the call was not a recorded
+    /// direct site.
+    pending_eval_module: u32,
+    pending_eval_function: u32,
+    pending_eval_pc: u32,
+    /// Where a direct eval's code runs: the caller's environment and its
+    /// `this`, or undefined for global eval.
+    pending_eval_environment: Value,
+    pending_eval_this: Value,
+    /// How many native operations on the host stack have entered JavaScript
+    /// beneath them right now. Each is a real host frame, so the bound is
+    /// explicit rather than whatever stack the platform happened to give.
+    nested: u32,
     /// Where a match backtracks, and what it must put back when it does.
     regexp_choices: Option<&'a mut [crate::regexp::Choice]>,
     regexp_undo: Option<&'a mut [(u8, u32)]>,
@@ -373,6 +397,12 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             trace: 0,
             retained: Value::UNDEFINED,
             pending_eval: Value::UNDEFINED,
+            pending_eval_module: u32::MAX,
+            pending_eval_function: u32::MAX,
+            pending_eval_pc: u32::MAX,
+            pending_eval_environment: Value::UNDEFINED,
+            pending_eval_this: Value::UNDEFINED,
+            nested: 0,
             regexp_choices: None,
             regexp_undo: None,
             regexp_subject: None,
@@ -726,6 +756,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             trace: self.trace,
             retained: self.retained,
             pending_eval: self.pending_eval,
+            pending_eval_module: self.pending_eval_module,
+            pending_eval_function: self.pending_eval_function,
+            pending_eval_pc: self.pending_eval_pc,
+            pending_eval_environment: self.pending_eval_environment,
+            pending_eval_this: self.pending_eval_this,
             outbox_length: self.outbox_length,
         }
     }
@@ -744,6 +779,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         self.trace = snapshot.trace;
         self.retained = snapshot.retained;
         self.pending_eval = snapshot.pending_eval;
+        self.pending_eval_module = snapshot.pending_eval_module;
+        self.pending_eval_function = snapshot.pending_eval_function;
+        self.pending_eval_pc = snapshot.pending_eval_pc;
+        self.pending_eval_environment = snapshot.pending_eval_environment;
+        self.pending_eval_this = snapshot.pending_eval_this;
         self.outbox_length = snapshot.outbox_length;
     }
 
@@ -826,7 +866,17 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         if !pressed {
             return None;
         }
+        self.collect_now()
+    }
 
+    /// Collect immediately, whatever the pressure heuristic says.
+    ///
+    /// An allocation that failed with garbage still reclaimable — a table
+    /// that doubled away from its old copies faster than the headroom check
+    /// watched — collects here and retries, so a failure means the live data
+    /// truly does not fit.
+    fn collect_now(&mut self) -> Option<Completion> {
+        self.roots_storage.as_ref()?;
         // Stage the roots into the caller's storage, then collect in slices.
         // The storage is taken out and put back so the machine can read its own
         // state while writing into it.
@@ -1045,6 +1095,8 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         push(self.accumulator, out, &mut written);
         push(self.retained, out, &mut written);
         push(self.pending_eval, out, &mut written);
+        push(self.pending_eval_environment, out, &mut written);
+        push(self.pending_eval_this, out, &mut written);
         let mut index = 0usize;
         while index < self.top as usize {
             if let Some(&value) = self.registers.get(index) {
@@ -1075,6 +1127,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             self.realm.iterator_prototype,
             self.realm.big_int_prototype,
             self.realm.iterator_symbol,
+            self.realm.has_instance_symbol,
         ] {
             if let Some(slot) = out.get_mut(written) {
                 *slot = handle;
@@ -1261,32 +1314,59 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         }
     }
 
+    /// The call site the machine paused on, when the image recorded it as a
+    /// direct eval: the module, the function, and the pc of the `Call`.
+    pub fn pending_eval_site(&self) -> Option<(u32, u32, u32)> {
+        if self.pending_eval_module == u32::MAX {
+            None
+        } else {
+            Some((
+                self.pending_eval_module,
+                self.pending_eval_function,
+                self.pending_eval_pc,
+            ))
+        }
+    }
+
     /// Enter the unit the host compiled for the pending eval.
     ///
-    /// The unit runs as global code — its top level reads and declares on the
-    /// global object — and its completion value answers the `eval` call.
+    /// A unit compiled against a recorded direct-eval site runs over the
+    /// caller's environment with the caller's `this`; anything else runs as
+    /// global code. Either way its completion value answers the `eval` call.
     pub fn enter_eval(&mut self, unit: u32) -> Result<(), Completion> {
         self.pending_eval = Value::UNDEFINED;
         let entry = self.unit_of(unit).header().entry_function;
-        let environment = Value::object(self.realm.environment);
-        self.push_frame(
-            entry,
-            environment,
-            Value::object(self.realm.global),
-            Value::UNDEFINED,
-            unit,
-        )
+        let (environment, this) = if self.pending_eval_environment.is_object() {
+            (self.pending_eval_environment, self.pending_eval_this)
+        } else {
+            (
+                Value::object(self.realm.environment),
+                Value::object(self.realm.global),
+            )
+        };
+        self.pending_eval_module = u32::MAX;
+        self.pending_eval_environment = Value::UNDEFINED;
+        let kept_this = this;
+        self.pending_eval_this = Value::UNDEFINED;
+        self.push_frame(entry, environment, kept_this, Value::UNDEFINED, unit)
     }
 
     /// Refuse the pending eval: the source did not compile, and the `eval`
     /// call throws a syntax error the program can catch.
     pub fn fail_eval(&mut self) -> Option<Completion> {
+        self.fail_eval_to(1)
+    }
+
+    fn fail_eval_to(&mut self, floor: u32) -> Option<Completion> {
         self.pending_eval = Value::UNDEFINED;
+        self.pending_eval_module = u32::MAX;
+        self.pending_eval_environment = Value::UNDEFINED;
+        self.pending_eval_this = Value::UNDEFINED;
         let completion = self.throw_error_of(ErrorKind::Syntax);
         let Completion::Throw(thrown) = completion else {
             return Some(completion);
         };
-        self.unwind(thrown, 1)
+        self.unwind(thrown, floor)
     }
 
     /// Call a function value with a receiver and arguments.
@@ -1338,6 +1418,12 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         // A function runs the unit of the module it was made in, wherever it
         // is called from.
         let module = object::function_module(self.heap, function).unwrap_or(0);
+        // A native that enters JavaScript nests an interpreter loop on the
+        // host stack, and the nesting is bounded by its own declared depth:
+        // the frame table bounds JavaScript recursion, this bounds the host's.
+        if self.nested >= MAX_NESTED_ENTRIES {
+            return Err(Completion::Terminated(Termination::StackOverflow));
+        }
         let environment = self.prepare_call_environment(closure, this, code, module)?;
         self.push_frame(code, environment, this, callee, module)?;
         // The arguments occupy the callee's first registers.
@@ -1352,7 +1438,17 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             index += 1;
         }
         self.frames[self.depth as usize - 1].argument_count = u32::try_from(index).unwrap_or(0);
-        match self.execute() {
+        // The nested run is bounded by fuel like any other, and what it burns
+        // is charged against the outer slice when one is open, so a module
+        // step that did heavy nested work hands control back promptly rather
+        // than pretending the work took one instruction.
+        let before = self.fuel;
+        self.nested += 1;
+        let completion = self.execute();
+        self.nested -= 1;
+        let spent = before.saturating_sub(self.fuel);
+        self.slice = self.slice.saturating_sub(spent);
+        match completion {
             Completion::Value(value) => Ok(value),
             other => Err(other),
         }
@@ -1391,6 +1487,13 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 let source = arguments.first().copied().unwrap_or(Value::UNDEFINED);
                 if source.is_string() {
                     self.pending_eval = source;
+                    // The Call arm overwrites these when the site is a
+                    // recorded direct eval; anything else runs as global.
+                    self.pending_eval_module = u32::MAX;
+                    self.pending_eval_function = u32::MAX;
+                    self.pending_eval_pc = u32::MAX;
+                    self.pending_eval_environment = Value::UNDEFINED;
+                    self.pending_eval_this = Value::UNDEFINED;
                 } else {
                     self.accumulator = source;
                 }
@@ -1585,10 +1688,23 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// Run until the frame that was current on entry returns.
     fn execute(&mut self) -> Completion {
         let floor = self.depth;
-        match self.drive(floor, false) {
-            Some(completion) => completion,
-            // A nested evaluation is never sliced, so it always finishes.
-            None => Completion::Terminated(Termination::Malformed),
+        loop {
+            match self.drive(floor, false) {
+                Some(completion) => return completion,
+                None => {
+                    // A nested evaluation is never sliced, so the only pause
+                    // is an eval's — and on the host's own stack there is no
+                    // way to hand it to the compiler, so the call fails with
+                    // the syntax error it would produce, catchably.
+                    if self.pending_eval().is_some() {
+                        if let Some(completion) = self.fail_eval_to(floor) {
+                            return completion;
+                        }
+                        continue;
+                    }
+                    return Completion::Terminated(Termination::Malformed);
+                }
+            }
         }
     }
 
@@ -1954,6 +2070,12 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             }
             Op::GetKeyedProperty => {
                 let target = self.register(frame, operands[0]);
+                // The base must be coercible before the key is: coercing the
+                // key can run a program's `toString`, and a read through
+                // nothing is a type error first.
+                if target.is_nullish() {
+                    return Err(self.throw_type_error());
+                }
                 let key_value = self.accumulator;
                 let key = self.coerce_to_key(key_value)?;
                 self.accumulator = self.get_property(target, key)?;
@@ -1966,6 +2088,9 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             }
             Op::SetKeyedProperty => {
                 let target = self.register(frame, operands[0]);
+                if target.is_nullish() {
+                    return Err(self.throw_type_error());
+                }
                 let key_value = self.register(frame, operands[1]);
                 let key = self.coerce_to_key(key_value)?;
                 let value = self.accumulator;
@@ -2004,6 +2129,19 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             }
             Op::StaGlobal => {
                 let key = self.constant_key(operands[0])?;
+                let value = self.accumulator;
+                self.set_property(Value::object(self.realm.global), key, value)?;
+            }
+            Op::StaGlobalStrict => {
+                let key = self.constant_key(operands[0])?;
+                let present = object::has_property(self.heap, self.realm.global, key)
+                    .map_err(|_| Completion::Terminated(Termination::Malformed))?;
+                if !present {
+                    // Strict assignment never creates a binding: a name the
+                    // global object lost — or never had — is a reference
+                    // error, not a new property.
+                    return Err(self.throw_error_of(ErrorKind::Reference));
+                }
                 let value = self.accumulator;
                 self.set_property(Value::object(self.realm.global), key, value)?;
             }
@@ -2108,6 +2246,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .map_err(|_| Completion::Terminated(Termination::HeapExhausted))?;
                 self.accumulator = Value::object(function);
             }
+            Op::ToPropertyKeyChecked => {
+                let base = self.register(frame, operands[0]);
+                if base.is_nullish() {
+                    return Err(self.throw_type_error());
+                }
+                let key = self.coerce_to_key(self.accumulator)?;
+                self.accumulator = self.key_to_value(key)?;
+            }
             Op::SetPrototype => {
                 let target = self.register(frame, operands[0]);
                 let value = self.accumulator;
@@ -2115,6 +2261,40 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     object::set_prototype(self.heap, target.as_handle(), value)
                         .map_err(|_| Completion::Terminated(Termination::HeapExhausted))?;
                 }
+            }
+            Op::NameClosure => {
+                let closure = self.accumulator;
+                if closure.is_object() {
+                    let handle = closure.as_handle();
+                    let name_key = self.ascii_key(b"name")?;
+                    let absent = object::get_own_property(self.heap, handle, name_key)
+                        .unwrap_or(None)
+                        .is_none();
+                    if absent {
+                        let constant = self.constant_key(operands[0])?;
+                        let name = self.key_to_value(constant)?;
+                        object::define_own_property(
+                            self.heap,
+                            handle,
+                            name_key,
+                            object::Descriptor::data(name, attribute::CONFIGURABLE),
+                        )
+                        .map_err(|_| self.heap_failure())?;
+                    }
+                }
+            }
+            Op::DefineNamedGetter | Op::DefineNamedSetter => {
+                let target = self.register(frame, operands[0]);
+                let key = self.constant_key(operands[1])?;
+                let getter = matches!(instruction.opcode, Op::DefineNamedGetter);
+                self.define_accessor(target, key, self.accumulator, getter)?;
+            }
+            Op::DefineKeyedGetter | Op::DefineKeyedSetter => {
+                let target = self.register(frame, operands[0]);
+                let key_value = self.register(frame, operands[1]);
+                let key = self.coerce_to_key(key_value)?;
+                let getter = matches!(instruction.opcode, Op::DefineKeyedGetter);
+                self.define_accessor(target, key, self.accumulator, getter)?;
             }
             Op::CreateArguments => {
                 // An ordinary object, not an array: its `length` does not
@@ -2144,6 +2324,19 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     object,
                     length_key,
                     object::Descriptor::data(length, attribute::WRITABLE | attribute::CONFIGURABLE),
+                )
+                .map_err(|_| Completion::Terminated(Termination::HeapExhausted))?;
+                // `callee` is the function being run, which is what lets an
+                // anonymous function call itself through its own arguments.
+                let callee_key = self.ascii_key(b"callee")?;
+                object::define_own_property(
+                    self.heap,
+                    object,
+                    callee_key,
+                    object::Descriptor::data(
+                        frame.callee,
+                        attribute::WRITABLE | attribute::CONFIGURABLE,
+                    ),
                 )
                 .map_err(|_| Completion::Terminated(Termination::HeapExhausted))?;
                 let values_key = self.ascii_key(b"values")?;
@@ -2260,6 +2453,17 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     index += 1;
                 }
                 if self.enter_call(callee, receiver, &arguments[..passed], false)? {
+                    // A pause here may be a direct eval: the site is the
+                    // instruction itself, and the eval's code — if the image
+                    // recorded the site — runs over this frame's environment
+                    // with this frame's `this`.
+                    if self.pending_eval.is_string() {
+                        self.pending_eval_module = frame.module;
+                        self.pending_eval_function = frame.code;
+                        self.pending_eval_pc = frame.pc;
+                        self.pending_eval_environment = frame.environment;
+                        self.pending_eval_this = self.this_value(frame)?;
+                    }
                     return Ok(Flow::Enter);
                 }
                 let result = self.call_value(callee, receiver, &arguments[..passed])?;
@@ -2521,20 +2725,17 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             }
             ConstantKind::RegExp => Err(Completion::Terminated(Termination::Malformed)),
             ConstantKind::BigInt => {
-                let mut digits = [0u8; 256];
-                let length = self
+                // Read out of the image where it lies: a literal of any length
+                // is the number it was written as, or an image the machine
+                // refuses, never a prefix of itself.
+                let bytes = self
                     .unit()
                     .constant_bytes(&constant)
-                    .map(|bytes| {
-                        let length = bytes.len().min(digits.len());
-                        digits[..length].copy_from_slice(&bytes[..length]);
-                        length
-                    })
                     .ok_or(Completion::Terminated(Termination::Malformed))?;
                 // The constant carries its radix in front of its digits.
-                let radix = u32::from(digits.first().copied().unwrap_or(10));
+                let radix = u32::from(bytes.first().copied().unwrap_or(10));
                 let number =
-                    crate::bigint::from_digits(digits.get(1..length).unwrap_or(&[]), radix, false)
+                    crate::bigint::from_digits(bytes.get(1..).unwrap_or(&[]), radix, false)
                         .map_err(|_| Completion::Terminated(Termination::Malformed))?;
                 let handle = crate::bigint::write(self.heap, &number)
                     .map_err(|_| Completion::Terminated(Termination::HeapExhausted))?;
@@ -2612,11 +2813,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 let number = self.coerce_to_number(right)?;
                 self.loose_equals(left, Value::number(number))
             }
-            (Tag::Object, Tag::Number | Tag::String) => {
+            (Tag::Object, Tag::Number | Tag::String | Tag::BigInt | Tag::Symbol) => {
                 let primitive = self.coerce_to_primitive(left, Hint::Default)?;
                 self.loose_equals(primitive, right)
             }
-            (Tag::Number | Tag::String, Tag::Object) => {
+            (Tag::Number | Tag::String | Tag::BigInt | Tag::Symbol, Tag::Object) => {
                 let primitive = self.coerce_to_primitive(right, Hint::Default)?;
                 self.loose_equals(left, primitive)
             }
@@ -2672,6 +2873,18 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     }
 
     fn instance_of(&mut self, left: Value, right: Value) -> Result<bool, Completion> {
+        // `Symbol.hasInstance` decides first when the right side carries one:
+        // whatever it answers, coerced to a boolean, is the result.
+        if right.is_object() {
+            let method = self.get_property(right, Key::Symbol(self.realm.has_instance_symbol))?;
+            if !method.is_nullish() {
+                if !self.is_callable_value(method) {
+                    return Err(self.throw_type_error());
+                }
+                let answer = self.call_value(method, right, &[left])?;
+                return self.coerce_to_boolean(answer);
+            }
+        }
         if !right.is_object() || !object::is_callable(self.heap, right.as_handle()).unwrap_or(false)
         {
             return Err(self.throw_type_error());
@@ -2803,11 +3016,10 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             return Ok(());
         }
         let handle = target.as_handle();
-        if object::is_callable(self.heap, handle) != Ok(true)
-            || object::is_native(self.heap, handle).unwrap_or(true)
-        {
+        if object::is_callable(self.heap, handle) != Ok(true) {
             return Ok(());
         }
+        let native = object::is_native(self.heap, handle).unwrap_or(true);
         let length_key = self.ascii_key(b"length")?;
         let name_key = self.ascii_key(b"name")?;
         if key != length_key && key != name_key {
@@ -2820,12 +3032,16 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             return Ok(());
         }
         let value = if key == length_key {
-            let code = object::function_code(self.heap, handle).unwrap_or(0);
-            let module = object::function_module(self.heap, handle).unwrap_or(0);
-            let count = self
-                .unit_of(module)
-                .function(code)
-                .map_or(0, |record| record.argument_count);
+            let count = if native {
+                let id = object::function_code(self.heap, handle).unwrap_or(0);
+                crate::realm::native::arity(id)
+            } else {
+                let code = object::function_code(self.heap, handle).unwrap_or(0);
+                let module = object::function_module(self.heap, handle).unwrap_or(0);
+                self.unit_of(module)
+                    .function(code)
+                    .map_or(0, |record| record.argument_count)
+            };
             Value::number(crate::softfloat::from_u64(u64::from(count)))
         } else {
             self.ascii_string(b"")?
@@ -2837,6 +3053,66 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             object::Descriptor::data(value, object::attribute::CONFIGURABLE),
         )
         .map_err(|_| Completion::Terminated(Termination::HeapExhausted))?;
+        Ok(())
+    }
+
+    /// Give a bound function the `length` and `name` its target implies.
+    ///
+    /// The length is what is left of the target's parameters once the bound
+    /// arguments are counted off, never below zero and never from a target
+    /// whose `length` is not a number. The name is the target's, behind
+    /// `bound `.
+    fn name_bound_function(
+        &mut self,
+        bound: Handle,
+        target: Value,
+        bound_count: u32,
+    ) -> Result<(), Completion> {
+        let length_key = self.ascii_key(b"length")?;
+        let declared = self.get_property(target, length_key)?;
+        let remaining = if declared.is_number() {
+            // `+Infinity` stays infinite however much is bound; anything else
+            // is the declared count less the bound arguments, floored at zero.
+            let count = crate::value::to_integer_or_infinity(declared.as_number());
+            if count == f64::INFINITY {
+                count
+            } else {
+                let bound_arguments = crate::softfloat::from_u64(u64::from(bound_count));
+                let left = crate::softfloat::sub(count, bound_arguments);
+                if crate::softfloat::compare(left, 0.0) > 0 {
+                    left
+                } else {
+                    0.0
+                }
+            }
+        } else {
+            0.0
+        };
+        object::define_own_property(
+            self.heap,
+            bound,
+            length_key,
+            object::Descriptor::data(Value::number(remaining), object::attribute::CONFIGURABLE),
+        )
+        .map_err(|_| self.heap_failure())?;
+
+        let name_key = self.ascii_key(b"name")?;
+        let declared = self.get_property(target, name_key)?;
+        let prefix = self.ascii_string(b"bound ")?;
+        let name = if declared.is_string() {
+            let joined = string::concat(self.heap, prefix.as_handle(), declared.as_handle())
+                .map_err(|_| self.heap_failure())?;
+            Value::string(joined)
+        } else {
+            prefix
+        };
+        object::define_own_property(
+            self.heap,
+            bound,
+            name_key,
+            object::Descriptor::data(name, object::attribute::CONFIGURABLE),
+        )
+        .map_err(|_| self.heap_failure())?;
         Ok(())
     }
 
@@ -2890,6 +3166,29 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         }
     }
 
+    /// Store through `object::set`, collecting and retrying when the heap is
+    /// full: a table that outgrew its copies leaves them as garbage, and a
+    /// failure counts only when the live data truly does not fit.
+    fn set_with_room(
+        &mut self,
+        target: Value,
+        key: Key,
+        value: Value,
+    ) -> Result<Assignment, Completion> {
+        match object::set(self.heap, target.as_handle(), key, value) {
+            Ok(outcome) => Ok(outcome),
+            Err(object::ObjectError::Heap(
+                crate::heap::HeapError::ArenaFull | crate::heap::HeapError::SlotsFull,
+            )) => {
+                if let Some(stop) = self.collect_now() {
+                    return Err(stop);
+                }
+                object::set(self.heap, target.as_handle(), key, value).map_err(Self::object_failure)
+            }
+            Err(error) => Err(Self::object_failure(error)),
+        }
+    }
+
     fn set_property(&mut self, target: Value, key: Key, value: Value) -> Result<(), Completion> {
         if target.is_nullish() {
             return Err(self.throw_type_error());
@@ -2906,8 +3205,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     let old = self.length_of(target)?;
                     let wanted = self.coerce_to_number(value)?;
                     let new = value::to_uint32(wanted);
-                    let outcome = object::set(self.heap, target.as_handle(), key, value)
-                        .map_err(|_| Completion::Terminated(Termination::Malformed))?;
+                    let outcome = self.set_with_room(target, key, value)?;
                     if matches!(outcome, Assignment::Done) {
                         let mut index = new;
                         while index < old {
@@ -2919,8 +3217,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 }
             }
         }
-        let outcome = object::set(self.heap, target.as_handle(), key, value)
-            .map_err(|_| Completion::Terminated(Termination::Malformed))?;
+        let outcome = self.set_with_room(target, key, value)?;
         match outcome {
             Assignment::Done | Assignment::Refused => {
                 // An array's `length` follows its highest index: a store past
@@ -2942,26 +3239,76 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         }
     }
 
+    /// Define one half of an accessor, keeping the other half an existing
+    /// accessor already carries.
+    fn define_accessor(
+        &mut self,
+        target: Value,
+        key: Key,
+        closure: Value,
+        getter: bool,
+    ) -> Result<(), Completion> {
+        if !target.is_object() {
+            return Err(self.throw_type_error());
+        }
+        let handle = target.as_handle();
+        let existing =
+            object::get_own_property(self.heap, handle, key).map_err(|_| self.heap_failure())?;
+        let (mut get, mut set) = match existing {
+            Some(found) if matches!(found.kind, object::DescriptorKind::Accessor) => {
+                (found.getter, found.setter)
+            }
+            _ => (Value::UNDEFINED, Value::UNDEFINED),
+        };
+        if getter {
+            get = closure;
+        } else {
+            set = closure;
+        }
+        object::define_own_property(
+            self.heap,
+            handle,
+            key,
+            object::Descriptor::accessor(get, set, attribute::ENUMERABLE | attribute::CONFIGURABLE),
+        )
+        .map_err(|_| self.heap_failure())?;
+        Ok(())
+    }
+
     fn define_property(&mut self, target: Value, key: Key, value: Value) -> Result<(), Completion> {
         if !target.is_object() {
             return Err(self.throw_type_error());
         }
-        object::define_own_property(
-            self.heap,
-            target.as_handle(),
-            key,
-            Descriptor::data(value, attribute::DEFAULT),
-        )
-        .map_err(|_| Completion::Terminated(Termination::HeapExhausted))?;
-        Ok(())
+        let descriptor = Descriptor::data(value, attribute::DEFAULT);
+        match object::define_own_property(self.heap, target.as_handle(), key, descriptor) {
+            Ok(_) => Ok(()),
+            Err(object::ObjectError::Heap(
+                crate::heap::HeapError::ArenaFull | crate::heap::HeapError::SlotsFull,
+            )) => {
+                // The arena may hold reclaimable garbage the pressure check
+                // did not see; a failure counts only after a collection.
+                if let Some(stop) = self.collect_now() {
+                    return Err(stop);
+                }
+                object::define_own_property(self.heap, target.as_handle(), key, descriptor)
+                    .map(|_| ())
+                    .map_err(Self::object_failure)
+            }
+            Err(error) => Err(Self::object_failure(error)),
+        }
     }
 
     fn delete_property(&mut self, target: Value, key: Key) -> Result<bool, Completion> {
+        // A reference through nothing is a type error, exactly as a read
+        // through it is; a primitive base holds nothing deletable and
+        // answers true.
+        if target.is_nullish() {
+            return Err(self.throw_type_error());
+        }
         if !target.is_object() {
             return Ok(true);
         }
-        object::delete(self.heap, target.as_handle(), key)
-            .map_err(|_| Completion::Terminated(Termination::Malformed))
+        object::delete(self.heap, target.as_handle(), key).map_err(Self::object_failure)
     }
 
     fn copy_data_properties(&mut self, target: Value, source: Value) -> Result<(), Completion> {
@@ -3212,6 +3559,21 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
 
     fn heap_failure(&self) -> Completion {
         Completion::Terminated(Termination::HeapExhausted)
+    }
+
+    /// What a failed object operation means: exhausted storage is a heap
+    /// outcome, an overfull bound is a quota, and only a reference that names
+    /// nothing live is a malformed image.
+    const fn object_failure(error: object::ObjectError) -> Completion {
+        match error {
+            object::ObjectError::Heap(
+                crate::heap::HeapError::ArenaFull | crate::heap::HeapError::SlotsFull,
+            ) => Completion::Terminated(Termination::HeapExhausted),
+            object::ObjectError::TooManyKeys | object::ObjectError::PrototypeChainTooDeep => {
+                Completion::Terminated(Termination::QuotaExceeded)
+            }
+            _ => Completion::Terminated(Termination::Malformed),
+        }
     }
 
     /// What a failed key listing means: storage that was too small is a quota,
@@ -4589,6 +4951,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .map_err(|_| self.heap_failure())?;
                 object::set_bound_value(self.heap, bound, record)
                     .map_err(|_| self.heap_failure())?;
+                // A bound function's `length` and `name` come from what it was
+                // bound to and are settled here: they are the one pair the
+                // lazy path cannot work out from the callable alone, because
+                // the answer is the target's, less what is already bound.
+                self.name_bound_function(bound, this, written.saturating_sub(2))?;
                 Ok(Value::object(bound))
             }
             native::BOUND_FUNCTION => {
@@ -4819,6 +5186,26 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             .map_err(|_| Completion::Terminated(Termination::Malformed))
     }
 
+    /// One code unit of a string, or zero past its end.
+    fn string_unit(&self, handle: Handle, at: usize) -> Result<u16, Completion> {
+        Ok(
+            string::unit_at(self.heap, handle, u32::try_from(at).unwrap_or(u32::MAX))
+                .map_err(|_| self.heap_failure())?
+                .unwrap_or(0),
+        )
+    }
+
+    /// What a failed BigInt operation means to a program: a numeral too big
+    /// for the engine's limbs is a range error, because the text named a
+    /// number the engine cannot hold; anything else is text that is not a
+    /// numeral at all.
+    fn big_int_failure(&mut self, error: crate::bigint::BigIntError) -> Completion {
+        match error {
+            crate::bigint::BigIntError::TooLarge => self.throw_error_of(ErrorKind::Range),
+            _ => self.throw_error_of(ErrorKind::Syntax),
+        }
+    }
+
     fn big_int_value(&mut self, number: &crate::bigint::Number) -> Result<Value, Completion> {
         let handle = crate::bigint::write(self.heap, number)
             .map_err(|_| Completion::Terminated(Termination::HeapExhausted))?;
@@ -4986,30 +5373,59 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 let handle = value.as_handle();
                 let length =
                     string::length(self.heap, handle).map_err(|_| self.heap_failure())? as usize;
-                let mut digits = [0u8; 256];
-                let mut count = 0usize;
-                let mut index = 0usize;
-                let mut negative = false;
-                while index < length && count < digits.len() {
-                    let unit =
-                        string::unit_at(self.heap, handle, u32::try_from(index).unwrap_or(0))
-                            .map_err(|_| self.heap_failure())?
-                            .unwrap_or(0);
-                    if index == 0 && (unit == u16::from(b'-') || unit == u16::from(b'+')) {
-                        negative = unit == u16::from(b'-');
-                        index += 1;
-                        continue;
+                // The numeral is what lies between the whitespace at either
+                // end, so the end is found before the digits are read.
+                let mut at = 0usize;
+                let mut end = length;
+                while at < end && is_string_white_space(self.string_unit(handle, at)?) {
+                    at += 1;
+                }
+                while end > at && is_string_white_space(self.string_unit(handle, end - 1)?) {
+                    end -= 1;
+                }
+                // An empty string, and one that is nothing but whitespace, is
+                // zero. Everything else must be a numeral.
+                if at == end {
+                    return self.big_int_value(&crate::bigint::Number::ZERO);
+                }
+                let first = self.string_unit(handle, at)?;
+                let signed = first == u16::from(b'-') || first == u16::from(b'+');
+                let negative = first == u16::from(b'-');
+                if signed {
+                    at += 1;
+                }
+                // A radix prefix, on an unsigned numeral only.
+                let mut radix = 10u32;
+                if !signed && end - at >= 2 && self.string_unit(handle, at)? == u16::from(b'0') {
+                    radix = match self.string_unit(handle, at + 1)? {
+                        0x78 | 0x58 => 16,
+                        0x6F | 0x4F => 8,
+                        0x62 | 0x42 => 2,
+                        _ => 10,
+                    };
+                    if radix != 10 {
+                        at += 2;
                     }
-                    if unit > 0x7F {
+                }
+                let mut accumulator = crate::bigint::Accumulator::new(radix);
+                while at < end {
+                    let unit = self.string_unit(handle, at)?;
+                    // The string grammar has no separators: only a literal
+                    // written in source may carry them.
+                    if unit > 0x7F || unit == u16::from(b'_') {
                         return Err(self.throw_error_of(ErrorKind::Syntax));
                     }
-                    digits[count] = unit as u8;
-                    count += 1;
-                    index += 1;
+                    accumulator
+                        .push(unit as u8)
+                        .map_err(|error| self.big_int_failure(error))?;
+                    at += 1;
                 }
-                let number =
-                    crate::bigint::from_digits(digits.get(..count).unwrap_or(&[]), 10, negative)
-                        .map_err(|_| self.throw_error_of(ErrorKind::Syntax))?;
+                // A sign or a radix prefix with no digits behind it is not a
+                // numeral.
+                if accumulator.digits() == 0 {
+                    return Err(self.throw_error_of(ErrorKind::Syntax));
+                }
+                let number = accumulator.finish_signed(negative);
                 self.big_int_value(&number)
             }
             _ => Err(self.throw_type_error()),
@@ -5696,6 +6112,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             // catch, not a termination.
             native::FUNCTION => Err(self.throw_type_error()),
             native::THROW_TYPE_ERROR => Err(self.throw_type_error()),
+            native::FUNCTION_PROTOTYPE => Ok(Value::UNDEFINED),
             native::EVAL => {
                 // On the host's own stack there is no way to pause for the
                 // compiler; a non-string answers itself, and a string is
@@ -6150,6 +6567,16 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     }
 }
 
+/// Whether a code unit is whitespace to the string grammar: the whitespace
+/// characters, the line terminators, and the Unicode space separators — the
+/// set `StringToBigInt` and `StringToNumber` skip at either end.
+fn is_string_white_space(unit: u16) -> bool {
+    matches!(
+        unit,
+        0x0009 | 0x000A | 0x000B | 0x000C | 0x000D | 0x0020 | 0x00A0 | 0x2028 | 0x2029 | 0xFEFF
+    ) || crate::unicode_id::is_space_separator(u32::from(unit))
+}
+
 /// How an instruction affected control.
 enum Flow {
     Continue,
@@ -6180,6 +6607,9 @@ const ITERATE_ENTRIES: u8 = 2;
 const ITERATE_CODE_POINTS: u8 = 3;
 
 const MAX_ARGUMENTS: usize = 16;
+/// Interpreter loops one host stack may nest: a native that runs a callback
+/// which reaches another native that runs a callback, so far and no further.
+const MAX_NESTED_ENTRIES: u32 = 64;
 /// The longest string the interpreter stages on its own stack.
 const MAX_STRING_UNITS: usize = 256;
 /// The most own keys one spread copies.

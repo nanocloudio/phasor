@@ -31,6 +31,8 @@ mod diagnostic;
 mod digest;
 #[path = "../../common/emit.rs"]
 mod emit;
+#[path = "../../common/evalsite.rs"]
+mod evalsite;
 #[path = "../../common/feature.rs"]
 mod feature;
 #[path = "../../common/lex.rs"]
@@ -94,6 +96,7 @@ const LEXICAL_CAPACITY: usize = 256;
 const PENDING_CAPACITY: usize = 64;
 const IMPORT_CAPACITY: usize = 32;
 const EXPORT_CAPACITY: usize = 32;
+const EVAL_SITE_CAPACITY: usize = 2048;
 struct Storage {
     nodes: [Node; NODE_CAPACITY],
     lists: [u32; LIST_CAPACITY],
@@ -117,6 +120,7 @@ struct Storage {
     pending: [PendingFunction; PENDING_CAPACITY],
     imports: [ImportRecord; IMPORT_CAPACITY],
     exports: [ExportRecord; EXPORT_CAPACITY],
+    eval_sites: [u8; EVAL_SITE_CAPACITY],
 }
 
 /// What one compilation produced.
@@ -165,6 +169,7 @@ fn compile(storage: &mut Storage, source: &[u8]) -> Outcome {
         pending: &mut storage.pending,
         imports: &mut storage.imports,
         exports: &mut storage.exports,
+        eval_sites: &mut storage.eval_sites,
     };
     match lower_expression(source, parser.arena(), root, &mut lowering) {
         Ok(compiled) => Outcome {

@@ -64,7 +64,7 @@ pub const FEATURES: [Feature; 46] = [
     // which the versions say so that an older image is refused.
     feature(b"syntax.primary", 3),
     feature(b"syntax.array", 3),
-    feature(b"syntax.object", 1),
+    feature(b"syntax.object", 2),
     feature(b"syntax.member", 3),
     feature(b"syntax.optional-chain", 1),
     feature(b"syntax.operators", 1),

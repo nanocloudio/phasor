@@ -186,6 +186,13 @@ pub mod property_key {
     pub const NUMBER: u32 = 2;
 }
 
+/// What a `Property` node's third payload word says the property is.
+pub mod property_kind {
+    pub const DATA: u32 = 0;
+    pub const GETTER: u32 = 1;
+    pub const SETTER: u32 = 2;
+}
+
 /// Flag bits carried by a node.
 pub mod flag {
     /// The construct was written with `?.`.

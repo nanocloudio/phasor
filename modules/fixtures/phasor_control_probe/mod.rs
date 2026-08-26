@@ -59,6 +59,8 @@ mod regexp;
 mod softfloat;
 #[path = "../../common/string.rs"]
 mod string;
+#[path = "../../common/unicode_id.rs"]
+mod unicode_id;
 #[path = "../../common/value.rs"]
 mod value;
 #[path = "../../common/verify.rs"]
