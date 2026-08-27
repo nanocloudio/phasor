@@ -125,6 +125,7 @@ pub struct HeapSave {
     compact_write: u32,
     reclaimed_cells: u32,
     reclaimed_bytes: u32,
+    free_hint: u32,
 }
 
 pub struct Heap<'a> {
@@ -142,6 +143,10 @@ pub struct Heap<'a> {
     /// Cells reclaimed and bytes recovered by the last completed collection.
     reclaimed_cells: u32,
     reclaimed_bytes: u32,
+    /// Where the search for a free slot starts: every slot below it was in
+    /// use when last looked at, so an allocation scans from here and wraps,
+    /// and a slot freed below it pulls it back.
+    free_hint: u32,
 }
 
 impl<'a> Heap<'a> {
@@ -156,6 +161,7 @@ impl<'a> Heap<'a> {
             compact_write: self.compact_write,
             reclaimed_cells: self.reclaimed_cells,
             reclaimed_bytes: self.reclaimed_bytes,
+            free_hint: self.free_hint,
         }
     }
 
@@ -164,6 +170,7 @@ impl<'a> Heap<'a> {
         self.worklist_length = save.worklist_length;
         self.used = save.used;
         self.live = save.live;
+        self.free_hint = save.free_hint;
         self.phase = match save.phase {
             1 => Phase::Marking,
             2 => Phase::Compacting,
@@ -201,6 +208,7 @@ impl<'a> Heap<'a> {
             compact_write: 0,
             reclaimed_cells: 0,
             reclaimed_bytes: 0,
+            free_hint: 0,
         }
     }
 
@@ -227,6 +235,7 @@ impl<'a> Heap<'a> {
             compact_write: 0,
             reclaimed_cells: 0,
             reclaimed_bytes: 0,
+            free_hint: 0,
         };
         heap.restore(save);
         heap
@@ -243,15 +252,12 @@ impl<'a> Heap<'a> {
     /// the table their handles come from. A caller that collects when one is
     /// low must watch the other too.
     pub fn free_slots(&self) -> u32 {
-        let mut free = 0u32;
-        let mut index = 0usize;
-        while index < self.slots.len() {
-            if CellKind::from_byte(self.slots[index].kind) == Some(CellKind::Free) {
-                free += 1;
-            }
-            index += 1;
-        }
-        free
+        // Every slot not holding a live cell is free: the live count moves
+        // with each allocation and each release, so no walk of the table
+        // is needed — a walk the machine's safe points could not afford.
+        u32::try_from(self.slots.len())
+            .unwrap_or(u32::MAX)
+            .saturating_sub(self.live)
     }
 
     /// Slots the handle table holds in all.
@@ -315,14 +321,31 @@ impl<'a> Heap<'a> {
     }
 
     fn take_slot(&mut self) -> Result<u32, HeapError> {
-        let mut index = 0usize;
-        while index < self.slots.len() {
+        // Scan from the hint to the end, then from the start up to it: the
+        // slots below the hint were all taken when it was last set.
+        let count = self.slots.len();
+        let start = (self.free_hint as usize).min(count);
+        let mut scanned = 0usize;
+        let mut index = start;
+        while scanned < count {
+            if index >= count {
+                index = 0;
+            }
             if CellKind::from_byte(self.slots[index].kind) == Some(CellKind::Free) {
+                self.free_hint = u32::try_from(index + 1).unwrap_or(u32::MAX);
                 return u32::try_from(index).map_err(|_| HeapError::SlotsFull);
             }
             index += 1;
+            scanned += 1;
         }
         Err(HeapError::SlotsFull)
+    }
+
+    /// A slot below the hint came free: the next search starts there.
+    fn note_free(&mut self, index: u32) {
+        if index < self.free_hint {
+            self.free_hint = index;
+        }
     }
 
     fn slot(&self, handle: Handle) -> Result<&Slot, HeapError> {
@@ -376,6 +399,7 @@ impl<'a> Heap<'a> {
         // handle can never name this slot again.
         slot.generation = slot.generation.saturating_add(1);
         self.live = self.live.saturating_sub(1);
+        self.note_free(handle.index);
         Ok(())
     }
 }
@@ -536,6 +560,7 @@ impl Heap<'_> {
                 self.compact_write += aligned;
             } else {
                 self.reclaimed_bytes = self.reclaimed_bytes.saturating_add(aligned);
+                let mut freed = false;
                 if let Some(slot) = self.slots.get_mut(index as usize) {
                     if slot.kind != CellKind::Free as u8 {
                         slot.kind = CellKind::Free as u8;
@@ -543,7 +568,11 @@ impl Heap<'_> {
                         slot.generation = slot.generation.saturating_add(1);
                         self.live = self.live.saturating_sub(1);
                         self.reclaimed_cells = self.reclaimed_cells.saturating_add(1);
+                        freed = true;
                     }
+                }
+                if freed {
+                    self.note_free(index);
                 }
             }
 

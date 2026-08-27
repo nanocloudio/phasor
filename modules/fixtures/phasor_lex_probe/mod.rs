@@ -168,6 +168,11 @@ fn number_is(source: &[u8], expected: f64) -> bool {
     }
 }
 
+/// Whether the first token carries the legacy-octal mark.
+fn legacy_marked(source: &[u8]) -> bool {
+    first(source).is_some_and(|token| token.flags & lex::token_flag::LEGACY_OCTAL != 0)
+}
+
 fn cooks_to(source: &[u8], expected: &[u16]) -> bool {
     let Some(token) = first(source) else {
         return false;
@@ -227,7 +232,8 @@ fn run_case(case: u16) -> bool {
         19 => kinds_are(b"123n", &[BigInt]),
 
         // Numeric rejections.
-        20 => error_of(b"0123") == code::LEGACY_OCTAL_LITERAL,
+        // A legacy octal integer lexes, marked for strict code to refuse.
+        20 => number_is(b"0123", 83.0) && legacy_marked(b"0123"),
         21 => error_of(b"3in") == code::INVALID_NUMERIC_TERMINATOR,
         22 => error_of(b"0x1g") == code::INVALID_NUMERIC_TERMINATOR,
         23 => error_of(b"1__0") == code::INVALID_NUMERIC_SEPARATOR,
@@ -244,7 +250,8 @@ fn run_case(case: u16) -> bool {
         32 => cooks_to(b"\\u0061bc", &[0x61, 0x62, 0x63]),
         33 => error_of(b"\"abc") == code::UNTERMINATED_STRING,
         34 => error_of(b"\"a\nb\"") == code::UNTERMINATED_STRING,
-        35 => error_of(b"\"\\01\"") == code::LEGACY_OCTAL_ESCAPE,
+        // A legacy octal escape cooks, marked for strict code to refuse.
+        35 => cooks_to(b"\"\\01\"", &[0x01]) && legacy_marked(b"\"\\01\""),
         36 => error_of(b"\"\\u{110000}\"") == code::INVALID_CODE_POINT,
         // An escaped name is an identifier name, not a keyword: the parser
         // decides where that is illegal.

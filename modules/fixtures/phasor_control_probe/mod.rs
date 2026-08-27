@@ -35,6 +35,8 @@ mod dtoa;
 mod emit;
 #[path = "../../common/env.rs"]
 mod env;
+#[path = "../../common/evalsite.rs"]
+mod evalsite;
 #[path = "../../common/feature.rs"]
 mod feature;
 #[path = "../../common/gc.rs"]
@@ -77,8 +79,8 @@ use value::{Handle, Value};
 use vm::{Completion, Frame, Progress, Termination, Vm};
 
 const CASE_COUNT: u16 = 10;
-const ARENA_BYTES: usize = 64 * 1024;
-const SLOT_COUNT: usize = 1536;
+const ARENA_BYTES: usize = 192 * 1024;
+const SLOT_COUNT: usize = 3072;
 const WORKLIST: usize = 512;
 const IMAGE_CAPACITY: usize = 1024;
 const CODE_CAPACITY: usize = 64;

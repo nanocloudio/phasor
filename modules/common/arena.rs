@@ -33,6 +33,8 @@ pub enum NodeKind {
     /// cooked length, and the `COOKED_INVALID` flag records an escape that has
     /// no cooked value.
     TemplateElement,
+    /// `import(specifier)`: first the specifier expression.
+    ImportCall,
     /// A tagged template. `first` is the tag, `second` the template.
     TaggedTemplate,
     /// A regular-expression literal. `first`/`second` are the pattern span and
@@ -56,6 +58,40 @@ pub enum NodeKind {
     /// `first`/`second` are its span and `third` is its `property_key` kind,
     /// which says whether the span needs cooking or numeric conversion.
     PropertyName,
+    /// `[a, b = 1, ...r]` as a binding target. `first`/`second` are its
+    /// element list: binding elements, elisions, and at most one rest, last.
+    ArrayPattern,
+    /// `{a, b: c = 1, ...r}` as a binding target. `first`/`second` are its
+    /// property list: pattern properties and at most one rest, last.
+    ObjectPattern,
+    /// One target with an optional default. `first` is the target — a name
+    /// or a nested pattern — and `second` the default expression, or `NONE`.
+    BindingElement,
+    /// `key: target` in an object pattern. `first` is the key, `second` the
+    /// binding element it binds.
+    PatternProperty,
+    /// `...target` in a pattern. `first` is the target.
+    RestElement,
+    /// A class: first the name or `NONE`, second and third the member list,
+    /// whose first entry is the heritage expression or `NONE`.
+    Class,
+    /// A class carrying decorators: first and second the decorator
+    /// expression list, third the class node. The decorators evaluate in
+    /// source order before the class does; what they answer is not applied,
+    /// which the proposal reads as keeping the value decorated.
+    Decorated,
+    /// One class member: first the key, second the function, third the kind.
+    ClassMember,
+    /// `super(...)`: first and second the argument list.
+    SuperCall,
+    /// `super.name`: first and second the name's span.
+    SuperMember,
+    /// `super[expression]`. `first` is the key expression.
+    SuperIndex,
+    /// `new.target`.
+    NewTarget,
+    /// `with (object) statement`: first the object, second the body.
+    With,
     /// `object.property`. `first` is the object, `second` the property name
     /// node, and the `OPTIONAL` flag marks `?.`.
     Member,
@@ -177,6 +213,12 @@ pub mod declaration {
     pub const VAR: u32 = 0;
     pub const LET: u32 = 1;
     pub const CONST: u32 = 2;
+    /// `using x = resource`: a `const` whose value is disposed when the
+    /// block that declared it is left.
+    pub const USING: u32 = 3;
+    /// `await using x = resource`: a `using` whose disposal is awaited,
+    /// through `@@asyncDispose` where the resource has one.
+    pub const AWAIT_USING: u32 = 4;
 }
 
 /// How a property name was written, which decides how its span becomes a key.
@@ -186,11 +228,37 @@ pub mod property_key {
     pub const NUMBER: u32 = 2;
 }
 
+/// What a `ClassMember` node's third payload word says the member is: one of
+/// the kinds below, with the STATIC bit set for members of the constructor.
+pub mod class_member {
+    pub const METHOD: u32 = 0;
+    pub const GETTER: u32 = 1;
+    pub const SETTER: u32 = 2;
+    pub const CONSTRUCTOR: u32 = 3;
+    pub const FIELD: u32 = 4;
+    /// `static { ... }`: a block run once, with `this` the constructor.
+    pub const STATIC_BLOCK: u32 = 5;
+    /// `accessor name`: a field behind a getter and setter of its name.
+    pub const ACCESSOR_FIELD: u32 = 6;
+    /// A decorator on the member that follows: `second` is its expression.
+    pub const DECORATOR: u32 = 7;
+    pub const STATIC: u32 = 1 << 3;
+}
+
+/// What a `Parameter` node's third payload word says the parameter is.
+pub mod parameter_kind {
+    pub const PLAIN: u32 = 0;
+    pub const REST: u32 = 1;
+}
+
 /// What a `Property` node's third payload word says the property is.
 pub mod property_kind {
     pub const DATA: u32 = 0;
     pub const GETTER: u32 = 1;
     pub const SETTER: u32 = 2;
+    /// A shorthand method: a data property whose function was written as a
+    /// MethodDefinition, so it carries a home object and admits `super`.
+    pub const METHOD: u32 = 3;
 }
 
 /// Flag bits carried by a node.
@@ -205,6 +273,9 @@ pub mod flag {
     pub const COOKED_INVALID: u8 = 1 << 3;
     /// A call is the start of an optional chain rather than a link in one.
     pub const CHAIN_ROOT: u8 = 1 << 4;
+    /// A Number or String literal strict code refuses: a legacy octal
+    /// integer, a non-octal decimal integer, or a legacy escape.
+    pub const LEGACY_OCTAL: u8 = CHAIN_ROOT;
     /// The function was written as an arrow.
     pub const ARROW: u8 = 1 << 5;
     /// An arrow's body is one expression rather than a block.
@@ -215,6 +286,23 @@ pub mod flag {
     /// The same bit reads as `NAMESPACE` on an import clause, where no `for`
     /// loop can be.
     pub const NAMESPACE: u8 = OF;
+    /// An import clause reads as DEFER: `import defer * as name` waits to
+    /// evaluate the module until its namespace is meaningfully used.
+    pub const DEFER: u8 = CHAIN_ROOT;
+    /// An import clause reads as SOURCE: `import source name` asks for a
+    /// phase no host here serves.
+    pub const SOURCE: u8 = COOKED_INVALID;
+    /// The same bit reads as `ASYNC` on a function, where no `?.` can be.
+    pub const ASYNC: u8 = OPTIONAL;
+    /// The same bit reads as `DECLARATION` on a function, where no template
+    /// element can be: a declared function's name is the enclosing scope's
+    /// mutable binding, never a self-name of its own.
+    pub const DECLARATION: u8 = COOKED_INVALID;
+    /// The same bit reads as `GENERATOR` on a function, where no update
+    /// expression can be.
+    pub const GENERATOR: u8 = PREFIX;
+    /// The same bit reads as `FOR_AWAIT` on a `for` head.
+    pub const FOR_AWAIT: u8 = PREFIX;
 }
 
 /// Unary and update operators.
@@ -228,6 +316,9 @@ pub mod unary_operator {
     pub const LOGICAL_NOT: u32 = 6;
     pub const INCREMENT: u32 = 7;
     pub const DECREMENT: u32 = 8;
+    pub const AWAIT: u32 = 9;
+    pub const YIELD: u32 = 10;
+    pub const YIELD_DELEGATE: u32 = 11;
 }
 
 /// Binary, logical, and assignment operators.

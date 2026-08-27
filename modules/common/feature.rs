@@ -49,7 +49,7 @@ const fn feature(name: &[u8], version: u16) -> Feature {
 /// The order is the layers of the engine: what is scanned, what is parsed, and
 /// what runs. Adding, removing, or versioning an entry changes the digest, and
 /// therefore refuses every image compiled before the change.
-pub const FEATURES: [Feature; 46] = [
+pub const FEATURES: [Feature; 49] = [
     feature(b"lex.source-text", 1),
     feature(b"lex.comment", 1),
     feature(b"lex.identifier", 1),
@@ -64,19 +64,37 @@ pub const FEATURES: [Feature; 46] = [
     // which the versions say so that an older image is refused.
     feature(b"syntax.primary", 3),
     feature(b"syntax.array", 3),
-    feature(b"syntax.object", 2),
-    feature(b"syntax.member", 3),
+    // Version 3 of objects: method definitions joined the literal.
+    feature(b"syntax.object", 3),
+    // Version 4 of members: `new` over a tagged template, and `import(...)`
+    // with its `source` and `defer` phases.
+    feature(b"syntax.member", 4),
     feature(b"syntax.optional-chain", 1),
     feature(b"syntax.operators", 1),
     feature(b"syntax.conditional", 1),
     feature(b"syntax.assignment", 1),
     feature(b"syntax.sequence", 1),
-    feature(b"syntax.statements", 1),
-    feature(b"syntax.declarations", 1),
-    feature(b"syntax.functions", 1),
+    // Version 2 of statements: `with` in sloppy code, and a `let` that is a
+    // name where only a Statement may stand.
+    feature(b"syntax.statements", 2),
+    // Version 2 of declarations and functions: binding patterns, parameter
+    // defaults, and rest parameters joined the admitted surface. Version 3
+    // of declarations: `using`, and the legacy octal literals sloppy code
+    // admits. Version 4: `await using`.
+    feature(b"syntax.declarations", 4),
+    feature(b"syntax.functions", 2),
+    // Async functions, async arrows, and `await`.
+    feature(b"syntax.async", 1),
+    // Classes: declarations, expressions, heritage, super, and members.
+    // Version 2: static blocks, and writes through `super`.
+    feature(b"syntax.class", 2),
+    // Generators: function*, yield, and yield*.
+    feature(b"syntax.generator", 1),
     feature(b"syntax.iteration", 1),
     feature(b"syntax.regexp", 1),
-    feature(b"syntax.modules", 1),
+    // Version 2 of modules: any IdentifierName as an exported or imported
+    // name.
+    feature(b"syntax.modules", 2),
     feature(b"runtime.values", 1),
     feature(b"runtime.strings", 1),
     feature(b"runtime.objects", 1),

@@ -72,7 +72,7 @@ pub enum Keyword {
     Yield,
 }
 
-fn keyword_of(text: &[u8]) -> Option<Keyword> {
+pub fn keyword_of(text: &[u8]) -> Option<Keyword> {
     let keyword = match text {
         b"await" => Keyword::Await,
         b"break" => Keyword::Break,
@@ -130,6 +130,7 @@ pub enum Punctuator {
     Comma,
     Colon,
     Tilde,
+    At,
     Question,
     Dot,
     Ellipsis,
@@ -242,6 +243,14 @@ pub struct Token {
     pub flags: u16,
 }
 
+/// Bits of a token's `flags` for literal tokens (a regular expression
+/// token carries its own flag letters there instead).
+pub mod token_flag {
+    /// A numeric or string literal that strict code refuses: a legacy octal
+    /// integer, a non-octal decimal integer, or a legacy escape.
+    pub const LEGACY_OCTAL: u16 = 1 << 0;
+}
+
 impl Token {
     const fn empty(kind: TokenKind, start: u32, end: u32, line_break_before: bool) -> Self {
         Self {
@@ -272,6 +281,9 @@ pub struct Lexer<'s, 't> {
     fuel: u32,
     tokens: u32,
     template_depth: u32,
+    /// Whether the string literal being scanned carried a legacy octal or
+    /// non-octal decimal escape, which strict code refuses.
+    legacy_escape: bool,
     /// Byte offset of the current line's first byte. It is tracked here rather
     /// than read from the line table, so a table that has run out of storage
     /// cannot change how the line-length limit is measured.
@@ -306,6 +318,7 @@ impl<'s, 't> Lexer<'s, 't> {
             fuel,
             tokens: 0,
             template_depth: 0,
+            legacy_escape: false,
             line_start: 0,
             line_break: false,
         })
@@ -848,6 +861,10 @@ impl<'s, 't> Lexer<'s, 't> {
                     token.inner_start = inner_start;
                     token.inner_end = inner_end;
                     token.code_units = units;
+                    if self.legacy_escape {
+                        token.flags |= token_flag::LEGACY_OCTAL;
+                        self.legacy_escape = false;
+                    }
                     return Ok(token);
                 }
                 b'\n' | b'\r' => return Err(self.error(code::UNTERMINATED_STRING, start)),
@@ -908,13 +925,25 @@ impl<'s, 't> Lexer<'s, 't> {
                     self.bump();
                     Ok(Escape::Units(1))
                 } else {
+                    // A legacy octal escape: up to three digits, the first
+                    // deciding how many may follow. Sloppy code admits it;
+                    // the token is marked so strict code can refuse it.
+                    let _ = escape_start;
                     self.bump();
-                    Err(self.error(code::LEGACY_OCTAL_ESCAPE, escape_start))
+                    let more = if byte <= b'3' { 2 } else { 1 };
+                    let mut taken = 0;
+                    while taken < more && matches!(self.peek(), Some(b'0'..=b'7')) {
+                        self.bump();
+                        taken += 1;
+                    }
+                    self.legacy_escape = true;
+                    Ok(Escape::Units(1))
                 }
             }
             b'8' | b'9' => {
                 self.bump();
-                Err(self.error(code::LEGACY_OCTAL_ESCAPE, escape_start))
+                self.legacy_escape = true;
+                Ok(Escape::Units(1))
             }
             b'x' => {
                 self.bump();
@@ -1068,7 +1097,14 @@ impl<'s, 't> Lexer<'s, 't> {
     /// Skip one template escape, recovering past a malformed one so that a
     /// tagged template can still produce its raw text.
     fn scan_template_escape(&mut self, escape_start: u32) -> Result<Escape, Diagnostic> {
-        let outcome = self.scan_string_escape(escape_start);
+        self.legacy_escape = false;
+        let mut outcome = self.scan_string_escape(escape_start);
+        if self.legacy_escape {
+            // A template admits no legacy escape, sloppy or not: the cooked
+            // value is undefined, and the raw text stands.
+            self.legacy_escape = false;
+            outcome = Err(self.error(code::LEGACY_OCTAL_ESCAPE, escape_start));
+        }
         if outcome.is_err() {
             // Step past the escaped character so scanning continues at the
             // next template character rather than re-reading the backslash.
@@ -1112,6 +1148,7 @@ impl<'s, 't> Lexer<'s, 't> {
         let mut exponent = 0i32;
         let mut is_bigint = false;
         let mut fractional = false;
+        let mut legacy: Option<bool> = None;
 
         if self.peek() == Some(b'0') {
             match self.peek_at(1) {
@@ -1119,28 +1156,36 @@ impl<'s, 't> Lexer<'s, 't> {
                 Some(b'o' | b'O') => radix = 8,
                 Some(b'b' | b'B') => radix = 2,
                 Some(b'0'..=b'9') => {
+                    // A legacy octal integer — or, with an 8 or a 9 among the
+                    // digits, a decimal one. Sloppy code admits both; the
+                    // token is marked so strict code can refuse them.
                     self.bump();
-                    self.bump();
-                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    let mut octal = true;
+                    while let Some(digit @ b'0'..=b'9') = self.peek() {
+                        if digit >= b'8' {
+                            octal = false;
+                        }
                         self.bump();
                     }
-                    return Err(self.error(code::LEGACY_OCTAL_LITERAL, start));
+                    legacy = Some(octal);
                 }
                 _ => {}
             }
         }
 
         if radix == 10 {
-            self.scan_digits(10, start)?;
+            if legacy.is_none() {
+                self.scan_digits(10, start)?;
+            }
             integer_end = self.cursor;
-            if self.peek() == Some(b'.') {
+            if legacy != Some(true) && self.peek() == Some(b'.') {
                 fractional = true;
                 self.bump();
                 fraction_start = self.cursor;
                 self.scan_digits(10, start)?;
                 fraction_end = self.cursor;
             }
-            if matches!(self.peek(), Some(b'e' | b'E')) {
+            if legacy != Some(true) && matches!(self.peek(), Some(b'e' | b'E')) {
                 fractional = true;
                 self.bump();
                 if matches!(self.peek(), Some(b'+' | b'-')) {
@@ -1214,8 +1259,13 @@ impl<'s, 't> Lexer<'s, 't> {
         token.radix = radix;
         token.inner_start = digits_start;
         token.inner_end = integer_end;
+        if legacy.is_some() {
+            token.flags |= token_flag::LEGACY_OCTAL;
+        }
         if !is_bigint {
-            token.number = if radix == 10 {
+            token.number = if legacy == Some(true) {
+                radix_value(self.span(start, integer_end), 8)
+            } else if radix == 10 {
                 decimal_value(DecimalLiteral {
                     integer: self.span(start, integer_end),
                     fraction: self.span(fraction_start, fraction_end),
@@ -1462,6 +1512,7 @@ impl<'s, 't> Lexer<'s, 't> {
             (b',', _, _, _) => (Punctuator::Comma, 1),
             (b':', _, _, _) => (Punctuator::Colon, 1),
             (b'~', _, _, _) => (Punctuator::Tilde, 1),
+            (b'@', _, _, _) => (Punctuator::At, 1),
             (b'?', _, _, _) => (Punctuator::Question, 1),
             (b'.', _, _, _) => (Punctuator::Dot, 1),
             (b'<', _, _, _) => (Punctuator::Less, 1),
@@ -1578,7 +1629,46 @@ fn append_utf8(buffer: &mut [u8; 12], length: &mut usize, code_point: u32) -> bo
 /// The token has already been validated by the lexer, so the only reasons this
 /// returns `None` are a token that has no cooked value, a token that is not a
 /// literal or identifier, and storage smaller than `token.code_units`.
+/// Where cooked code units go: a unit slice, or the byte image a unit
+/// stores its constants in, little-endian.
+pub trait UnitSink {
+    /// How many units the sink can take.
+    fn room(&self) -> usize;
+    /// Store one unit at `index`, or refuse.
+    fn put(&mut self, index: usize, unit: u16) -> Option<()>;
+}
+
+impl UnitSink for [u16] {
+    fn room(&self) -> usize {
+        self.len()
+    }
+    fn put(&mut self, index: usize, unit: u16) -> Option<()> {
+        *self.get_mut(index)? = unit;
+        Some(())
+    }
+}
+
+/// A byte slice taking units two bytes each, low byte first.
+pub struct LittleEndianUnits<'a>(pub &'a mut [u8]);
+
+impl UnitSink for LittleEndianUnits<'_> {
+    fn room(&self) -> usize {
+        self.0.len() / 2
+    }
+    fn put(&mut self, index: usize, unit: u16) -> Option<()> {
+        let bytes = unit.to_le_bytes();
+        *self.0.get_mut(index * 2)? = bytes[0];
+        *self.0.get_mut(index * 2 + 1)? = bytes[1];
+        Some(())
+    }
+}
+
 pub fn cook(source: &[u8], token: &Token, out: &mut [u16]) -> Option<usize> {
+    cook_into(source, token, out)
+}
+
+/// Write the cooked value of a token into any unit sink.
+pub fn cook_into<S: UnitSink + ?Sized>(source: &[u8], token: &Token, out: &mut S) -> Option<usize> {
     if !token.cooked_valid {
         return None;
     }
@@ -1593,7 +1683,7 @@ pub fn cook(source: &[u8], token: &Token, out: &mut [u16]) -> Option<usize> {
         }
         _ => return None,
     };
-    if out.len() < token.code_units as usize {
+    if out.room() < token.code_units as usize {
         return None;
     }
 
@@ -1626,13 +1716,38 @@ pub fn cook(source: &[u8], token: &Token, out: &mut [u16]) -> Option<usize> {
                         cursor += 1;
                     }
                 }
-                (Escapes::Full, b'0') => {
+                (Escapes::Full, b'0'..=b'7') => {
+                    // `\0` alone is the null character; digits after it, or
+                    // a leading 1 to 7, make a legacy octal escape.
+                    let first = escaped - b'0';
+                    let mut value = u32::from(first);
                     cursor += 1;
-                    written += write_scalar(out, written, 0)?;
+                    let more = if first <= 3 { 2 } else { 1 };
+                    let mut taken = 0;
+                    while taken < more {
+                        match source.get(cursor) {
+                            Some(digit @ b'0'..=b'7') => {
+                                value = value * 8 + u32::from(digit - b'0');
+                                cursor += 1;
+                                taken += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    written += write_scalar(out, written, value)?;
+                }
+                (Escapes::Full, b'8' | b'9') => {
+                    cursor += 1;
+                    written += write_scalar(out, written, u32::from(escaped))?;
                 }
                 (Escapes::Full, _) => {
                     let decoded = decode(source, cursor)?;
                     cursor += decoded.length as usize;
+                    if matches!(decoded.code_point, 0x2028 | 0x2029) {
+                        // A line separator continues the line: the escape
+                        // cooks to nothing.
+                        continue;
+                    }
                     let value = match decoded.code_point {
                         0x62 => 0x08,
                         0x66 => 0x0C,
@@ -1701,15 +1816,15 @@ fn read_unicode_escape(source: &[u8], offset: usize) -> Option<(u32, usize)> {
 ///
 /// A value in the surrogate range is written verbatim, because a lone surrogate
 /// written with an escape is a legitimate ECMAScript string element.
-fn write_scalar(out: &mut [u16], written: usize, value: u32) -> Option<usize> {
+fn write_scalar<S: UnitSink + ?Sized>(out: &mut S, written: usize, value: u32) -> Option<usize> {
     if value > 0xFFFF {
         let adjusted = value.checked_sub(0x1_0000)?;
         let high = u16::try_from(0xD800 + (adjusted >> 10)).ok()?;
         let low = u16::try_from(0xDC00 + (adjusted & 0x3FF)).ok()?;
-        *out.get_mut(written)? = high;
-        *out.get_mut(written + 1)? = low;
+        out.put(written, high)?;
+        out.put(written + 1, low)?;
         return Some(2);
     }
-    *out.get_mut(written)? = u16::try_from(value).ok()?;
+    out.put(written, u16::try_from(value).ok()?)?;
     Some(1)
 }

@@ -17,9 +17,13 @@
 //! ```text
 //! count: u32
 //! count × site:
-//!   function: u32 | pc: u32 | flags: u32 | bindings: u32
+//!   function: u32 | pc: u32 | flags: u32 | bindings: u32 | var_depth: u32
 //!   bindings × { slot: u32 | depth: u32 | kind: u32 | length: u32 | name bytes }
 //! ```
+//!
+//! `var_depth` is the context depth, from the site, of the variable
+//! environment its sloppy eval code declares into — `u32::MAX` when that
+//! environment is the global object.
 
 /// The site's code is strict, so the eval source is strict before its own
 /// directive says anything.
@@ -27,6 +31,29 @@ pub const FLAG_STRICT: u32 = 1 << 0;
 /// More was visible than the record could hold. A host treats the site as if
 /// it had no record rather than resolving against half a scope.
 pub const FLAG_TRUNCATED: u32 = 1 << 1;
+/// The site sits in function code, so the eval's variable environment is a
+/// function environment, which sloppy eval code may not `var`-declare
+/// `arguments` into.
+pub const FLAG_FUNCTION: u32 = 1 << 2;
+/// The site sits in code with a home object — a method, an accessor, a
+/// class constructor, or a field initialiser — so the eval source may
+/// reference `super.name`.
+pub const FLAG_SUPER_PROPERTY: u32 = 1 << 3;
+/// The site sits in a derived class constructor, so the eval source may
+/// call `super()`.
+pub const FLAG_SUPER_CALL: u32 = 1 << 4;
+/// The site sits in function code proper, so the eval source may read
+/// `new.target`.
+pub const FLAG_NEW_TARGET: u32 = 1 << 5;
+/// The site sits in a class field initialiser, whose code — the eval
+/// source included — may not reference `arguments`.
+pub const FLAG_NO_ARGUMENTS: u32 = 1 << 6;
+/// The site can see a private scope, so the eval source may reference
+/// private members.
+pub const FLAG_PRIVATES: u32 = 1 << 7;
+/// The site sits in a parameter initialiser — arrow or not — whose
+/// parameter bindings a sloppy eval may not `var`-redeclare.
+pub const FLAG_PARAMETERS: u32 = 1 << 8;
 
 /// One binding a host hands back to the compiler.
 #[derive(Clone, Copy)]
@@ -43,6 +70,8 @@ pub struct Site<'a> {
     pub flags: u32,
     bindings: &'a [u8],
     pub binding_count: u32,
+    /// The context depth of the site's variable environment, from the site.
+    pub var_depth: u32,
 }
 
 impl<'a> Site<'a> {
@@ -96,7 +125,8 @@ pub fn find(blob: &[u8], function: u32, pc: u32) -> Option<Site<'_>> {
         let site_pc = read_u32(blob, at + 4)?;
         let flags = read_u32(blob, at + 8)?;
         let bindings = read_u32(blob, at + 12)?;
-        let start = at + 16;
+        let var_depth = read_u32(blob, at + 16)?;
+        let start = at + 20;
         let mut cursor = start;
         let mut binding = 0u32;
         while binding < bindings {
@@ -109,6 +139,7 @@ pub fn find(blob: &[u8], function: u32, pc: u32) -> Option<Site<'_>> {
                 flags,
                 bindings: blob.get(start..cursor)?,
                 binding_count: bindings,
+                var_depth,
             });
         }
         at = cursor;

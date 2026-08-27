@@ -141,6 +141,234 @@ pub enum Opcode {
     /// The keyed forms take the key from a register.
     DefineKeyedGetter = 0x3D,
     DefineKeyedSetter = 0x3E,
+    /// Branch when the accumulator is not `undefined`: what a default value
+    /// checks, which fires on `undefined` alone, never on `null`.
+    JumpIfNotUndefined = 0x99,
+    /// Build an array of the running frame's actual arguments from the
+    /// operand index onward: a rest parameter's value.
+    CreateRestArguments = 0x9A,
+    /// Read a name through the environment chain by its text — a binding a
+    /// direct eval created — falling back to the global object.
+    LdaDynamic = 0x9B,
+    /// Write the accumulator through the environment chain by name, creating
+    /// a global property when nothing binds it.
+    StaDynamic = 0x9C,
+    /// Read a name as `typeof` does: an unresolvable name is `undefined`.
+    TypeofDynamic = 0x9D,
+    /// Declare a `var` in the nearest variable environment — a function or
+    /// arrow environment, or the global object — unless it already binds the
+    /// name.
+    DeclareEvalVar = 0x9E,
+    /// Delete a name: a binding a direct eval created is removed, a global
+    /// property is deleted, and a static binding was already answered false.
+    DeleteDynamic = 0x9F,
+    /// Suspend the running async function until the accumulator's value
+    /// settles, answering its promise to the caller.
+    Await = 0xA0,
+    /// Read a context slot — unless a nearer named binding, one a direct
+    /// eval created, shadows it.
+    LdaShadowable = 0xA1,
+    /// Write a context slot — unless a nearer named binding shadows it.
+    StaShadowable = 0xA2,
+    /// Resolve an assignment target's environment before its value is made:
+    /// the shadowing named binding's environment when one is nearer than the
+    /// static slot, the slot's own environment otherwise.
+    PrepareShadowable = 0xA3,
+    /// Read through a prepared environment: the named binding when the
+    /// record holds one, the slot otherwise.
+    LdaPrepared = 0xA4,
+    /// Write through a prepared environment.
+    StaPrepared = 0xA5,
+    /// A class with no written constructor gets the specification's default:
+    /// base does nothing, derived forwards its arguments to `super`.
+    CreateDefaultConstructor = 0xA6,
+    /// Shape the accumulator's function into a class constructor over the
+    /// prototype object in the register: only-via-new, home object, and the
+    /// `prototype`/`constructor` pair.
+    MakeClassConstructor = 0xA7,
+    /// Define the accumulator as a named method: non-enumerable, with the
+    /// register's object as its home.
+    DefineMethod = 0xA8,
+    /// Define the accumulator as a method under the computed key in the
+    /// second register.
+    DefineMethodKeyed = 0xA9,
+    /// Define the accumulator as a class accessor: non-enumerable getter or
+    /// setter, by the immediate kind.
+    DefineClassAccessor = 0xAA,
+    /// The keyed form of the class accessor definition.
+    DefineClassAccessorKeyed = 0xAB,
+    /// Read a property through the running method's home object's prototype.
+    LdaSuperProperty = 0xAC,
+    /// Call the parent constructor with this frame's `this`.
+    CallSuper = 0xAD,
+    /// `new.target`: the constructed callee, or undefined in a plain call.
+    LdaNewTarget = 0xAE,
+    /// The prototype object a heritage supplies: the register's value must
+    /// be a constructor whose `prototype` is an object or null, or the
+    /// heritage is the TypeError the specification makes it.
+    GetHeritagePrototype = 0xAF,
+    /// Suspend the running generator, handing the accumulator to whoever
+    /// called `next`.
+    Yield = 0xB0,
+    /// Suspend a generator at its start, once its parameters are bound: the
+    /// call's answer is the generator object.
+    InitialYield = 0xB1,
+    /// Push an object environment over the accumulator's object: the `with`
+    /// statement's scope.
+    PushObjectContext = 0xB2,
+    /// Run the class fields the running constructor's function carries,
+    /// defining each on `this` in order.
+    InitFields = 0xB3,
+    /// Close the iterator in the first register unless the done flag in the
+    /// second says it finished on its own.
+    IteratorClose = 0xB4,
+    /// Close the iterator, swallowing anything the close itself throws: what
+    /// an abrupt destructuring does before rethrowing its own reason.
+    IteratorCloseQuiet = 0xB5,
+    /// The accumulator must be an object — an iterator result — or the
+    /// TypeError the protocol demands.
+    RequireObject = 0xB6,
+    /// `super()` returned: `this` leaves its dead zone.
+    BindThis = 0xB7,
+    /// `new` with a spread: the callee in the first register, the gathered
+    /// arguments in the second.
+    ConstructWithArray = 0xB8,
+    /// `super(...)` with a spread: the gathered arguments in the register.
+    CallSuperWithArray = 0xB9,
+    /// `import()`: a promise rejected with a TypeError — this build carries
+    /// no module loader, and the rejection is how the expression says so.
+    ImportReject = 0xBA,
+    /// The iterator `for await` walks: the async protocol's, or the sync
+    /// protocol's whose results the loop awaits.
+    GetAsyncIterator = 0xBB,
+    /// Suspend the running generator at a `yield*` step: a later `return`
+    /// or `throw` resumes here with its kind readable, so the delegation
+    /// forwards it to the inner iterator instead of acting itself.
+    YieldStar = 0xBC,
+    /// How the suspended generator was resumed: 0 for `next`, 1 for
+    /// `throw`, 2 for `return`, as a number in the accumulator.
+    ResumeKind = 0xBD,
+    /// Declare a global function binding by name: the property must be
+    /// definable — absent on an extensible global, configurable, or a
+    /// writable enumerable data property — or the TypeError the
+    /// specification makes it.
+    DeclareGlobalFunction = 0xBE,
+    /// Define one instance field on `this`: the register holds the field's
+    /// evaluated name, the accumulator its value, and a private name makes a
+    /// hidden property.
+    DefineField = 0xBF,
+    /// Give the function in the accumulator the register's object as its
+    /// home, which is what a field initialiser's `super` resolves through.
+    SetHome = 0xC0,
+    /// Stamp `this` with the running constructor's prototype: the private
+    /// brand, which private member access checks against.
+    Brand = 0xC1,
+    /// `#x in o`: whether the accumulator's object carries the site's
+    /// private member named by the constant.
+    TestPrivateIn = 0xC2,
+    /// Read the accumulator's key through the running method's home
+    /// object's prototype: `super[key]`.
+    LdaSuperKeyed = 0xC3,
+    /// Turn the private name in the accumulator into the storage key of the
+    /// register's class object: same-named privates of other classes stay
+    /// apart, and no reflective surface sees the result.
+    PrivateKey = 0xC4,
+    /// The running method's super base — its home object's prototype — into
+    /// the accumulator, after `this` is bound.
+    GetSuperBase = 0xC5,
+    /// Throw a ReferenceError: what deleting a super reference does.
+    ThrowReference = 0xC6,
+    /// The template object for one tagged-template site: the first
+    /// evaluation's array is kept, and every later one answers it.
+    CacheTemplate = 0xC7,
+    /// Throw a TypeError: what strict code assigning a named function
+    /// expression's own name does.
+    ThrowSelfAssignment = 0xC8,
+    /// Suspend at a sync `yield*` step whose accumulator already holds the
+    /// inner iterator's result object: the resumer receives it untouched.
+    YieldDelegate = 0xC9,
+    /// Unary plus: the accumulator to a Number, refusing a BigInt.
+    ToNumber = 0xCA,
+    /// Whether the accumulator names a property the register's object still
+    /// has — or true for a primitive, whose keys cannot be deleted.
+    ForInHas = 0xCB,
+    /// The object a `with` environment supplies the named binding from, as
+    /// a call's receiver — or undefined when no such environment binds it.
+    LdaWithReceiver = 0xCC,
+    /// Write the accumulator to `super.name`: through the base in the
+    /// register, onto this frame's `this`.
+    StaSuperNamed = 0xCD,
+    /// Write the accumulator to `super[key]`: the base and the key are the
+    /// registers, the receiver is this frame's `this`.
+    StaSuperKeyed = 0xCE,
+    /// A fresh stack of resources to dispose, in the accumulator.
+    CreateDisposeStack = 0xCF,
+    /// Push the accumulator onto the stack in the register: nothing for
+    /// null or undefined, a TypeError for anything without `@@dispose`.
+    AddDisposable = 0xD0,
+    /// Dispose the stack in the register, last resource first; a disposer's
+    /// throw suppresses whatever was thrown before it.
+    DisposeStack = 0xD1,
+    /// Dispose the stack in the first register while the exception in the
+    /// second propagates, then throw what remains.
+    DisposeStackThrow = 0xD2,
+    /// Push the accumulator onto the stack in the register for awaited
+    /// disposal: by `@@asyncDispose`, else by `@@dispose` with an await of
+    /// undefined after it; null and undefined join as an await alone.
+    AddDisposableAsync = 0xD3,
+    /// Dispose the stack in the first register up to the next result that
+    /// must be awaited, leaving that result in the accumulator — or the
+    /// stack itself once nothing remains. A disposer's throw joins the
+    /// second register, which holds the stack while nothing is pending.
+    DisposeStackNext = 0xD4,
+    /// Fold the exception in the second register into the first, which holds
+    /// a pending exception — or a dispose stack while none is pending — so
+    /// the new one suppresses the earlier.
+    SuppressError = 0xD5,
+    /// A script's top-level lexical name may be declared: no global lexical
+    /// or script `var` already has it, and no non-configurable global
+    /// property does — else the SyntaxError declaration instantiation throws.
+    CheckGlobalLexical = 0xD6,
+    /// A script's `var` or function name may be declared: no global lexical
+    /// has it.
+    CheckGlobalVar = 0xD7,
+    /// Bind a script's top-level lexical name in the global lexical
+    /// environment, uninitialised; the immediate says whether it is a const.
+    DeclareGlobalLexical = 0xD8,
+    /// Initialise the global lexical binding of the name with the accumulator.
+    InitGlobalLexical = 0xD9,
+    /// Whether the name resolves at all — a global lexical, even in its dead
+    /// zone, or a property of the global object — into the accumulator: a
+    /// strict assignment resolves its reference before the value is made.
+    HasGlobal = 0xDA,
+    /// Store the accumulator to the global name whose resolution the
+    /// register holds: unresolvable is the strict ReferenceError.
+    StaGlobalResolved = 0xDB,
+    /// `CopyDataProperties` with an exclusion list: the accumulator's own
+    /// enumerable properties cross to the first register's object, except
+    /// the keys the second register's object holds — an object rest pattern
+    /// never looks at the properties it named, not even to skip them.
+    CopyDataPropertiesExcluding = 0xDC,
+    /// Load a free name for a call under `with`: one resolution supplies
+    /// both the callee, into the accumulator, and the receiver the call
+    /// takes — the `with` object that bound the name, or undefined — into
+    /// the register.
+    LdaDynamicCallee = 0xDD,
+    /// `NameClosure` from a computed key: the register holds the property
+    /// key the closure in the accumulator is defined under.
+    NameClosureKeyed = 0xDE,
+    /// Define an auto-accessor property: a getter and setter of the key in
+    /// the second register, on the first register's object, reading and
+    /// writing a hidden field of the receiver.
+    DefineAutoAccessor = 0xE0,
+    /// Import the module the accumulator's string names, answering a promise
+    /// of its namespace — the deferred one when the operand says so. The
+    /// module must be one of the closure's; anything else rejects.
+    DynamicImport = 0xE1,
+    /// The end of a module's instantiation: its bindings exist and its
+    /// function declarations hold their closures. An instantiation pass
+    /// stops here; an evaluation walks straight through.
+    InstantiationEnd = 0xE2,
     /// Give the closure in the accumulator its `name`, from a key constant:
     /// what the specification calls named evaluation. A closure that already
     /// carries a name keeps it.
@@ -231,6 +459,12 @@ pub enum Opcode {
     // Calls.
     Call = 0x80,
     CallProperty = 0x81,
+    /// `Call` in tail position of a strict function: the running frame is
+    /// given up before the callee's is made, so a chain of such calls
+    /// holds one frame however long it runs. A callee that is not
+    /// bytecode, or a frame that must outlive the call, calls as `Call`
+    /// does and the `Return` that follows delivers the value.
+    TailCall = 0xDF,
     Construct = 0x82,
     /// Call with the arguments an array holds, which is what a spread argument
     /// needs: how many there are is not known where the call is written.
@@ -290,6 +524,79 @@ impl Opcode {
             0x3D => Self::DefineKeyedGetter,
             0x3E => Self::DefineKeyedSetter,
             0x3F => Self::NameClosure,
+            0x99 => Self::JumpIfNotUndefined,
+            0x9A => Self::CreateRestArguments,
+            0x9B => Self::LdaDynamic,
+            0x9C => Self::StaDynamic,
+            0x9D => Self::TypeofDynamic,
+            0x9E => Self::DeclareEvalVar,
+            0x9F => Self::DeleteDynamic,
+            0xA0 => Self::Await,
+            0xA1 => Self::LdaShadowable,
+            0xA2 => Self::StaShadowable,
+            0xA3 => Self::PrepareShadowable,
+            0xA4 => Self::LdaPrepared,
+            0xA5 => Self::StaPrepared,
+            0xA6 => Self::CreateDefaultConstructor,
+            0xA7 => Self::MakeClassConstructor,
+            0xA8 => Self::DefineMethod,
+            0xA9 => Self::DefineMethodKeyed,
+            0xAA => Self::DefineClassAccessor,
+            0xAB => Self::DefineClassAccessorKeyed,
+            0xAC => Self::LdaSuperProperty,
+            0xAD => Self::CallSuper,
+            0xAE => Self::LdaNewTarget,
+            0xAF => Self::GetHeritagePrototype,
+            0xB0 => Self::Yield,
+            0xB1 => Self::InitialYield,
+            0xB2 => Self::PushObjectContext,
+            0xB3 => Self::InitFields,
+            0xB4 => Self::IteratorClose,
+            0xB5 => Self::IteratorCloseQuiet,
+            0xB6 => Self::RequireObject,
+            0xB7 => Self::BindThis,
+            0xB8 => Self::ConstructWithArray,
+            0xB9 => Self::CallSuperWithArray,
+            0xBA => Self::ImportReject,
+            0xBB => Self::GetAsyncIterator,
+            0xBC => Self::YieldStar,
+            0xBD => Self::ResumeKind,
+            0xBE => Self::DeclareGlobalFunction,
+            0xBF => Self::DefineField,
+            0xC0 => Self::SetHome,
+            0xC1 => Self::Brand,
+            0xC2 => Self::TestPrivateIn,
+            0xC3 => Self::LdaSuperKeyed,
+            0xC4 => Self::PrivateKey,
+            0xC5 => Self::GetSuperBase,
+            0xC6 => Self::ThrowReference,
+            0xC7 => Self::CacheTemplate,
+            0xC8 => Self::ThrowSelfAssignment,
+            0xC9 => Self::YieldDelegate,
+            0xCA => Self::ToNumber,
+            0xCB => Self::ForInHas,
+            0xCC => Self::LdaWithReceiver,
+            0xCD => Self::StaSuperNamed,
+            0xCE => Self::StaSuperKeyed,
+            0xCF => Self::CreateDisposeStack,
+            0xD0 => Self::AddDisposable,
+            0xD1 => Self::DisposeStack,
+            0xD2 => Self::DisposeStackThrow,
+            0xD3 => Self::AddDisposableAsync,
+            0xD4 => Self::DisposeStackNext,
+            0xD5 => Self::SuppressError,
+            0xD6 => Self::CheckGlobalLexical,
+            0xD7 => Self::CheckGlobalVar,
+            0xD8 => Self::DeclareGlobalLexical,
+            0xD9 => Self::InitGlobalLexical,
+            0xDA => Self::HasGlobal,
+            0xDB => Self::StaGlobalResolved,
+            0xDC => Self::CopyDataPropertiesExcluding,
+            0xDD => Self::LdaDynamicCallee,
+            0xDE => Self::NameClosureKeyed,
+            0xE0 => Self::DefineAutoAccessor,
+            0xE1 => Self::DynamicImport,
+            0xE2 => Self::InstantiationEnd,
             0x40 => Self::TestEqual,
             0x41 => Self::TestNotEqual,
             0x42 => Self::TestStrictEqual,
@@ -334,6 +641,7 @@ impl Opcode {
             0x73 => Self::SetPrototype,
             0x80 => Self::Call,
             0x81 => Self::CallProperty,
+            0xDF => Self::TailCall,
             0x82 => Self::Construct,
             0x83 => Self::CallWithArray,
             0x90 => Self::Jump,
@@ -380,11 +688,30 @@ impl Opcode {
             | Self::LdaCallee
             | Self::GetIterator
             | Self::GetEnumerable
-            | Self::CreateArguments
             | Self::Return
-            | Self::Throw => Signature::new(0, [NONE, NONE, NONE]),
+            | Self::Throw
+            | Self::Await
+            | Self::Yield
+            | Self::InitialYield
+            | Self::PushObjectContext
+            | Self::InitFields
+            | Self::RequireObject
+            | Self::BindThis
+            | Self::ImportReject
+            | Self::GetAsyncIterator
+            | Self::YieldStar
+            | Self::ResumeKind
+            | Self::Brand
+            | Self::GetSuperBase
+            | Self::ThrowReference
+            | Self::ThrowSelfAssignment
+            | Self::YieldDelegate
+            | Self::ToNumber
+            | Self::InstantiationEnd => Signature::new(0, [NONE, NONE, NONE]),
+            Self::ForInHas => Signature::new(1, [Register, NONE, NONE]),
 
-            Self::LdaSmi => Signature::new(1, [Immediate, NONE, NONE]),
+            Self::LdaSmi | Self::CacheTemplate => Signature::new(1, [Immediate, NONE, NONE]),
+            Self::DynamicImport => Signature::new(2, [Immediate, Register, NONE]),
             Self::LdaConstant
             | Self::LdaGlobal
             | Self::LdaGlobalOrUndefined
@@ -392,7 +719,24 @@ impl Opcode {
             | Self::StaGlobalStrict
             | Self::DeclareGlobal
             | Self::NameClosure
-            | Self::DeleteNamedProperty => Signature::new(1, [Constant, NONE, NONE]),
+            | Self::DeleteNamedProperty
+            | Self::LdaDynamic
+            | Self::LdaWithReceiver
+            | Self::StaDynamic
+            | Self::TypeofDynamic
+            | Self::DeclareEvalVar
+            | Self::DeleteDynamic
+            | Self::TestPrivateIn => Signature::new(1, [Constant, NONE, NONE]),
+            Self::DeclareGlobalFunction | Self::DeclareGlobalLexical => {
+                Signature::new(2, [Constant, Immediate, NONE])
+            }
+            Self::CheckGlobalLexical
+            | Self::CheckGlobalVar
+            | Self::InitGlobalLexical
+            | Self::HasGlobal => Signature::new(1, [Constant, NONE, NONE]),
+            Self::StaGlobalResolved | Self::LdaDynamicCallee => {
+                Signature::new(2, [Constant, Register, NONE])
+            }
             Self::Ldar
             | Self::Star
             | Self::Add
@@ -421,18 +765,37 @@ impl Opcode {
             | Self::AppendArrayElement
             | Self::AppendArrayHole
             | Self::CopyDataProperties
+            | Self::NameClosureKeyed
             | Self::DeleteKeyedProperty => Signature::new(1, [Register, NONE, NONE]),
             Self::PushContext => Signature::new(1, [Count, NONE, NONE]),
-            Self::IteratorNext => Signature::new(2, [Register, Register, NONE]),
+            Self::IteratorNext
+            | Self::IteratorClose
+            | Self::IteratorCloseQuiet
+            | Self::ConstructWithArray => Signature::new(2, [Register, Register, NONE]),
+            Self::CallSuperWithArray => Signature::new(1, [Register, NONE, NONE]),
+            Self::DefineField => Signature::new(1, [Register, NONE, NONE]),
+            Self::SetHome => Signature::new(1, [Register, NONE, NONE]),
+            Self::PrivateKey => Signature::new(2, [Register, Immediate, NONE]),
+            Self::LdaSuperKeyed => Signature::new(1, [Register, NONE, NONE]),
             Self::Jump
             | Self::JumpIfTrue
             | Self::JumpIfFalse
             | Self::JumpIfToBooleanTrue
             | Self::JumpIfToBooleanFalse
             | Self::JumpIfNullish
-            | Self::JumpIfNotNullish => Signature::new(1, [Jump, NONE, NONE]),
+            | Self::JumpIfNotNullish
+            | Self::JumpIfNotUndefined => Signature::new(1, [Jump, NONE, NONE]),
 
             Self::Mov => Signature::new(2, [Register, Register, NONE]),
+            Self::StaSuperNamed => Signature::new(2, [Register, Constant, NONE]),
+            Self::StaSuperKeyed | Self::DisposeStackThrow | Self::DisposeStackNext => {
+                Signature::new(2, [Register, Register, NONE])
+            }
+            Self::SuppressError => Signature::new(3, [Register, Register, Register]),
+            Self::CreateDisposeStack => Signature::new(0, [NONE, NONE, NONE]),
+            Self::AddDisposable | Self::AddDisposableAsync | Self::DisposeStack => {
+                Signature::new(1, [Register, NONE, NONE])
+            }
             Self::GetNamedProperty
             | Self::SetNamedProperty
             | Self::DefineNamedProperty
@@ -441,9 +804,31 @@ impl Opcode {
             Self::SetKeyedProperty
             | Self::DefineKeyedProperty
             | Self::DefineKeyedGetter
-            | Self::DefineKeyedSetter => Signature::new(2, [Register, Register, NONE]),
+            | Self::DefineKeyedSetter
+            | Self::CopyDataPropertiesExcluding
+            | Self::DefineAutoAccessor => Signature::new(2, [Register, Register, NONE]),
             Self::LdaContextSlot | Self::StaContextSlot | Self::InitContextSlot => {
                 Signature::new(2, [Count, Depth, NONE])
+            }
+            Self::LdaShadowable | Self::StaShadowable => {
+                Signature::new(3, [Constant, Count, Depth])
+            }
+            // The third operand is a depth or the free-name sentinel, so it
+            // is not held to the declared context depth.
+            Self::PrepareShadowable => Signature::new(3, [Constant, Count, Count]),
+            Self::LdaPrepared | Self::StaPrepared => Signature::new(3, [Register, Constant, Count]),
+            Self::CreateDefaultConstructor => Signature::new(1, [Immediate, NONE, NONE]),
+            Self::MakeClassConstructor => Signature::new(2, [Register, Immediate, NONE]),
+            Self::DefineMethod => Signature::new(2, [Register, Constant, NONE]),
+            Self::DefineMethodKeyed => Signature::new(2, [Register, Register, NONE]),
+            Self::DefineClassAccessor => Signature::new(3, [Register, Constant, Immediate]),
+            Self::DefineClassAccessorKeyed => Signature::new(3, [Register, Register, Immediate]),
+            Self::LdaSuperProperty => Signature::new(1, [Constant, NONE, NONE]),
+            Self::CallSuper => Signature::new(2, [Register, Count, NONE]),
+            Self::LdaNewTarget => Signature::new(0, [NONE, NONE, NONE]),
+            Self::GetHeritagePrototype => Signature::new(1, [Register, NONE, NONE]),
+            Self::CreateRestArguments | Self::CreateArguments => {
+                Signature::new(1, [Count, NONE, NONE])
             }
             Self::SetPrototype | Self::ToPropertyKeyChecked => {
                 Signature::new(1, [Register, NONE, NONE])
@@ -454,7 +839,7 @@ impl Opcode {
 
             Self::Call | Self::Construct => Signature::new(3, [Register, Register, Count]),
             Self::CallWithArray => Signature::new(3, [Register, Register, Register]),
-            Self::CallProperty => Signature::new(3, [Register, Register, Count]),
+            Self::CallProperty | Self::TailCall => Signature::new(3, [Register, Register, Count]),
         }
     }
 
@@ -474,11 +859,12 @@ impl Opcode {
                 | Self::JumpIfToBooleanFalse
                 | Self::JumpIfNullish
                 | Self::JumpIfNotNullish
+                | Self::JumpIfNotUndefined
         )
     }
 
     /// The highest assigned opcode byte, which bounds the format descriptor.
-    pub const MAX_BYTE: u8 = 0x98;
+    pub const MAX_BYTE: u8 = 0xE0;
 }
 
 /// One decoded instruction.
@@ -756,6 +1142,20 @@ pub mod function_flag {
     /// The function's body is strict code: a call with no receiver leaves
     /// `this` undefined rather than binding the global object.
     pub const STRICT: u32 = 1 << 1;
+    /// The function's code may direct-eval: its environment carries spare
+    /// capacity for the `var` bindings sloppy eval code declares at run time.
+    pub const DYNAMIC: u32 = 1 << 2;
+    /// The function is async: a call answers a promise, and `await` suspends
+    /// its frame until the awaited value settles.
+    pub const ASYNC: u32 = 1 << 3;
+    /// The function is a generator: a call answers a generator object, and
+    /// `yield` suspends its frame until the next `next`.
+    pub const GENERATOR: u32 = 1 << 4;
+    /// A derived class constructor: `this` stays in its dead zone until
+    /// `super()` binds it.
+    pub const DERIVED_CONSTRUCTOR: u32 = 1 << 5;
+    /// A method, getter, or setter: callable, never a constructor.
+    pub const METHOD: u32 = 1 << 6;
 }
 
 /// The section table of a unit image.
@@ -799,6 +1199,27 @@ pub struct ImportRecord {
     /// The slot this module's environment holds it in.
     pub slot: u32,
 }
+
+/// An export whose slot carries this mark names the exporting module's own
+/// import of that index instead: `export { imported }` is an indirection
+/// the linker follows, not a slot of this module's environment.
+pub const EXPORT_IMPORT_MARK: u32 = 1 << 31;
+
+/// An import record whose name is this asks for the module's namespace with
+/// its evaluation deferred: `import defer * as name`.
+pub const DEFER_IMPORT_NAME: u32 = u32::MAX - 1;
+
+/// A resolved import row holding this could not be linked — a name that
+/// resolves nowhere or ambiguously. Reading it is the SyntaxError linking
+/// would have raised.
+pub const POISON_IMPORT: u32 = u32::MAX - 2;
+
+/// An import record whose name is this asks for a source-phase record no
+/// host here provides; its row refuses with the host's TypeError.
+pub const SOURCE_IMPORT_NAME: u32 = u32::MAX - 3;
+
+/// A resolved row the host refused: a source phase it does not serve.
+pub const HOST_POISON_IMPORT: u32 = u32::MAX - 3;
 
 /// One name a module exports.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1018,6 +1439,11 @@ impl<'a> Unit<'a> {
         let mut index = 0u32;
         while index < self.header.export_count {
             let record = self.export(index)?;
+            if record.name == u32::MAX {
+                // `export * from`: no name of its own; a resolver follows it.
+                index += 1;
+                continue;
+            }
             let constant = self.constant(record.name)?;
             let mut units = [0u16; 64];
             let length = self.constant_units(&constant, &mut units)?;
@@ -1042,7 +1468,10 @@ impl<'a> Unit<'a> {
         let constant = self.constant(record.specifier)?;
         let specifier_length = self.constant_units(&constant, specifier)?;
         let mut name_length = 0usize;
-        if record.name != u32::MAX {
+        if record.name != u32::MAX
+            && record.name != DEFER_IMPORT_NAME
+            && record.name != SOURCE_IMPORT_NAME
+        {
             let constant = self.constant(record.name)?;
             name_length = self.constant_units(&constant, name)?;
         }
@@ -1093,6 +1522,16 @@ impl<'a> Unit<'a> {
     pub fn constant_bytes(&self, constant: &Constant) -> Option<&'a [u8]> {
         let at = self.constant_data_at + constant.first as usize;
         self.bytes.get(at..at + constant.second as usize)
+    }
+
+    /// A string or key constant's code units as the image lays them out:
+    /// little-endian, two bytes each.
+    pub fn constant_unit_bytes(&self, constant: &Constant) -> Option<&'a [u8]> {
+        if !matches!(constant.kind, ConstantKind::String | ConstantKind::Key) {
+            return None;
+        }
+        let at = self.constant_data_at + constant.first as usize;
+        self.bytes.get(at..at + constant.second as usize * 2)
     }
 
     /// A function's code.

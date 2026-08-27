@@ -86,6 +86,14 @@ fn trace_object(heap: &mut Heap<'_>, handle: Handle) {
             );
         }
         push_value(&mut children, &mut count, read_value(cell, 28));
+        // A method's home object, when it has one.
+        if let Some(home) = field8(cell, 48) {
+            let index = u32::from_le_bytes([home[0], home[1], home[2], home[3]]);
+            if index != u32::MAX {
+                let generation = u32::from_le_bytes([home[4], home[5], home[6], home[7]]);
+                push_handle(&mut children, &mut count, Handle::new(index, generation));
+            }
+        }
         // A promise's reaction list, when it has one.
         if let Some(reactions) = field8(cell, 40) {
             let index =
@@ -153,7 +161,7 @@ fn trace_property_table(heap: &mut Heap<'_>, handle: Handle) {
 }
 
 fn trace_environment(heap: &mut Heap<'_>, handle: Handle) {
-    const HEADER: usize = 32;
+    const HEADER: usize = 56;
     const BINDING: usize = 24;
     let mut index = 0usize;
     let mut first = true;
@@ -168,6 +176,8 @@ fn trace_environment(heap: &mut Heap<'_>, handle: Handle) {
             if first {
                 push_value(&mut children, &mut count, read_value(cell, 12));
                 push_value(&mut children, &mut count, read_value(cell, 21));
+                push_value(&mut children, &mut count, read_value(cell, 32));
+                push_value(&mut children, &mut count, read_value(cell, 41));
                 first = false;
             }
             let Some(header) = field4(cell, 4) else {

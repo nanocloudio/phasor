@@ -1027,3 +1027,286 @@ fn scale_by_power_of_two(value: f64, power: i32) -> f64 {
     let biased = (remaining + 1023) as u64;
     result * f64::from_bits(biased << 52)
 }
+
+/// The exponential of a value.
+pub fn exp(value: f64) -> f64 {
+    if value.is_nan() {
+        return f64::NAN;
+    }
+    if value == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    if value == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    exp2(value * core::f64::consts::LOG2_E)
+}
+
+/// The natural logarithm of a value.
+pub fn log(value: f64) -> f64 {
+    logarithm(value, core::f64::consts::LN_2)
+}
+
+/// The base-two logarithm of a value.
+pub fn log_2(value: f64) -> f64 {
+    logarithm(value, 1.0)
+}
+
+/// The base-ten logarithm of a value.
+pub fn log_10(value: f64) -> f64 {
+    logarithm(value, core::f64::consts::LOG10_2)
+}
+
+/// A logarithm as the base-two logarithm times a conversion factor.
+fn logarithm(value: f64, factor: f64) -> f64 {
+    if value.is_nan() || value < 0.0 {
+        return f64::NAN;
+    }
+    if value == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if value == 1.0 {
+        return 0.0;
+    }
+    if value == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    log2(value) * factor
+}
+
+/// The cube root of a value, keeping the sign.
+pub fn cbrt(value: f64) -> f64 {
+    if value.is_nan() || value == 0.0 || value.is_infinite() {
+        return value;
+    }
+    let negative = value.to_bits() >> 63 == 1;
+    let magnitude = f64::from_bits(value.to_bits() & !(1 << 63));
+    let mut root = exp2(log2(magnitude) / 3.0);
+    // One Newton step tightens the estimate against the cube.
+    root -= (root - magnitude / (root * root)) / 3.0;
+    if negative {
+        -root
+    } else {
+        root
+    }
+}
+
+/// The sine of an angle in radians.
+pub fn sin(value: f64) -> f64 {
+    if value == 0.0 {
+        return value;
+    }
+    if !value.is_finite() {
+        return f64::NAN;
+    }
+    let (quadrant, reduced) = reduce_angle(value);
+    match quadrant {
+        0 => sine_series(reduced),
+        1 => cosine_series(reduced),
+        2 => -sine_series(reduced),
+        _ => -cosine_series(reduced),
+    }
+}
+
+/// The cosine of an angle in radians.
+pub fn cos(value: f64) -> f64 {
+    if value == 0.0 {
+        return 1.0;
+    }
+    if !value.is_finite() {
+        return f64::NAN;
+    }
+    let (quadrant, reduced) = reduce_angle(value);
+    match quadrant {
+        0 => cosine_series(reduced),
+        1 => -sine_series(reduced),
+        2 => -cosine_series(reduced),
+        _ => sine_series(reduced),
+    }
+}
+
+/// The tangent of an angle in radians.
+pub fn tan(value: f64) -> f64 {
+    if value == 0.0 {
+        return value;
+    }
+    if !value.is_finite() {
+        return f64::NAN;
+    }
+    let (quadrant, reduced) = reduce_angle(value);
+    let ratio = sine_series(reduced) / cosine_series(reduced);
+    if quadrant % 2 == 0 {
+        ratio
+    } else {
+        -1.0 / ratio
+    }
+}
+
+/// Fold an angle into an eighth-turn around zero, and say which quarter of
+/// the circle it came from.
+///
+/// The half pi is carried in three parts, so the remainder after a large
+/// multiple stays exact to well below the series' own error.
+fn reduce_angle(value: f64) -> (u32, f64) {
+    const HALF_PI_HIGH: f64 = core::f64::consts::FRAC_PI_2;
+    const HALF_PI_MID: f64 = 6.123_233_995_736_766e-17;
+    const HALF_PI_LOW: f64 = -1.497_384_904_859_228_3e-33;
+    let turns = value * core::f64::consts::FRAC_2_PI;
+    let rounded = truncate_towards_negative(turns + 0.5);
+    let reduced =
+        ((value - rounded * HALF_PI_HIGH) - rounded * HALF_PI_MID) - rounded * HALF_PI_LOW;
+    let quadrant = {
+        let folded = rounded - truncate_towards_negative(rounded / 4.0) * 4.0;
+        folded as u32 % 4
+    };
+    (quadrant, reduced)
+}
+
+/// The sine series on a reduced argument.
+fn sine_series(value: f64) -> f64 {
+    let square = value * value;
+    let mut term = value;
+    let mut sum = value;
+    let mut index = 1u32;
+    while index < 10 {
+        let step = f64::from(2 * index) * f64::from(2 * index + 1);
+        term *= -square / step;
+        sum += term;
+        index += 1;
+    }
+    sum
+}
+
+/// The cosine series on a reduced argument.
+fn cosine_series(value: f64) -> f64 {
+    let square = value * value;
+    let mut term = 1.0f64;
+    let mut sum = 1.0f64;
+    let mut index = 1u32;
+    while index < 10 {
+        let step = f64::from(2 * index - 1) * f64::from(2 * index);
+        term *= -square / step;
+        sum += term;
+        index += 1;
+    }
+    sum
+}
+
+/// The arctangent of a value.
+pub fn atan(value: f64) -> f64 {
+    if value.is_nan() || value == 0.0 {
+        return value;
+    }
+    if value == f64::INFINITY {
+        return core::f64::consts::FRAC_PI_2;
+    }
+    if value == f64::NEG_INFINITY {
+        return -core::f64::consts::FRAC_PI_2;
+    }
+    let negative = value.to_bits() >> 63 == 1;
+    let magnitude = f64::from_bits(value.to_bits() & !(1 << 63));
+    // Fold onto the unit interval, then halve the argument twice so the
+    // series converges fast; each halving doubles the angle back afterwards.
+    let inverted = magnitude > 1.0;
+    let mut x = if inverted { 1.0 / magnitude } else { magnitude };
+    let mut halvings = 0u32;
+    while x > 0.25 {
+        x /= 1.0 + sqrt(1.0 + x * x);
+        halvings += 1;
+    }
+    let square = x * x;
+    let mut term = x;
+    let mut sum = x;
+    let mut divisor = 3.0f64;
+    let mut index = 0u32;
+    while index < 12 {
+        term *= -square;
+        sum += term / divisor;
+        divisor += 2.0;
+        index += 1;
+    }
+    let mut angle = sum;
+    let mut count = halvings;
+    while count > 0 {
+        angle *= 2.0;
+        count -= 1;
+    }
+    if inverted {
+        angle = core::f64::consts::FRAC_PI_2 - angle;
+    }
+    if negative {
+        -angle
+    } else {
+        angle
+    }
+}
+
+/// The arcsine of a value.
+pub fn asin(value: f64) -> f64 {
+    if value.is_nan() || value == 0.0 {
+        return value;
+    }
+    if !(-1.0..=1.0).contains(&value) {
+        return f64::NAN;
+    }
+    if value == 1.0 {
+        return core::f64::consts::FRAC_PI_2;
+    }
+    if value == -1.0 {
+        return -core::f64::consts::FRAC_PI_2;
+    }
+    atan(value / sqrt(1.0 - value * value))
+}
+
+/// The arccosine of a value.
+pub fn acos(value: f64) -> f64 {
+    if value.is_nan() {
+        return f64::NAN;
+    }
+    if !(-1.0..=1.0).contains(&value) {
+        return f64::NAN;
+    }
+    if value == 1.0 {
+        return 0.0;
+    }
+    core::f64::consts::FRAC_PI_2 - asin(value)
+}
+
+/// The angle of a point, measured from the positive horizontal axis.
+pub fn atan2(y: f64, x: f64) -> f64 {
+    use core::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+    if y.is_nan() || x.is_nan() {
+        return f64::NAN;
+    }
+    let y_negative = y.to_bits() >> 63 == 1;
+    let x_negative = x.to_bits() >> 63 == 1;
+    if y.is_infinite() && x.is_infinite() {
+        let eighth = if x_negative {
+            3.0 * FRAC_PI_4
+        } else {
+            FRAC_PI_4
+        };
+        return if y_negative { -eighth } else { eighth };
+    }
+    if y == 0.0 {
+        let flat = if x_negative { PI } else { 0.0 };
+        return if y_negative { -flat } else { flat };
+    }
+    if x == 0.0 || y.is_infinite() {
+        return if y_negative { -FRAC_PI_2 } else { FRAC_PI_2 };
+    }
+    if x.is_infinite() {
+        let flat = if x_negative { PI } else { 0.0 };
+        return if y_negative { -flat } else { flat };
+    }
+    let base = atan(y / x);
+    if x_negative {
+        if y_negative {
+            base - PI
+        } else {
+            base + PI
+        }
+    } else {
+        base
+    }
+}

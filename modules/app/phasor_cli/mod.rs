@@ -126,6 +126,7 @@ fn name_of(value: u16) -> (&'static [u8], bool) {
         code::RETURN_OUTSIDE_FUNCTION => b"return-outside-function",
         code::STRICT_ASSIGNMENT_TO_RESTRICTED_NAME => b"strict-assignment-to-restricted-name",
         code::STRICT_INVALID_PARAMETER => b"strict-invalid-parameter",
+        code::EVAL_RESTRICTED_DECLARATION => b"eval-restricted-declaration",
         code::UNKNOWN_OPCODE => b"unknown-opcode",
         code::TRUNCATED_OPERAND => b"truncated-operand",
         code::MISPLACED_PREFIX => b"misplaced-prefix",

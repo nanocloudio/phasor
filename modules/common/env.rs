@@ -23,6 +23,9 @@ pub enum EnvironmentKind {
     Function = 1,
     /// The environment whose bindings are properties of an object.
     Object = 2,
+    /// An arrow call's environment: a variable environment for the `var`s a
+    /// direct eval declares, with no `this` of its own.
+    Arrow = 3,
 }
 
 /// Binding flags.
@@ -34,6 +37,9 @@ pub mod binding {
     /// Assigning to this binding when it is not writable throws rather than
     /// failing silently.
     pub const STRICT: u8 = 1 << 2;
+    /// The binding can never be deleted: a script's global lexical, which
+    /// `delete` answers false for rather than removing.
+    pub const PERMANENT: u8 = 1 << 3;
 }
 
 /// Why an environment operation did not happen.
@@ -63,7 +69,7 @@ impl From<HeapError> for EnvironmentError {
 pub const MAX_SCOPE_DEPTH: u32 = 256;
 
 /// Bytes before the bindings.
-const HEADER: usize = 32;
+const HEADER: usize = 56;
 /// Bytes in one binding.
 const BINDING: usize = 24;
 
@@ -83,7 +89,45 @@ pub fn create(
     cell[8..12].copy_from_slice(&capacity.to_le_bytes());
     write_value(&mut cell[12..21], parent);
     write_value(&mut cell[21..30], Value::UNDEFINED);
+    cell[30] = 0;
+    write_value(&mut cell[32..41], Value::UNDEFINED);
+    write_value(&mut cell[41..50], Value::UNDEFINED);
     Ok(handle)
+}
+
+/// The function a function environment was made for: what an arrow's
+/// `super()` constructs through.
+pub fn function(heap: &Heap<'_>, environment: Handle) -> Result<Value, EnvironmentError> {
+    let cell = environment_cell(heap, environment)?;
+    Ok(read_value(&cell[41..50]))
+}
+
+/// Record the function a function environment was made for.
+pub fn set_function(
+    heap: &mut Heap<'_>,
+    environment: Handle,
+    value: Value,
+) -> Result<(), EnvironmentError> {
+    let cell = heap.cell_mut(environment)?;
+    write_value(&mut cell[41..50], value);
+    Ok(())
+}
+
+/// Whether a function environment's `this` is still in its dead zone: a
+/// derived constructor's, before `super()` binds it.
+pub fn this_uninitialised(heap: &Heap<'_>, environment: Handle) -> Result<bool, EnvironmentError> {
+    let cell = environment_cell(heap, environment)?;
+    Ok(cell[30] != 0)
+}
+
+/// Put a function environment's `this` in its dead zone until `set_this`.
+pub fn mark_this_uninitialised(
+    heap: &mut Heap<'_>,
+    environment: Handle,
+) -> Result<(), EnvironmentError> {
+    let cell = heap.cell_mut(environment)?;
+    cell[30] = 1;
+    Ok(())
 }
 
 /// Create the environment whose bindings are the properties of `object`.
@@ -103,6 +147,7 @@ pub fn kind(heap: &Heap<'_>, environment: Handle) -> Result<EnvironmentKind, Env
     Ok(match cell[0] {
         1 => EnvironmentKind::Function,
         2 => EnvironmentKind::Object,
+        3 => EnvironmentKind::Arrow,
         _ => EnvironmentKind::Declarative,
     })
 }
@@ -132,6 +177,24 @@ pub fn set_this(
 ) -> Result<(), EnvironmentError> {
     let cell = heap.cell_mut(environment)?;
     write_value(&mut cell[21..30], value);
+    cell[30] = 0;
+    Ok(())
+}
+
+/// The `new.target` a function environment carries.
+pub fn new_target(heap: &Heap<'_>, environment: Handle) -> Result<Value, EnvironmentError> {
+    let cell = environment_cell(heap, environment)?;
+    Ok(read_value(&cell[32..41]))
+}
+
+/// Give a function environment its `new.target`.
+pub fn set_new_target(
+    heap: &mut Heap<'_>,
+    environment: Handle,
+    value: Value,
+) -> Result<(), EnvironmentError> {
+    let cell = heap.cell_mut(environment)?;
+    write_value(&mut cell[32..41], value);
     Ok(())
 }
 
@@ -217,6 +280,27 @@ pub fn index_of(
     Ok(None)
 }
 
+/// The flags a binding carries.
+pub fn binding_flags(
+    heap: &Heap<'_>,
+    environment: Handle,
+    index: u32,
+) -> Result<u8, EnvironmentError> {
+    Ok(binding_record(heap, environment, index)?[0])
+}
+
+/// Give an environment a new parent: what threads a fresh record into the
+/// global lexical chain when the head runs out of room.
+pub fn set_parent(
+    heap: &mut Heap<'_>,
+    environment: Handle,
+    parent: Value,
+) -> Result<(), EnvironmentError> {
+    let cell = heap.cell_mut(environment)?;
+    write_value(&mut cell[12..21], parent);
+    Ok(())
+}
+
 /// Read a binding by index in this record.
 pub fn slot_value(
     heap: &Heap<'_>,
@@ -250,6 +334,29 @@ pub fn set_slot(
         .get_mut(at..at + BINDING)
         .ok_or(EnvironmentError::Unresolvable)?;
     write_value(&mut record[12..21], value);
+    Ok(())
+}
+
+/// Remove a binding by index: its name is blanked so no lookup matches it
+/// again. The record keeps its length, so every other index stays what it
+/// was.
+pub fn remove(
+    heap: &mut Heap<'_>,
+    environment: Handle,
+    index: u32,
+) -> Result<(), EnvironmentError> {
+    let count = count(heap, environment)?;
+    if index >= count {
+        return Err(EnvironmentError::Unresolvable);
+    }
+    let cell = heap.cell_mut(environment)?;
+    let at = HEADER + index as usize * BINDING;
+    let record = cell
+        .get_mut(at..at + BINDING)
+        .ok_or(EnvironmentError::Unresolvable)?;
+    record[0] = binding::MUTABLE;
+    record[4..12].copy_from_slice(&[0u8; 8]);
+    write_value(&mut record[12..21], Value::UNDEFINED);
     Ok(())
 }
 

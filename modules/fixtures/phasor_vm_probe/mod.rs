@@ -48,6 +48,7 @@ mod job;
 #[path = "../../common/lex.rs"]
 mod lex;
 #[path = "../../common/lower.rs"]
+#[macro_use]
 mod lower;
 #[path = "../../common/numeric.rs"]
 mod numeric;
@@ -111,20 +112,20 @@ const POINT_CAPACITY: usize = 24;
 const PATCH_CAPACITY: usize = 24;
 const LABEL_CAPACITY: usize = 24;
 const VERIFIER_CAPACITY: usize = 2048;
-const ARENA_BYTES: usize = 64 * 1024;
+const ARENA_BYTES: usize = 192 * 1024;
 /// An arena with room for the realm and a working program, but not for every
 /// intermediate value one produces: a program of that shape must collect to
 /// finish, and must run out of heap when it may not.
-const COLLECTING_ARENA: usize = 36 * 1024;
-const SLOT_COUNT: usize = 1536;
-const ATOM_ENTRIES: usize = 512;
-const ATOM_HANDLES: usize = 384;
+const COLLECTING_ARENA: usize = 96 * 1024;
+const SLOT_COUNT: usize = 3072;
+const ATOM_ENTRIES: usize = 2048;
+const ATOM_HANDLES: usize = 1536;
 const FRAME_COUNT: usize = 12;
 const REGISTER_COUNT: usize = 96;
 const WORKLIST: usize = 512;
 const ROOT_COUNT: usize = 2048;
 /// Room for the generated source that outgrows the heap.
-const CHAIN_CAPACITY: usize = 1024;
+const CHAIN_CAPACITY: usize = 2048;
 
 /// Every buffer the front end and the interpreter need.
 const UNIT_CODE_CAPACITY: usize = 8192;
@@ -191,26 +192,7 @@ fn evaluates(storage: &mut Storage, source: &[u8], expected: &[u8]) -> bool {
         let Ok(root) = parser.parse_unit() else {
             return false;
         };
-        let mut lowering = LowerStorage {
-            code: &mut storage.code,
-            image: &mut storage.image,
-            constants: &mut storage.constants,
-            constant_data: &mut storage.constant_data,
-            safe_points: &mut storage.safe_points,
-            patches: &mut storage.patches,
-            labels: &mut storage.labels,
-            verifier_state: &mut storage.verifier_state,
-            unit_code: &mut storage.unit_code,
-            unit_safe_points: &mut storage.unit_safe_points,
-            functions: &mut storage.functions,
-            exceptions: &mut storage.exceptions,
-            scopes: &mut storage.scopes,
-            bindings: &mut storage.lexical,
-            pending: &mut storage.pending,
-            imports: &mut storage.imports,
-            exports: &mut storage.exports,
-            eval_sites: &mut storage.eval_sites,
-        };
+        let mut lowering = lower_storage!(storage);
         match lower_expression(source, parser.arena(), root, &mut lowering) {
             Ok(compiled) => compiled.length,
             Err(_) => return false,
@@ -360,26 +342,7 @@ fn run_chain(
         let syntax = Arena::new(&mut storage.nodes, &mut storage.lists, &mut storage.numbers);
         let mut parser = Parser::new(lexer, syntax, &mut storage.scratch, Limits::CEILING);
         let root = parser.parse_unit().ok()?;
-        let mut lowering = LowerStorage {
-            code: &mut storage.code,
-            image: &mut storage.image,
-            constants: &mut storage.constants,
-            constant_data: &mut storage.constant_data,
-            safe_points: &mut storage.safe_points,
-            patches: &mut storage.patches,
-            labels: &mut storage.labels,
-            verifier_state: &mut storage.verifier_state,
-            unit_code: &mut storage.unit_code,
-            unit_safe_points: &mut storage.unit_safe_points,
-            functions: &mut storage.functions,
-            exceptions: &mut storage.exceptions,
-            scopes: &mut storage.scopes,
-            bindings: &mut storage.lexical,
-            pending: &mut storage.pending,
-            imports: &mut storage.imports,
-            exports: &mut storage.exports,
-            eval_sites: &mut storage.eval_sites,
-        };
+        let mut lowering = lower_storage!(storage);
         lower_expression(source, parser.arena(), root, &mut lowering)
             .ok()
             .map(|compiled| compiled.length)?
@@ -472,26 +435,7 @@ fn ends(storage: &mut Storage, source: &[u8], ending: Ending) -> bool {
         let Ok(root) = parser.parse_unit() else {
             return false;
         };
-        let mut lowering = LowerStorage {
-            code: &mut storage.code,
-            image: &mut storage.image,
-            constants: &mut storage.constants,
-            constant_data: &mut storage.constant_data,
-            safe_points: &mut storage.safe_points,
-            patches: &mut storage.patches,
-            labels: &mut storage.labels,
-            verifier_state: &mut storage.verifier_state,
-            unit_code: &mut storage.unit_code,
-            unit_safe_points: &mut storage.unit_safe_points,
-            functions: &mut storage.functions,
-            exceptions: &mut storage.exceptions,
-            scopes: &mut storage.scopes,
-            bindings: &mut storage.lexical,
-            pending: &mut storage.pending,
-            imports: &mut storage.imports,
-            exports: &mut storage.exports,
-            eval_sites: &mut storage.eval_sites,
-        };
+        let mut lowering = lower_storage!(storage);
         match lower_expression(source, parser.arena(), root, &mut lowering) {
             Ok(compiled) => compiled.length,
             Err(_) => return false,
@@ -660,17 +604,18 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             let length = build_chain(storage, 90);
             let straight = run_chain(storage, length, COLLECTING_ARENA, true, false);
             let stepwise = run_chain(storage, length, COLLECTING_ARENA, true, true);
+            // Case 26 already holds the collector to having run; this case's
+            // claim is the equality itself.
             match (straight, stepwise) {
-                (Some((left, _)), Some((right, collections))) => {
-                    left == right && right == 540.0 && collections > 0
-                }
+                (Some((left, _)), Some((right, _))) => left == right && right == 540.0,
                 _ => false,
             }
         }
         27 => {
             // Without a collector the same program runs out of heap. The
-            // arena here is the realm plus a little, so the chain cannot fit.
-            let length = build_chain(storage, 90);
+            // arena here is the realm plus a little, so a longer chain
+            // cannot fit.
+            let length = build_chain(storage, 360);
             run_chain(storage, length, COLLECTING_ARENA, false, false).is_none()
         }
 

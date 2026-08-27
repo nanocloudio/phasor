@@ -9,8 +9,9 @@ decides whether something belongs here at all.
 ## 1. What belongs here
 
 A function belongs in the library when it is a pure function of its arguments
-and the heap. `Math.floor` is; `Math.random` is not, and is absent. There is no
-clock, no locale, no environment, and no input: every one of those is authority,
+and the heap. `Math.floor` is; `Math.random` is not, and comes only from a
+host that installs it. There is no clock the engine reads for itself, no
+locale, no environment, and no input: every one of those is authority,
 and authority reaches a program only through an admitted binding — see
 `capabilities.md`.
 
@@ -28,17 +29,25 @@ realm costs about twenty kilobytes of heap rather than a megabyte.
 | `String` | `fromCharCode` |
 | `String.prototype` | `charAt`, `charCodeAt`, `codePointAt`, `at`, `indexOf`, `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `slice`, `substring`, `split`, `toUpperCase`, `toLowerCase`, `trim`, `repeat`, `padStart`, `padEnd`, `concat`, `replace`, `toString`, `valueOf`, `[Symbol.iterator]` |
 | `Number` | `isInteger`, `isFinite`, `isNaN`, `isSafeInteger`, `parseInt`, `parseFloat`, and the value constants |
-| `Number.prototype` | `toString` with a radix, `toFixed`, `valueOf` |
+| `Number.prototype` | `toString` with a radix, `toFixed`, `toExponential`, `toPrecision`, `valueOf` |
 | `Boolean.prototype` | `toString`, `valueOf` |
 | `Symbol` | `iterator`, and the constructor that makes one |
 | `BigInt` | the conversion, and `toString` with a radix and `valueOf` on its prototype |
 | `Symbol.prototype` | `toString`, `description` |
-| `Math` | `abs`, `floor`, `ceil`, `round`, `trunc`, `sqrt`, `pow`, `sign`, `min`, `max`, `hypot`, and `PI`, `E`, `LN2`, `SQRT2` |
+| `Math` | `abs`, `floor`, `ceil`, `round`, `trunc`, `sqrt`, `pow`, `sign`, `min`, `max`, `hypot`, the transcendentals, and `PI`, `E`, `LN2`, `SQRT2`; `random` only where the host installs it, drawing a fixed-seed sequence that replays exactly |
+| `JSON` | `parse` with a reviver and `stringify` with a replacer function or list and a gap, pure functions of their arguments |
+| `WeakRef` | the constructor and `deref`, which always answers the target: no collection is ever observed |
+| `WeakMap`, `WeakSet` | `get`/`set`/`has`/`delete` and `add`/`has`/`delete`, keyed by objects and symbols only; nothing enumerates or counts the members, so a member stays until deleted |
+| `Proxy` | a handler between every operation and its target: the `get`, `set`, `has`, `deleteProperty`, `defineProperty`, `ownKeys`, `getOwnPropertyDescriptor`, `apply`, and `construct` traps, the target answering where a trap is absent; a `with` object, an object spread or rest, and `Reflect.set`'s receiver all go through them; `Proxy.revocable`; no `prototype` of its own |
+| `ArrayBuffer`, `SharedArrayBuffer`, the typed arrays, `DataView` | bytes held as numbers in an array the buffer owns, resizable to a `maxByteLength` given at construction; `slice` through the receiver's species; the eleven element kinds from `Int8Array` to `BigUint64Array` under `%TypedArray%` — `of`, `from`, the length and buffer accessors, iteration, `subarray`, `set`, `fill` — each view reading and writing its buffer little-endian by index, fixed or tracking its buffer's length; `SharedArrayBuffer` is the same bytes under its own name, since no thread here shares them |
+| `Date` | time values in UTC — the constructor in every form, `now`, `UTC`, `parse` of the ISO form, the getters, `setTime`, `toString`, `toISOString`, `toUTCString`, `toDateString`, `toTimeString`, `toJSON`, and `Symbol.toPrimitive`; "now" is the epoch unless the host provides a clock |
 | `Function` | the constructor, which compiles its body — see §8 |
 | `Function.prototype` | `call`, `apply`, `bind`, and the poisoned `caller` and `arguments` accessors, which refuse |
+| `GeneratorFunction`, `AsyncGeneratorFunction`, and `AsyncFunction` | reached through such a function's `constructor`, never a global; each builds from source only where a host compiles for `Function`, and the generator kinds' `prototype` chains run through the generator prototypes to `%IteratorPrototype%` or `%AsyncIteratorPrototype%` |
 | `Promise` | `resolve`, `reject`, and `then` on its prototype — see `jobs.md` |
 | `Error` and its kinds | `name`, `message`, `toString`; the kinds are `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `EvalError`, and `URIError` |
 | The global object | the above by name, plus `eval`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `undefined`, `NaN`, `Infinity`, `globalThis` |
+| A host's `$262` | installed by a conformance host: `evalScript` runs a source as a script, `global` names the global object, and `createRealm` makes a fresh realm of intrinsics beside this one — up to four in a machine, each function running in the realm it was made in |
 
 `sort` is an insertion sort: it is stable, it allocates nothing, and the arrays
 an isolate this size holds are small. `toUpperCase` and `toLowerCase` convert
@@ -124,12 +133,12 @@ a list shorter than the object.
 
 ## 5b. What a program does not find
 
-There is no `JSON`, `Map`, `Set`, `WeakMap`, `Date`, `console`, `setTimeout`,
-or typed array. The first four are data structures a program can write for
-itself; the rest are authority — a clock, a timer, an output stream — and
-authority reaches a program only through an admitted binding. Each is
-`undefined` rather than half-present, so a program that wants one finds out at
-once.
+There is no `console`, `setTimeout`, `Math.random`, or clock behind `Date`:
+each is authority — an output stream, a timer, a source of randomness, the time
+of day — and authority reaches a program only through a binding the host
+installs. Each is `undefined` rather than half-present, so a program that wants
+one finds out at once. `Atomics` is absent: the engine has no threads to
+share memory between, and nothing to wait on.
 
 ## 6. Primitives and their prototypes
 
@@ -153,10 +162,13 @@ The admitted grammar is: characters and the escapes `\n \t \r \f \v \0 \xHH
 \uHHHH \cX`, `.`, character classes with ranges and negation, the class escapes
 `\d \D \w \W \s \S`, the boundaries `\b \B`, the anchors `^ $`, groups both
 capturing and not, alternation, the quantifiers `* + ? {n} {n,} {n,m}` in greedy
-and lazy forms, backreferences, and lookahead both positive and negative.
+and lazy forms, backreferences, lookahead both positive and negative, and named
+groups: `(?<name>…)` names a capture, `\k<name>` refers to one — written before
+or after its group — a match's `groups` object holds the named captures on no
+prototype, and `$<name>` in a replacement string reads one.
 
-Not admitted, and refused rather than mis-read: lookbehind, named groups and the
-`\k` that names one, Unicode property escapes, and the `u`, `v`, and `d` flags.
+Not admitted, and refused rather than mis-read: lookbehind, Unicode property
+escapes, and the `u`, `v`, and `d` flags.
 The flags `g`, `i`, `m`, `s`, and `y` are admitted. Semantics are over code
 units, which is what the absence of `u` means; `ignoreCase` folds the ASCII and
 Latin-1 letters with a simple one-to-one mapping.
@@ -177,7 +189,11 @@ and `split`. A `$` in a replacement names part of the match: `$&`, `` $` ``,
 and limits as everything else. The machine pauses on the call; the host that
 carries the compiler compiles the source into a unit of its own and the
 machine enters it as a frame, so the eval'd code answers the call the way any
-frame answers its caller. Eval'd code runs as global code: its `var`
+frame answers its caller. A host may also attach its compiler to the machine
+(`attach_compiler`, a plain function and a state pointer), which the machine
+asks in place — the only way to an `eval` reached from inside a native's own
+call, such as an array callback or a promise reaction, where there is no
+pause to hand up. Eval'd code runs as global code: its `var`
 declarations land on the global object and its free names resolve there. A
 source that does not compile throws a `SyntaxError` the program can catch, a
 non-string argument to `eval` answers itself unchanged, and a host composed

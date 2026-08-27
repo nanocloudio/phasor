@@ -62,9 +62,11 @@ Decoding rules:
 - Language semantics are UTF-16. A code point above U+FFFF occupies two UTF-16
   code units, and every position exposed to a program counts code units, not
   bytes or code points.
-- Lone surrogates cannot be transported as UTF-8, so they enter only through
-  `\uXXXX` escapes inside string and template literals, where they are
-  preserved exactly.
+- A lone surrogate in a file enters only through a `\uXXXX` escape inside a
+  string or template literal, where it is preserved exactly. Source staged
+  from a string — an `eval` or `Function` argument — carries a string's lone
+  surrogates as three-byte sequences, which the decoder admits as the code
+  units they are.
 
 Line terminators are U+000A, U+000D, U+2028, and U+2029. The pair CR LF is one
 terminator. White space is U+0009, U+000B, U+000C, U+0020, U+00A0, U+FEFF, and

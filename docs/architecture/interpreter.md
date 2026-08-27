@@ -15,10 +15,20 @@ it has been initialised, so a read before initialisation is a distinct outcome
 from a read of a name that is not bound: that distinction is the temporal dead
 zone.
 
-A global environment holds no bindings of its own. It names an object, and a
-lookup that reaches it asks the object for the property, which is how a global
-reference reaches a property of the global object. Every walk outwards is
-bounded by an admitted scope depth.
+The global environment is two records. The outer names the global object, and
+a lookup that reaches it asks the object for the property, which is how a
+global reference reaches a property of the global object. Above it sits the
+global lexical record, where every script's top-level `let`, `const`, and
+`class` binds by name: a binding there is visible to every later script and
+to an indirect `eval`, is never a property of the global object, cannot be
+deleted, and keeps its dead zone until its declaration runs. A script
+instantiates its declarations before its first statement — every lexical name
+checked against the global lexicals, the names earlier scripts declared with
+`var`, and the non-configurable properties of the global object, and every
+`var` and function name checked against the global lexicals — so a collision
+is a `SyntaxError` thrown before any binding is made. A record that fills is
+followed by a fresh one beneath it. Every walk outwards is bounded by an
+admitted scope depth.
 
 ## 2. Functions
 
@@ -70,6 +80,15 @@ computed from a logarithm and an exponential, which the specification admits as
 implementation-approximated, so it may differ from another engine in the last
 place.
 
+A call in tail position of a strict function's `return` is the
+specification's proper tail call: the running frame is given up before the
+callee's frame is made, so a chain of such calls — a recursion however deep
+— holds one frame. The compiler marks the position, through a conditional,
+a comma, or a logical operator's chosen operand; the machine takes the short
+path only for a callee it would enter as a frame, and only from a frame with
+nothing waiting on how it ends — never from a construction, a generator, an
+async function, or under a finaliser still to run.
+
 ## 5. Throwing and unwinding
 
 A throw looks for the innermost exception region of the current function that
@@ -101,6 +120,8 @@ The error constructors are there too: `Error`, `TypeError`, `RangeError`,
 `ReferenceError`, and `SyntaxError`, each with its own prototype carrying its
 name, and `Error.prototype.toString`. They may be called or constructed.
 
-`JSON` is not there, and neither is a `Date`: one is a parser and a serialiser
-that nothing in the engine needs, and the other is a clock, which is a
-capability rather than something an engine may help itself to.
+`JSON` is a parser and a serialiser, pure functions of their arguments.
+`Date` is arithmetic over time values in UTC: what it cannot do on its own is
+tell the time, which is a capability rather than something an engine may help
+itself to — without a clock from the host, "now" is the epoch, the same
+answer every run.

@@ -24,6 +24,9 @@ pub enum PatternError {
     InvalidClass,
     /// An escape that means nothing.
     InvalidEscape,
+    /// A group name that is not an identifier, repeats another, or is
+    /// referred to without existing.
+    InvalidGroupName,
     /// A group that never closes, or a `)` with no group.
     UnmatchedParenthesis,
     /// The program, the group count, or the nesting is beyond what a build
@@ -38,6 +41,9 @@ pub mod flag {
     pub const MULTILINE: u8 = 1 << 2;
     pub const DOT_ALL: u8 = 1 << 3;
     pub const STICKY: u8 = 1 << 4;
+    /// The pattern works in code points: a surrogate pair is one atom, and
+    /// `\u{...}` escapes are admitted.
+    pub const UNICODE: u8 = 1 << 5;
 }
 
 /// Instructions of the compiled program.
@@ -68,10 +74,183 @@ mod op {
     pub const BACKREFERENCE: u8 = 0x0C;
     /// A sub-pattern that must match, or must not, without consuming.
     pub const LOOK: u8 = 0x0D;
+    /// A set of code-point ranges, possibly negated: the unicode-mode class.
+    pub const CLASS32: u8 = 0x0E;
 }
 
 /// Capture slots one pattern may have: two per group, plus the whole match.
 pub const MAX_SLOTS: usize = 64;
+/// Named groups one pattern may have, and the units one name may run to.
+pub const MAX_NAMES: usize = 16;
+pub const MAX_NAME_UNITS: usize = 32;
+
+/// A named group: which capture it is, and where its name lies in the
+/// pattern.
+#[derive(Clone, Copy)]
+struct GroupName {
+    index: u8,
+    start: usize,
+    end: usize,
+}
+
+const NO_NAME: GroupName = GroupName {
+    index: 0,
+    start: 0,
+    end: 0,
+};
+
+/// The named groups a pattern declares, found before compilation so a
+/// `\k<name>` written ahead of its group still resolves: each capturing
+/// group counts in order, and a name may not repeat.
+fn prescan_names(pattern: &[u16]) -> Result<([GroupName; MAX_NAMES], usize), PatternError> {
+    let mut names = [NO_NAME; MAX_NAMES];
+    let mut count = 0usize;
+    let mut groups = 0usize;
+    let mut position = 0usize;
+    let mut in_class = false;
+    while position < pattern.len() {
+        let unit = pattern[position];
+        if unit == 0x5C {
+            position += 2;
+            continue;
+        }
+        if in_class {
+            if unit == 0x5D {
+                in_class = false;
+            }
+            position += 1;
+            continue;
+        }
+        if unit == 0x5B {
+            in_class = true;
+            position += 1;
+            continue;
+        }
+        if unit != 0x28 {
+            position += 1;
+            continue;
+        }
+        if pattern.get(position + 1).copied() != Some(0x3F) {
+            groups += 1;
+            position += 1;
+            continue;
+        }
+        if pattern.get(position + 2).copied() != Some(0x3C)
+            || matches!(pattern.get(position + 3).copied(), Some(0x3D) | Some(0x21))
+        {
+            // `(?:`, `(?=`, `(?!`, or a lookbehind: nothing to name.
+            position += 2;
+            continue;
+        }
+        groups += 1;
+        if groups > MAX_GROUPS {
+            return Err(PatternError::TooLarge);
+        }
+        let start = position + 3;
+        let end = group_name_end(pattern, start)?;
+        let mut duplicate = false;
+        for earlier in names.iter().take(count) {
+            if pattern.get(earlier.start..earlier.end) == pattern.get(start..end) {
+                duplicate = true;
+            }
+        }
+        if duplicate || count >= MAX_NAMES {
+            return Err(PatternError::InvalidGroupName);
+        }
+        names[count] = GroupName {
+            index: u8::try_from(groups).map_err(|_| PatternError::TooLarge)?,
+            start,
+            end,
+        };
+        count += 1;
+        position = end + 1;
+    }
+    Ok((names, count))
+}
+
+/// Where a group name starting at `start` ends — the `>` that closes it —
+/// once it has been checked to be an identifier of admitted length.
+fn group_name_end(pattern: &[u16], start: usize) -> Result<usize, PatternError> {
+    let mut end = start;
+    while let Some(&unit) = pattern.get(end) {
+        if unit == 0x3E {
+            break;
+        }
+        let code_point = u32::from(unit);
+        let admitted = if end == start {
+            crate::unicode_id::is_id_start(code_point) || unit == 0x24 || unit == 0x5F
+        } else {
+            crate::unicode_id::is_id_continue(code_point)
+                || unit == 0x24
+                || unit == 0x5F
+                || unit == 0x200C
+                || unit == 0x200D
+        };
+        if !admitted {
+            return Err(PatternError::InvalidGroupName);
+        }
+        end += 1;
+    }
+    if end == start || end - start > MAX_NAME_UNITS || pattern.get(end).copied() != Some(0x3E) {
+        return Err(PatternError::InvalidGroupName);
+    }
+    Ok(end)
+}
+
+/// The named groups a compiled program records, read back from its tail:
+/// the count, and the entries as `(index, name units)`.
+pub struct Names<'a> {
+    code: &'a [u8],
+    at: usize,
+    remaining: usize,
+}
+
+impl<'a> Names<'a> {
+    /// The name table at the end of a program's code, empty when it has none.
+    pub fn of(code: &'a [u8]) -> Self {
+        let length = code.len();
+        if length < 3 {
+            return Self {
+                code,
+                at: 0,
+                remaining: 0,
+            };
+        }
+        let start = usize::from(code[length - 2]) | (usize::from(code[length - 1]) << 8);
+        let count = usize::from(code[length - 3]);
+        if start > length - 3 {
+            return Self {
+                code,
+                at: 0,
+                remaining: 0,
+            };
+        }
+        Self {
+            code,
+            at: start,
+            remaining: count,
+        }
+    }
+
+    /// How many names the table holds.
+    pub const fn count(&self) -> usize {
+        self.remaining
+    }
+
+    /// The next entry: the group's index and its name, one unit per two
+    /// bytes, little-endian.
+    pub fn next_entry(&mut self) -> Option<(u8, &'a [u8])> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let index = *self.code.get(self.at)?;
+        let units = usize::from(*self.code.get(self.at + 1)?);
+        let bytes = self.code.get(self.at + 2..self.at + 2 + units * 2)?;
+        self.at += 2 + units * 2;
+        self.remaining -= 1;
+        Some((index, bytes))
+    }
+}
 /// Groups one pattern may have.
 pub const MAX_GROUPS: usize = MAX_SLOTS / 2 - 1;
 
@@ -85,6 +264,7 @@ pub struct Program<'a> {
 /// Compile `pattern` into `out`, answering the program's length and how many
 /// groups it captures.
 pub fn compile(pattern: &[u16], flags: u8, out: &mut [u8]) -> Result<(usize, u8), PatternError> {
+    let (names, name_count) = prescan_names(pattern)?;
     let mut compiler = Compiler {
         pattern,
         position: 0,
@@ -93,6 +273,8 @@ pub fn compile(pattern: &[u16], flags: u8, out: &mut [u8]) -> Result<(usize, u8)
         groups: 0,
         flags,
         depth: 0,
+        names,
+        name_count,
     };
     compiler.alternation()?;
     if compiler.position < compiler.pattern.len() {
@@ -100,6 +282,24 @@ pub fn compile(pattern: &[u16], flags: u8, out: &mut [u8]) -> Result<(usize, u8)
         return Err(PatternError::UnmatchedParenthesis);
     }
     compiler.emit(op::MATCH)?;
+    // The name table follows the code, where no instruction reaches: each
+    // entry is the group's index, its length in units, and the units; then
+    // the count and where the table starts, read back from the end.
+    let table_start = compiler.length;
+    let mut entry = 0usize;
+    while entry < name_count {
+        let name = compiler.names[entry];
+        compiler.emit(name.index)?;
+        compiler.emit(u8::try_from(name.end - name.start).map_err(|_| PatternError::TooLarge)?)?;
+        let mut at = name.start;
+        while at < name.end {
+            compiler.emit_u16(pattern[at])?;
+            at += 1;
+        }
+        entry += 1;
+    }
+    compiler.emit(u8::try_from(name_count).map_err(|_| PatternError::TooLarge)?)?;
+    compiler.emit_u16(u16::try_from(table_start).map_err(|_| PatternError::TooLarge)?)?;
     Ok((compiler.length, compiler.groups))
 }
 
@@ -116,7 +316,7 @@ pub fn flags_of_token(bits: u16) -> Result<u8, PatternError> {
     const UNICODE: u16 = 1 << 5;
     const UNICODE_SETS: u16 = 1 << 6;
     const STICKY: u16 = 1 << 7;
-    if bits & (UNICODE | UNICODE_SETS | HAS_INDICES) != 0 {
+    if bits & (UNICODE_SETS | HAS_INDICES) != 0 {
         return Err(PatternError::NotAdmitted);
     }
     let mut flags = 0u8;
@@ -126,6 +326,7 @@ pub fn flags_of_token(bits: u16) -> Result<u8, PatternError> {
         (MULTILINE, flag::MULTILINE),
         (DOT_ALL, flag::DOT_ALL),
         (STICKY, flag::STICKY),
+        (UNICODE, flag::UNICODE),
     ] {
         if bits & bit != 0 {
             flags |= mapped;
@@ -142,6 +343,7 @@ pub fn flag_text(flags: u8, out: &mut [u16]) -> usize {
         (flag::IGNORE_CASE, b'i'),
         (flag::MULTILINE, b'm'),
         (flag::DOT_ALL, b's'),
+        (flag::UNICODE, b'u'),
         (flag::STICKY, b'y'),
     ] {
         if flags & bit != 0 {
@@ -184,6 +386,8 @@ struct Compiler<'a, 'b> {
     groups: u8,
     flags: u8,
     depth: u32,
+    names: [GroupName; MAX_NAMES],
+    name_count: usize,
 }
 
 impl Compiler<'_, '_> {
@@ -543,16 +747,112 @@ impl Compiler<'_, '_> {
             0x2A | 0x2B | 0x3F => Err(PatternError::InvalidQuantifier),
             0x29 => Err(PatternError::UnmatchedParenthesis),
             _ => {
-                self.emit_char(unit)?;
+                if self.flags & flag::UNICODE != 0 {
+                    self.position -= 1;
+                    let Some(point) = self.next_point() else {
+                        return Err(PatternError::Unterminated);
+                    };
+                    self.emit_point(point)?;
+                } else {
+                    self.emit_char(unit)?;
+                }
                 Ok(true)
             }
         }
     }
 
+    /// Emit one code point as an atom: a BMP unit directly, an astral point
+    /// as its surrogate pair, which a quantifier still treats as one atom.
+    fn emit_point(&mut self, point: u32) -> Result<(), PatternError> {
+        if point > 0x10FFFF {
+            return Err(PatternError::InvalidEscape);
+        }
+        if point > 0xFFFF {
+            let bias = point - 0x10000;
+            let high = 0xD800 + (bias >> 10) as u16;
+            let low = 0xDC00 + (bias & 0x3FF) as u16;
+            self.emit_char(high)?;
+            return self.emit_char(low);
+        }
+        self.emit_char(point as u16)
+    }
+
+    /// The code point at the cursor, combining a surrogate pair in unicode
+    /// mode; the cursor moves past what was read.
+    fn next_point(&mut self) -> Option<u32> {
+        let unit = self.next()?;
+        if self.flags & flag::UNICODE != 0 && (0xD800..0xDC00).contains(&unit) {
+            if let Some(&low) = self.pattern.get(self.position) {
+                if (0xDC00..0xE000).contains(&low) {
+                    self.position += 1;
+                    return Some(
+                        0x10000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00),
+                    );
+                }
+            }
+        }
+        Some(u32::from(unit))
+    }
+
+    /// The code point an escape denotes in unicode mode: `\u{...}`, a
+    /// combined `\uD.. \uD..` pair, or the unit escapes.
+    fn escape_point(&mut self, escape: u16) -> Result<u32, PatternError> {
+        if escape == 0x75 && self.peek() == Some(0x7B) {
+            self.position += 1;
+            let mut value = 0u32;
+            let mut any = false;
+            loop {
+                let Some(unit) = self.peek() else {
+                    return Err(PatternError::InvalidEscape);
+                };
+                if unit == 0x7D {
+                    self.position += 1;
+                    break;
+                }
+                let digit = self.hex_digit()?;
+                value = value
+                    .checked_mul(16)
+                    .and_then(|scaled| scaled.checked_add(u32::from(digit)))
+                    .ok_or(PatternError::InvalidEscape)?;
+                if value > 0x10FFFF {
+                    return Err(PatternError::InvalidEscape);
+                }
+                any = true;
+            }
+            if !any {
+                return Err(PatternError::InvalidEscape);
+            }
+            return Ok(value);
+        }
+        let unit = self.escape_value(escape)?;
+        if (0xD800..0xDC00).contains(&unit)
+            && self.pattern.get(self.position) == Some(&0x5C)
+            && self.pattern.get(self.position + 1) == Some(&0x75)
+        {
+            // A high escape followed by a low escape reads as one point.
+            let saved = self.position;
+            self.position += 2;
+            if let Ok(low) = self.escape_value(0x75) {
+                if (0xDC00..0xE000).contains(&low) {
+                    return Ok(0x10000
+                        + ((u32::from(unit) - 0xD800) << 10)
+                        + (u32::from(low) - 0xDC00));
+                }
+            }
+            self.position = saved;
+        }
+        Ok(u32::from(unit))
+    }
+
     fn emit_char(&mut self, unit: u16) -> Result<(), PatternError> {
         if self.flags & flag::IGNORE_CASE != 0 {
             self.emit(op::CHAR_FOLDED)?;
-            return self.emit_u16(fold(unit));
+            let folded = if self.flags & flag::UNICODE != 0 {
+                fold_unicode(unit)
+            } else {
+                fold(unit)
+            };
+            return self.emit_u16(folded);
         }
         self.emit(op::CHAR)?;
         self.emit_u16(unit)
@@ -598,29 +898,62 @@ impl Compiler<'_, '_> {
                     // either do nothing or never end.
                     Ok(false)
                 }
-                // `(?<` is a named group or a lookbehind; neither is admitted.
+                // `(?<name>`: a capturing group with a name the prescan
+                // recorded; `(?<=` and `(?<!` are lookbehind, not admitted.
+                0x3C => {
+                    if matches!(self.peek(), Some(0x3D) | Some(0x21)) {
+                        return Err(PatternError::NotAdmitted);
+                    }
+                    let end = group_name_end(self.pattern, self.position)?;
+                    self.position = end + 1;
+                    self.capture_group()
+                }
                 _ => Err(PatternError::NotAdmitted),
             }
         } else {
-            if self.groups as usize >= MAX_GROUPS {
-                return Err(PatternError::TooLarge);
-            }
-            self.groups += 1;
-            let index = self.groups;
-            self.emit(op::SAVE)?;
-            self.emit(index * 2)?;
-            self.alternation()?;
-            if !self.eat(0x29) {
-                return Err(PatternError::UnmatchedParenthesis);
-            }
-            self.emit(op::SAVE)?;
-            self.emit(index * 2 + 1)?;
-            Ok(true)
+            self.capture_group()
         }
+    }
+
+    /// The body of a capturing group, its `(` — and any name — consumed.
+    fn capture_group(&mut self) -> Result<bool, PatternError> {
+        if self.groups as usize >= MAX_GROUPS {
+            return Err(PatternError::TooLarge);
+        }
+        self.groups += 1;
+        let index = self.groups;
+        self.emit(op::SAVE)?;
+        self.emit(index * 2)?;
+        self.alternation()?;
+        if !self.eat(0x29) {
+            return Err(PatternError::UnmatchedParenthesis);
+        }
+        self.emit(op::SAVE)?;
+        self.emit(index * 2 + 1)?;
+        Ok(true)
+    }
+
+    /// The group a `\k<name>` refers to, by the prescan's table.
+    fn named_group(&mut self) -> Result<u8, PatternError> {
+        if !self.eat(0x3C) {
+            return Err(PatternError::InvalidGroupName);
+        }
+        let start = self.position;
+        let end = group_name_end(self.pattern, start)?;
+        self.position = end + 1;
+        for name in self.names.iter().take(self.name_count) {
+            if self.pattern.get(name.start..name.end) == self.pattern.get(start..end) {
+                return Ok(name.index);
+            }
+        }
+        Err(PatternError::InvalidGroupName)
     }
 
     /// `[...]`, having consumed the `[`.
     fn class(&mut self) -> Result<(), PatternError> {
+        if self.flags & flag::UNICODE != 0 {
+            return self.class32();
+        }
         let negated = self.eat(0x5E);
         self.emit(op::CLASS)?;
         self.emit(u8::from(negated))?;
@@ -696,6 +1029,97 @@ impl Compiler<'_, '_> {
         })
     }
 
+    /// A character class in unicode mode: code-point ranges, a surrogate
+    /// pair or `\u{...}` escape one endpoint each.
+    fn class32(&mut self) -> Result<(), PatternError> {
+        let negated = self.eat(0x5E);
+        self.emit(op::CLASS32)?;
+        self.emit(u8::from(negated))?;
+        let count_at = self.length;
+        self.emit(0)?;
+        let mut count = 0u8;
+        loop {
+            let Some(unit) = self.peek() else {
+                return Err(PatternError::InvalidClass);
+            };
+            if unit == 0x5D {
+                self.position += 1;
+                break;
+            }
+            match self.class_point()? {
+                ClassPoint::Set(ranges, wide) => {
+                    for &(start, end) in ranges {
+                        self.emit_u32(u32::from(start))?;
+                        self.emit_u32(u32::from(end))?;
+                        count = count.checked_add(1).ok_or(PatternError::TooLarge)?;
+                    }
+                    if wide {
+                        self.emit_u32(0x10000)?;
+                        self.emit_u32(0x10FFFF)?;
+                        count = count.checked_add(1).ok_or(PatternError::TooLarge)?;
+                    }
+                }
+                ClassPoint::Point(low) => {
+                    if self.peek() == Some(0x2D)
+                        && self.pattern.get(self.position + 1) != Some(&0x5D)
+                    {
+                        self.position += 1;
+                        let high = match self.class_point()? {
+                            ClassPoint::Point(high) => high,
+                            ClassPoint::Set(..) => return Err(PatternError::InvalidClass),
+                        };
+                        if high < low {
+                            return Err(PatternError::InvalidClass);
+                        }
+                        self.emit_u32(low)?;
+                        self.emit_u32(high)?;
+                    } else {
+                        self.emit_u32(low)?;
+                        self.emit_u32(low)?;
+                    }
+                    count = count.checked_add(1).ok_or(PatternError::TooLarge)?;
+                }
+            }
+        }
+        if let Some(slot) = self.out.get_mut(count_at) {
+            *slot = count;
+        }
+        Ok(())
+    }
+
+    fn class_point(&mut self) -> Result<ClassPoint, PatternError> {
+        let Some(unit) = self.peek() else {
+            return Err(PatternError::InvalidClass);
+        };
+        if unit != 0x5C {
+            let Some(point) = self.next_point() else {
+                return Err(PatternError::InvalidClass);
+            };
+            return Ok(ClassPoint::Point(point));
+        }
+        self.position += 1;
+        let Some(escape) = self.next() else {
+            return Err(PatternError::InvalidEscape);
+        };
+        Ok(match escape {
+            0x64 => ClassPoint::Set(DIGITS, false),
+            0x44 => ClassPoint::Set(NOT_DIGITS, true),
+            0x77 => ClassPoint::Set(WORD, false),
+            0x57 => ClassPoint::Set(NOT_WORD, true),
+            0x73 => ClassPoint::Set(SPACE, false),
+            0x53 => ClassPoint::Set(NOT_SPACE, true),
+            0x62 => ClassPoint::Point(0x08),
+            _ => ClassPoint::Point(self.escape_point(escape)?),
+        })
+    }
+
+    fn emit_u32(&mut self, value: u32) -> Result<(), PatternError> {
+        for byte in value.to_le_bytes() {
+            self.emit(byte)?;
+        }
+        Ok(())
+    }
+
     /// An escape outside a class. Answers whether a quantifier may follow.
     fn escape(&mut self) -> Result<bool, PatternError> {
         let Some(escape) = self.next() else {
@@ -703,6 +1127,26 @@ impl Compiler<'_, '_> {
         };
         match escape {
             0x64 | 0x44 | 0x77 | 0x57 | 0x73 | 0x53 => {
+                if self.flags & flag::UNICODE != 0 {
+                    // The positive set, negated by flag: the complement then
+                    // reaches every code point, astral ones included.
+                    let (ranges, negated) = match escape {
+                        0x64 => (DIGITS, false),
+                        0x44 => (DIGITS, true),
+                        0x77 => (WORD, false),
+                        0x57 => (WORD, true),
+                        0x73 => (SPACE, false),
+                        _ => (SPACE, true),
+                    };
+                    self.emit(op::CLASS32)?;
+                    self.emit(u8::from(negated))?;
+                    self.emit(u8::try_from(ranges.len()).unwrap_or(0))?;
+                    for &(start, end) in ranges {
+                        self.emit_u32(u32::from(start))?;
+                        self.emit_u32(u32::from(end))?;
+                    }
+                    return Ok(true);
+                }
                 let ranges = match escape {
                     0x64 => DIGITS,
                     0x44 => NOT_DIGITS,
@@ -737,9 +1181,22 @@ impl Compiler<'_, '_> {
                 self.emit(u8::try_from(index).unwrap_or(0))?;
                 Ok(true)
             }
+            // `\k<name>` refers to a named group; where the pattern names
+            // none, sloppy patterns read `\k` as the letter, as Annex B says.
+            0x6B if self.name_count > 0 || self.flags & flag::UNICODE != 0 => {
+                let index = self.named_group()?;
+                self.emit(op::BACKREFERENCE)?;
+                self.emit(index)?;
+                Ok(true)
+            }
             _ => {
-                let unit = self.escape_value(escape)?;
-                self.emit_char(unit)?;
+                if self.flags & flag::UNICODE != 0 {
+                    let point = self.escape_point(escape)?;
+                    self.emit_point(point)?;
+                } else {
+                    let unit = self.escape_value(escape)?;
+                    self.emit_char(unit)?;
+                }
                 Ok(true)
             }
         }
@@ -793,6 +1250,13 @@ impl Compiler<'_, '_> {
             _ => Err(PatternError::InvalidEscape),
         }
     }
+}
+
+enum ClassPoint {
+    Point(u32),
+    /// A named set's ranges; `true` marks a complement set, which in
+    /// unicode mode also covers every astral point.
+    Set(&'static [(u16, u16)], bool),
 }
 
 enum ClassAtom {
@@ -924,7 +1388,11 @@ pub fn run(
                 match input.get(position).copied() {
                     Some(unit) => {
                         let unit = if opcode == op::CHAR_FOLDED {
-                            fold(unit)
+                            if program.flags & flag::UNICODE != 0 {
+                                fold_unicode(unit)
+                            } else {
+                                fold(unit)
+                            }
                         } else {
                             unit
                         };
@@ -940,11 +1408,73 @@ pub fn run(
             }
             op::ANY => match input.get(position).copied() {
                 Some(unit) if program.flags & flag::DOT_ALL != 0 || !is_line_terminator(unit) => {
-                    position += 1;
+                    // In unicode mode the dot consumes a whole pair.
+                    if program.flags & flag::UNICODE != 0
+                        && (0xD800..0xDC00).contains(&unit)
+                        && input
+                            .get(position + 1)
+                            .is_some_and(|&low| (0xDC00..0xE000).contains(&low))
+                    {
+                        position += 2;
+                    } else {
+                        position += 1;
+                    }
                     pc += 1;
                 }
                 _ => backtrack = true,
             },
+            op::CLASS32 => {
+                let negated = program.code.get(pc + 1).copied().unwrap_or(0) != 0;
+                let count = program.code.get(pc + 2).copied().unwrap_or(0) as usize;
+                match input.get(position).copied() {
+                    Some(unit) => {
+                        // The subject reads as one code point: a surrogate
+                        // pair together, anything else alone.
+                        let (point, width) = if (0xD800..0xDC00).contains(&unit)
+                            && input
+                                .get(position + 1)
+                                .is_some_and(|&low| (0xDC00..0xE000).contains(&low))
+                        {
+                            let low = input.get(position + 1).copied().unwrap_or(0);
+                            (
+                                0x10000
+                                    + ((u32::from(unit) - 0xD800) << 10)
+                                    + (u32::from(low) - 0xDC00),
+                                2usize,
+                            )
+                        } else {
+                            (u32::from(unit), 1usize)
+                        };
+                        let folded_point =
+                            if program.flags & flag::IGNORE_CASE != 0 && point <= 0xFFFF {
+                                u32::from(fold(point as u16))
+                            } else {
+                                point
+                            };
+                        let mut inside = false;
+                        let mut index = 0usize;
+                        while index < count {
+                            let at = pc + 3 + index * 8;
+                            let low = read_u32(program.code, at);
+                            let high = read_u32(program.code, at + 4);
+                            if (point >= low && point <= high)
+                                || (folded_point >= low && folded_point <= high)
+                            {
+                                inside = true;
+                                break;
+                            }
+                            index += 1;
+                        }
+                        if inside != negated {
+                            position += width;
+                            pc += 3 + count * 8;
+                        } else {
+                            backtrack = true;
+                        }
+                    }
+                    None => backtrack = true,
+                }
+            }
             op::CLASS => {
                 let negated = program.code.get(pc + 1).copied().unwrap_or(0) != 0;
                 let count = program.code.get(pc + 2).copied().unwrap_or(0) as usize;
@@ -1122,6 +1652,29 @@ pub fn run(
             position = choice.position;
         }
     }
+}
+
+/// Simple case folding for unicode mode: the ASCII fold plus the pairs the
+/// specification's Canonicalize with unicode adds for common letters.
+fn fold_unicode(unit: u16) -> u16 {
+    match unit {
+        // KELVIN SIGN and ANGSTROM SIGN fold to their lowercase letters.
+        0x212A => 0x6B,
+        0x212B => 0xE5,
+        // LATIN SMALL LETTER LONG S folds with s.
+        0x17F => 0x73,
+        _ => fold(unit),
+    }
+}
+
+fn read_u32(code: &[u8], at: usize) -> u32 {
+    let bytes = [
+        code.get(at).copied().unwrap_or(0),
+        code.get(at + 1).copied().unwrap_or(0),
+        code.get(at + 2).copied().unwrap_or(0),
+        code.get(at + 3).copied().unwrap_or(0),
+    ];
+    u32::from_le_bytes(bytes)
 }
 
 fn read_u16(code: &[u8], at: usize) -> u16 {

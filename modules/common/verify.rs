@@ -146,7 +146,7 @@ fn verify_function(
                     // frame, counted from the register operand before it.
                     if matches!(
                         instruction.opcode,
-                        Opcode::Call | Opcode::CallProperty | Opcode::Construct
+                        Opcode::Call | Opcode::CallProperty | Opcode::TailCall | Opcode::Construct
                     ) {
                         let first = instruction.operands[1];
                         if first.saturating_add(value) > function.register_count {
@@ -349,7 +349,7 @@ fn verify_function(
         }
 
         let mut next = match instruction.opcode {
-            Opcode::PushContext => current + 1,
+            Opcode::PushContext | Opcode::PushObjectContext => current + 1,
             Opcode::PopContext => current - 1,
             _ => current,
         };

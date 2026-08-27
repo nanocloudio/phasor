@@ -48,6 +48,7 @@ mod job;
 #[path = "../../common/lex.rs"]
 mod lex;
 #[path = "../../common/lower.rs"]
+#[macro_use]
 mod lower;
 #[path = "../../common/numeric.rs"]
 mod numeric;
@@ -111,10 +112,10 @@ const POINT_CAPACITY: usize = 24;
 const PATCH_CAPACITY: usize = 24;
 const LABEL_CAPACITY: usize = 24;
 const VERIFIER_CAPACITY: usize = 512;
-const ARENA_BYTES: usize = 64 * 1024;
-const SLOT_COUNT: usize = 1536;
-const ATOM_ENTRIES: usize = 512;
-const ATOM_HANDLES: usize = 384;
+const ARENA_BYTES: usize = 192 * 1024;
+const SLOT_COUNT: usize = 3072;
+const ATOM_ENTRIES: usize = 2048;
+const ATOM_HANDLES: usize = 1536;
 const FRAME_COUNT: usize = 12;
 const REGISTER_COUNT: usize = 96;
 
@@ -175,26 +176,7 @@ fn compile(storage: &mut Storage, source: &[u8]) -> Option<usize> {
     let syntax = Arena::new(&mut storage.nodes, &mut storage.lists, &mut storage.numbers);
     let mut parser = Parser::new(lexer, syntax, &mut storage.scratch, Limits::CEILING);
     let root = parser.parse_unit().ok()?;
-    let mut lowering = LowerStorage {
-        code: &mut storage.code,
-        image: &mut storage.image,
-        constants: &mut storage.constants,
-        constant_data: &mut storage.constant_data,
-        safe_points: &mut storage.safe_points,
-        patches: &mut storage.patches,
-        labels: &mut storage.labels,
-        verifier_state: &mut storage.verifier_state,
-        unit_code: &mut storage.unit_code,
-        unit_safe_points: &mut storage.unit_safe_points,
-        functions: &mut storage.functions,
-        exceptions: &mut storage.exceptions,
-        scopes: &mut storage.scopes,
-        bindings: &mut storage.lexical,
-        pending: &mut storage.pending,
-        imports: &mut storage.imports,
-        exports: &mut storage.exports,
-        eval_sites: &mut storage.eval_sites,
-    };
+    let mut lowering = lower_storage!(storage);
     lower_expression(source, parser.arena(), root, &mut lowering)
         .ok()
         .map(|compiled| compiled.length)
@@ -212,26 +194,7 @@ fn evaluates(storage: &mut Storage, source: &[u8], expected: &[u8]) -> bool {
         let Ok(root) = parser.parse_unit() else {
             return false;
         };
-        let mut lowering = LowerStorage {
-            code: &mut storage.code,
-            image: &mut storage.image,
-            constants: &mut storage.constants,
-            constant_data: &mut storage.constant_data,
-            safe_points: &mut storage.safe_points,
-            patches: &mut storage.patches,
-            labels: &mut storage.labels,
-            verifier_state: &mut storage.verifier_state,
-            unit_code: &mut storage.unit_code,
-            unit_safe_points: &mut storage.unit_safe_points,
-            functions: &mut storage.functions,
-            exceptions: &mut storage.exceptions,
-            scopes: &mut storage.scopes,
-            bindings: &mut storage.lexical,
-            pending: &mut storage.pending,
-            imports: &mut storage.imports,
-            exports: &mut storage.exports,
-            eval_sites: &mut storage.eval_sites,
-        };
+        let mut lowering = lower_storage!(storage);
         match lower_expression(source, parser.arena(), root, &mut lowering) {
             Ok(compiled) => compiled.length,
             Err(_) => return false,

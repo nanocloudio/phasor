@@ -387,12 +387,12 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             let root = tree.root();
             matches!(root.kind, NodeKind::RegExp) && root.third != 0
         }),
-        36 => rejected(
-            storage,
-            b"#x in a",
-            limits,
-            code::PRIVATE_NAME_OUT_OF_CONTEXT,
-        ),
+        36 => parsed(storage, b"#x in a", limits, |tree| {
+            // The ergonomic brand check: the private name reads as the key
+            // it stores under, on the left of `in`.
+            let root = tree.root();
+            matches!(root.kind, NodeKind::Binary)
+        }),
         37 => rejected(storage, b"a ? b", limits, code::EXPECTED_COLON),
         38 => {
             let mut limits = Limits::CEILING;
@@ -503,7 +503,9 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             let root = tree.root();
             root.has(flag::ARROW) && tree.arena.list(root.second, root.third).len() == 1
         }),
-        58 => rejected(storage, b"class A {}", limits, code::SYNTAX_NOT_ADMITTED),
+        58 => parsed(storage, b"class A {}", limits, |tree| {
+            matches!(tree.root().kind, NodeKind::Class)
+        }),
         59 => rejected(storage, b"import 'x';", limits, code::SYNTAX_NOT_ADMITTED),
 
         _ => true,

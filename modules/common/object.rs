@@ -110,10 +110,67 @@ pub fn create(heap: &mut Heap<'_>, prototype: Value) -> Result<Handle, ObjectErr
     cell[12..16].copy_from_slice(&u32::MAX.to_le_bytes()); // no table yet
     cell[16..20].copy_from_slice(&0u32.to_le_bytes());
     cell[20] = INTERNAL_PLAIN;
+    // No home object: a method's `super` base, absent everywhere else.
+    cell[48..52].copy_from_slice(&u32::MAX.to_le_bytes());
+    cell[52..56].copy_from_slice(&0u32.to_le_bytes());
     Ok(handle)
 }
 
+/// Give a method the object it was defined on, which is what `super` in its
+/// body resolves through.
+pub fn set_home_object(
+    heap: &mut Heap<'_>,
+    function: Handle,
+    home: Handle,
+) -> Result<(), ObjectError> {
+    let cell = heap.cell_mut(function)?;
+    cell[48..52].copy_from_slice(&home.index.to_le_bytes());
+    cell[52..56].copy_from_slice(&home.generation.to_le_bytes());
+    Ok(())
+}
+
+/// The object a method was defined on, if `super` may be used in it.
+pub fn home_object(heap: &Heap<'_>, function: Handle) -> Result<Option<Handle>, ObjectError> {
+    let cell = object_cell(heap, function)?;
+    let index = u32::from_le_bytes([cell[48], cell[49], cell[50], cell[51]]);
+    if index == u32::MAX {
+        return Ok(None);
+    }
+    let generation = u32::from_le_bytes([cell[52], cell[53], cell[54], cell[55]]);
+    Ok(Some(Handle::new(index, generation)))
+}
+
 /// The internal-slot kinds an object may carry.
+/// The exotic behaviours an object may carry, in the byte after its
+/// extensibility flag: a proxy interposes its handler on every operation,
+/// a typed array reads and writes its buffer's bytes by index.
+pub mod exotic {
+    pub const NONE: u8 = 0;
+    pub const PROXY: u8 = 1;
+    pub const ARRAY_BUFFER: u8 = 2;
+    pub const TYPED_ARRAY: u8 = 3;
+    pub const DATA_VIEW: u8 = 4;
+    /// A module namespace: null prototype, never extensible, its bindings
+    /// read live.
+    pub const NAMESPACE: u8 = 5;
+    /// A deferred module namespace: shaped as a namespace, but a meaningful
+    /// use runs the module it names first.
+    pub const DEFERRED: u8 = 6;
+}
+
+/// The exotic behaviour an object carries, if any.
+pub fn exotic_kind(heap: &Heap<'_>, object: Handle) -> Result<u8, ObjectError> {
+    let cell = object_cell(heap, object)?;
+    Ok(cell[10])
+}
+
+/// Give an object an exotic behaviour.
+pub fn set_exotic_kind(heap: &mut Heap<'_>, object: Handle, kind: u8) -> Result<(), ObjectError> {
+    let cell = heap.cell_mut(object)?;
+    cell[10] = kind;
+    Ok(())
+}
+
 const INTERNAL_PLAIN: u8 = 0;
 const INTERNAL_FUNCTION: u8 = 1;
 const INTERNAL_NATIVE: u8 = 2;
@@ -126,6 +183,11 @@ const INTERNAL_WRAPPER: u8 = 4;
 const INTERNAL_ITERATOR: u8 = 5;
 /// A regular expression, carrying the program its pattern compiled to.
 const INTERNAL_REGEXP: u8 = 6;
+/// A generator: its state byte and its suspended frame.
+const INTERNAL_GENERATOR: u8 = 7;
+/// A mapped arguments object: its function environment and how many leading
+/// indices alias parameter slots.
+const INTERNAL_ARGUMENTS: u8 = 8;
 
 /// Function flags.
 pub mod function_flag {
@@ -133,6 +195,16 @@ pub mod function_flag {
     pub const CONSTRUCTOR: u8 = 1 << 0;
     /// The function's body is strict.
     pub const STRICT: u8 = 1 << 1;
+    /// A class constructor: callable only through `new`.
+    pub const CLASS: u8 = 1 << 2;
+    /// A derived class constructor: its body must `super()` before `this`
+    /// settles, and its default form forwards its arguments.
+    pub const DERIVED: u8 = 1 << 3;
+    /// The function's `name` has been materialised — or deleted — so it is
+    /// never made again.
+    pub const NAMED: u8 = 1 << 4;
+    /// The same for `length`.
+    pub const MEASURED: u8 = 1 << 5;
 }
 
 /// Create a function: an ordinary object that also carries the code it runs and
@@ -285,6 +357,106 @@ pub fn create_native(
     Ok(handle)
 }
 
+/// Generator states. The high bit marks an async generator, whose methods
+/// answer promises.
+pub mod generator_state {
+    pub const SUSPENDED: u8 = 0;
+    pub const RUNNING: u8 = 1;
+    pub const DONE: u8 = 2;
+    pub const ASYNC: u8 = 1 << 7;
+}
+
+/// Create a generator: the state byte and the suspended frame it will
+/// resume.
+pub fn create_generator(
+    heap: &mut Heap<'_>,
+    prototype: Value,
+    coroutine: Value,
+) -> Result<Handle, ObjectError> {
+    let handle = create(heap, prototype)?;
+    let cell = heap.cell_mut(handle)?;
+    cell[20] = INTERNAL_GENERATOR;
+    cell[21] = generator_state::SUSPENDED;
+    write_value(&mut cell[28..37], coroutine);
+    Ok(handle)
+}
+
+/// Mark an arguments object as mapped: reads and writes of the indices in
+/// the mask go through the environment's parameter slots.
+pub fn map_arguments(
+    heap: &mut Heap<'_>,
+    object: Handle,
+    environment: Value,
+    mapped: u32,
+) -> Result<(), ObjectError> {
+    let mask = if mapped >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << mapped) - 1
+    };
+    let cell = heap.cell_mut(object)?;
+    cell[20] = INTERNAL_ARGUMENTS;
+    write_value(&mut cell[28..37], environment);
+    cell[44..48].copy_from_slice(&mask.to_le_bytes());
+    Ok(())
+}
+
+/// A mapped arguments object's environment and mapped-index mask.
+pub fn arguments_map(heap: &Heap<'_>, object: Handle) -> Result<Option<(Value, u32)>, ObjectError> {
+    let cell = object_cell(heap, object)?;
+    if cell[20] != INTERNAL_ARGUMENTS {
+        return Ok(None);
+    }
+    let mask = u32::from_le_bytes([cell[44], cell[45], cell[46], cell[47]]);
+    Ok(Some((read_value(&cell[28..37]), mask)))
+}
+
+/// Remove one index from an arguments object's map, which `delete` and a
+/// redefinition that breaks the aliasing both do.
+pub fn unmap_argument(heap: &mut Heap<'_>, object: Handle, index: u32) -> Result<(), ObjectError> {
+    let cell = heap.cell_mut(object)?;
+    if cell[20] != INTERNAL_ARGUMENTS || index >= 32 {
+        return Ok(());
+    }
+    let mut mask = u32::from_le_bytes([cell[44], cell[45], cell[46], cell[47]]);
+    mask &= !(1u32 << index);
+    cell[44..48].copy_from_slice(&mask.to_le_bytes());
+    Ok(())
+}
+
+/// Whether the object is a generator.
+pub fn is_generator(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectError> {
+    let cell = object_cell(heap, object)?;
+    Ok(cell[20] == INTERNAL_GENERATOR)
+}
+
+/// A generator's state and suspended frame.
+pub fn generator(heap: &Heap<'_>, object: Handle) -> Result<Option<(u8, Value)>, ObjectError> {
+    let cell = object_cell(heap, object)?;
+    if cell[20] != INTERNAL_GENERATOR {
+        return Ok(None);
+    }
+    Ok(Some((cell[21], read_value(&cell[28..37]))))
+}
+
+/// Move a generator to `state`, holding `coroutine` as its frame.
+pub fn set_generator(
+    heap: &mut Heap<'_>,
+    object: Handle,
+    state: u8,
+    coroutine: Value,
+) -> Result<(), ObjectError> {
+    let cell = heap.cell_mut(object)?;
+    if cell[20] != INTERNAL_GENERATOR {
+        return Ok(());
+    }
+    cell[21] = state;
+    write_value(&mut cell[28..37], coroutine);
+    Ok(())
+}
+
+/// Whether the object is a promise, which async machinery asks before
+/// settling through a frame's promise slot.
 /// Whether the object can be called.
 pub fn is_callable(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectError> {
     let cell = object_cell(heap, object)?;
@@ -307,6 +479,17 @@ pub fn is_constructor(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectErr
 pub fn function_flags(heap: &Heap<'_>, object: Handle) -> Result<u8, ObjectError> {
     let cell = object_cell(heap, object)?;
     Ok(cell[21])
+}
+
+/// Add flags to a function, which shaping a class constructor does.
+pub fn add_function_flags(
+    heap: &mut Heap<'_>,
+    object: Handle,
+    flags: u8,
+) -> Result<(), ObjectError> {
+    let cell = heap.cell_mut(object)?;
+    cell[21] |= flags;
+    Ok(())
 }
 
 /// The index of the function's code in its unit.

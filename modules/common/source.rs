@@ -34,12 +34,12 @@ impl Limits {
         lines: 262_144,
         line_bytes: 65_536,
         tokens: 262_144,
-        identifier_units: 256,
+        identifier_units: 1024,
         literal_units: 65_536,
         numeric_bytes: 4_096,
         regexp_bytes: 4_096,
         template_depth: 16,
-        expression_depth: 128,
+        expression_depth: 512,
         syntax_nodes: 262_144,
     };
 
@@ -92,9 +92,11 @@ impl Decoded {
 /// Decode one well-formed UTF-8 sequence at `offset`.
 ///
 /// Returns `None` for a truncated sequence, an unexpected continuation byte, an
-/// overlong encoding, a surrogate, or a value above U+10FFFF. There is no
+/// overlong encoding, or a value above U+10FFFF. There is no
 /// replacement-character substitution: substitution would change the program a
-/// digest identifies.
+/// digest identifies. A three-byte sequence for a surrogate is admitted: source
+/// staged from a string carries the string's lone surrogates that way, and a
+/// program's source is a sequence of code units, not of scalar values.
 pub fn decode(source: &[u8], offset: usize) -> Option<Decoded> {
     let first = *source.get(offset)?;
     let (length, mut code_point) = match first {
@@ -125,7 +127,7 @@ pub fn decode(source: &[u8], offset: usize) -> Option<Decoded> {
         3 => 0x800,
         _ => 0x1_0000,
     };
-    if code_point < minimum || code_point > 0x10_FFFF || (0xD800..=0xDFFF).contains(&code_point) {
+    if code_point < minimum || code_point > 0x10_FFFF {
         return None;
     }
     Some(Decoded { code_point, length })

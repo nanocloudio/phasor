@@ -76,6 +76,9 @@ pub mod code {
     /// A strict function refuses a parameter named `eval` or `arguments`,
     /// and refuses two parameters with one name.
     pub const STRICT_INVALID_PARAMETER: u16 = 0x0217;
+    /// Sloppy direct eval code may not `var`-declare `arguments` when its
+    /// variable environment is a function environment.
+    pub const EVAL_RESTRICTED_DECLARATION: u16 = 0x0218;
 
     // Bytecode emission and verification, 0x0400-0x04FF.
     pub const UNKNOWN_OPCODE: u16 = 0x0400;
@@ -166,6 +169,7 @@ pub mod syntax_feature {
     pub const METHOD_DEFINITION: u32 = 9;
     pub const REGEXP_PATTERN: u32 = 10;
     pub const STATEMENT: u32 = 11;
+    pub const CLASS_FIELDS: u32 = 12;
 }
 
 /// Enumerated `image` argument values, naming why an image was rejected.

@@ -4,10 +4,11 @@ Source: `modules/common/parse.rs`, `modules/common/arena.rs`.
 
 This document defines the surface Phasor parses, the tree it builds, and the
 bounds that parse works within. A source is a script or a module: a list of
-statements, in which expressions, declarations, and functions appear, and — in
-a module — `import` and `export` declarations at the top level. Classes,
-generators, `async`, and destructuring patterns are outside the admitted
-grammar, and each is refused by name rather than mis-parsed.
+statements, in which expressions, declarations, functions, classes,
+generators, async functions, and destructuring patterns appear, and — in a
+module — `import` and `export` declarations at the top level. What remains
+outside the admitted grammar — decorators and private-name deletion among
+them — is refused by name rather than mis-parsed.
 
 ## 1. Feature versioning
 
@@ -20,29 +21,26 @@ different list is refused rather than run.
 |---|---|---|
 | `syntax.primary` | 3 | Identifier references, `this`, `null`, `true`, `false`, numeric, BigInt, string and template literals |
 | `syntax.array` | 3 | Array literals with elisions, spread elements, and a trailing comma |
-| `syntax.object` | 1 | Object literals with named, string, numeric, computed, shorthand, and spread properties |
-| `syntax.member` | 3 | `.`, `[]`, calls with spread arguments, `new`, and tagged templates |
+| `syntax.object` | 3 | Object literals with named, string, numeric, computed, shorthand, and spread properties, accessors, and plain, generator, and async methods |
+| `syntax.member` | 4 | `.`, `[]`, calls with spread arguments, `new` (over a tagged template too), tagged templates, and `import(…)` with its `source` and `defer` phases, answered by a rejecting promise |
 | `syntax.optional-chain` | 1 | `?.`, `?.[`, and `?.(` |
 | `syntax.operators` | 1 | Unary, update, binary, relational, equality, bitwise, logical, and nullish operators |
 | `syntax.conditional` | 1 | `test ? consequent : alternate` |
 | `syntax.assignment` | 1 | Simple, compound, and logical assignment to a resolvable target |
 | `syntax.sequence` | 1 | The comma operator |
-| `syntax.statements` | 1 | Blocks, `;`, expression statements, `if`, `while`, `do`, `for`, `continue`, `break`, `return`, `throw`, `try`, `switch`, labels, `debugger` |
-| `syntax.declarations` | 1 | `var`, `let`, and `const`, with a name and an optional initialiser |
-| `syntax.functions` | 1 | Function declarations, function expressions, and arrow functions, with simple parameters |
+| `syntax.statements` | 2 | Blocks, `;`, expression statements, `if`, `while`, `do`, `for`, `continue`, `break`, `return`, `throw`, `try`, `switch`, labels, `debugger`, and `with` in sloppy code |
+| `syntax.declarations` | 4 | `var`, `let`, and `const`, binding a name or a destructuring pattern, with an optional initialiser; `using`, binding a resource disposed when its block, loop, or module is left; `await using`, in async code, whose disposal is awaited |
+| `syntax.functions` | 2 | Function declarations, function expressions, and arrow functions, with patterns, defaults, and rest parameters |
+| `syntax.async` | 1 | Async functions, async arrows, async methods, `await`, and top-level await in modules |
+| `syntax.generator` | 1 | `function*`, generator methods, `yield`, and `yield*` |
+| `syntax.class` | 2 | Class declarations and expressions: heritage, `super` reads, writes, and calls, methods, accessors, fields, `accessor` auto-accessor fields, private members, static blocks, and decorators — `@name`, `@a.b`, `@a.#b`, `@(expression)`, with at most one trailing call — on the class and its elements, each evaluated in source order and its answer left unapplied, which the proposal reads as keeping the value decorated |
 | `syntax.iteration` | 1 | `for (x of y)`, `for (x in y)`, and a spread in an array literal or a call |
 | `syntax.regexp` | 1 | A regular-expression literal, whose pattern is compiled when the image runs |
-| `syntax.modules` | 1 | `import` and `export` at a module's top level: named, default, and namespace forms |
-
-A parameter default, a rest parameter, and a destructuring pattern are refused
-where they are written.
+| `syntax.modules` | 2 | `import` and `export` at a module's top level: named, default, and namespace forms, with any IdentifierName as an exported or imported name |
 
 Constructs outside that list are rejected by name rather than mis-parsed, so a
-program never appears to be accepted with different meaning. Each carries an
-argument identifying what was written: arrow functions, function expressions,
-class expressions, `async` and `await`, `yield`, `super`, `import`,
-`new.target`, destructuring patterns, method definitions, regular-expression
-patterns, and every statement keyword.
+program never appears to be accepted with different meaning. Each refusal
+carries an argument identifying what was written.
 
 ## 1a. Statements
 

@@ -50,6 +50,43 @@ pub fn create(heap: &mut Heap<'_>, units: &[u16]) -> Result<Handle, HeapError> {
     Ok(handle)
 }
 
+/// Create a string from UTF-16 code units already laid out little-endian,
+/// two bytes each, as a unit image stores a constant: no code-unit buffer
+/// stands between the image and the heap, so a constant may be as long as
+/// the image holds.
+pub fn create_from_le_bytes(heap: &mut Heap<'_>, bytes: &[u8]) -> Result<Handle, HeapError> {
+    let count = bytes.len() / 2;
+    let length = u32::try_from(count).map_err(|_| HeapError::ArenaFull)?;
+    if length > MAX_UNITS {
+        return Err(HeapError::ArenaFull);
+    }
+    let mut latin1 = true;
+    let mut index = 0usize;
+    while index < count {
+        if bytes[index * 2 + 1] != 0 {
+            latin1 = false;
+            break;
+        }
+        index += 1;
+    }
+    let payload = if latin1 { count } else { count * 2 };
+    let size = u32::try_from(HEADER + payload).map_err(|_| HeapError::ArenaFull)?;
+    let handle = heap.allocate(CellKind::String, size)?;
+    let cell = heap.cell_mut(handle)?;
+    cell[0] = if latin1 { LATIN1 } else { 0 };
+    cell[4..8].copy_from_slice(&length.to_le_bytes());
+    if latin1 {
+        let mut index = 0usize;
+        while index < count {
+            cell[HEADER + index] = bytes[index * 2];
+            index += 1;
+        }
+    } else {
+        cell[HEADER..HEADER + count * 2].copy_from_slice(&bytes[..count * 2]);
+    }
+    Ok(handle)
+}
+
 /// Create a symbol: a value whose identity is itself.
 ///
 /// The description is held the way a string's units are held, and it is only
@@ -683,6 +720,48 @@ impl<'a> Atoms<'a> {
                 .get(entry as usize)
                 .ok_or(HeapError::StaleHandle)?;
             if units_equal(heap, existing, units)? {
+                return Ok(existing);
+            }
+            probe = (probe + 1) & mask;
+            steps += 1;
+        }
+        Err(HeapError::SlotsFull)
+    }
+
+    /// Intern a string already on the heap, by its own units: the handle
+    /// itself becomes the atom when no equal one is held, so a name of any
+    /// length is a key without a unit buffer between.
+    pub fn intern_string(&mut self, heap: &Heap<'_>, string: Handle) -> Result<Handle, HeapError> {
+        let mask = self.entries.len().wrapping_sub(1);
+        if self.entries.is_empty() || self.entries.len() & mask != 0 {
+            return Err(HeapError::SlotsFull);
+        }
+        let count = length(heap, string)?;
+        let mut hash = 0x811C_9DC5u32;
+        let mut index = 0u32;
+        while index < count {
+            let unit = unit_at(heap, string, index)?.unwrap_or(0);
+            hash ^= u32::from(unit);
+            hash = hash.wrapping_mul(0x0100_0193);
+            index += 1;
+        }
+        let mut probe = hash as usize & mask;
+        let mut steps = 0usize;
+        while steps <= mask {
+            let entry = self.entries[probe];
+            if entry == EMPTY_ENTRY {
+                let index = self.count as usize;
+                let slot = self.handles.get_mut(index).ok_or(HeapError::SlotsFull)?;
+                *slot = string;
+                self.entries[probe] = u32::try_from(index).map_err(|_| HeapError::SlotsFull)?;
+                self.count += 1;
+                return Ok(string);
+            }
+            let existing = *self
+                .handles
+                .get(entry as usize)
+                .ok_or(HeapError::StaleHandle)?;
+            if equals(heap, existing, string)? {
                 return Ok(existing);
             }
             probe = (probe + 1) & mask;

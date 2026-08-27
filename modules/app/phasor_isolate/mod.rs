@@ -49,6 +49,8 @@ mod dtoa;
 mod emit;
 #[path = "../../common/env.rs"]
 mod env;
+#[path = "../../common/evalsite.rs"]
+mod evalsite;
 #[path = "../../common/feature.rs"]
 mod feature;
 #[path = "../../common/gc.rs"]
@@ -324,6 +326,10 @@ fn start(state: &mut State) -> bool {
                 environment: Value::UNDEFINED,
                 import_base: state.import_count,
                 namespace: Value::UNDEFINED,
+                deferred_namespace: Value::UNDEFINED,
+                completion: Value::UNDEFINED,
+                body_pc: 0,
+                evaluated: 0,
             };
             let imports = units[index].header().import_count;
             let mut import = 0u32;

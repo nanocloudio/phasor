@@ -42,6 +42,7 @@ mod feature;
 #[path = "../../common/lex.rs"]
 mod lex;
 #[path = "../../common/lower.rs"]
+#[macro_use]
 mod lower;
 #[path = "../../common/numeric.rs"]
 mod numeric;
@@ -219,26 +220,7 @@ fn compile(state: &mut State) -> bool {
                 return false;
             }
         };
-        let mut storage = LowerStorage {
-            code: &mut state.code,
-            image: &mut state.image,
-            constants: &mut state.constants,
-            constant_data: &mut state.constant_data,
-            safe_points: &mut state.safe_points,
-            patches: &mut state.patches,
-            labels: &mut state.labels,
-            verifier_state: &mut state.verifier_state,
-            unit_code: &mut state.unit_code,
-            unit_safe_points: &mut state.unit_safe_points,
-            functions: &mut state.functions,
-            exceptions: &mut state.exceptions,
-            scopes: &mut state.scopes,
-            bindings: &mut state.lexical,
-            pending: &mut state.pending,
-            imports: &mut state.imports,
-            exports: &mut state.exports,
-            eval_sites: &mut state.eval_sites,
-        };
+        let mut storage = lower_storage!(state);
         let compiled = if module {
             lower_module(source, parser.arena(), root, &mut storage)
         } else {

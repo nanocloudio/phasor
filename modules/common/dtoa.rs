@@ -524,6 +524,147 @@ pub fn fixed(value: f64, digits: u32, out: &mut [u16]) -> usize {
     written
 }
 
+/// The shortest digits of a positive finite magnitude rounded to `count`
+/// significant digits — half up, a carry adding a digit in front — with the
+/// decimal exponent of the first digit: the value is `0.d1d2... * 10^n`.
+fn significant(magnitude: f64, count: usize) -> ([u8; 40], usize, i32) {
+    let mut digits = [0u8; 40];
+    if magnitude == 0.0 {
+        return (digits, 1, 1);
+    }
+    let shortest = shortest(magnitude);
+    let mut length = shortest.length.min(digits.len());
+    digits[..length].copy_from_slice(&shortest.digits[..length]);
+    let mut exponent = shortest.exponent;
+    if count < length {
+        let round_up = digits[count] >= 5;
+        length = count;
+        if round_up {
+            let mut index = length;
+            loop {
+                if index == 0 {
+                    digits = [0u8; 40];
+                    digits[0] = 1;
+                    length = 1;
+                    exponent += 1;
+                    break;
+                }
+                index -= 1;
+                if digits[index] == 9 {
+                    digits[index] = 0;
+                    continue;
+                }
+                digits[index] += 1;
+                length = index + 1;
+                break;
+            }
+        }
+    }
+    (digits, length, exponent)
+}
+
+/// Digits, padded with zeros to `count`, in exponential form: `d.ddde±x`.
+fn write_exponential(out: &mut [u16], digits: &[u8], count: usize, exponent: i32) -> usize {
+    let mut written = 0usize;
+    written += write_digits(&mut out[written..], digits.get(..1).unwrap_or(&[]));
+    if count > 1 {
+        written += write_ascii(&mut out[written..], b".");
+        written += write_digits(&mut out[written..], digits.get(1..).unwrap_or(&[]));
+        written += write_repeat(
+            &mut out[written..],
+            b'0',
+            count.saturating_sub(digits.len().max(1)),
+        );
+    }
+    let e = exponent - 1;
+    written += write_ascii(&mut out[written..], if e >= 0 { b"e+" } else { b"e-" });
+    written += write_number(&mut out[written..], e.unsigned_abs());
+    written
+}
+
+/// The text `Number.prototype.toExponential` produces: one digit, a point,
+/// `digits` more — or, given none, the shortest digits — and the exponent.
+pub fn exponential(value: f64, digits: Option<u32>, out: &mut [u16]) -> usize {
+    if !value.is_finite() {
+        return shortest_text(value, out);
+    }
+    // Negative zero formats without its sign: the specification tests
+    // `x < 0`, which a negative zero fails.
+    let negative = value < 0.0;
+    let magnitude = f64::from_bits(value.to_bits() & !(1 << 63));
+    let mut written = 0usize;
+    if negative {
+        written += write_ascii(&mut out[written..], b"-");
+    }
+    if magnitude == 0.0 {
+        let count = digits.map_or(1, |digits| digits as usize + 1);
+        written += write_exponential(&mut out[written..], &[0], count, 1);
+        return written;
+    }
+    let (rounded, length, exponent) = match digits {
+        Some(digits) => significant(magnitude, digits as usize + 1),
+        None => significant(magnitude, 40),
+    };
+    let count = digits.map_or(length, |digits| digits as usize + 1);
+    written += write_exponential(&mut out[written..], &rounded[..length], count, exponent);
+    written
+}
+
+/// The text `Number.prototype.toPrecision` produces: `digits` significant
+/// digits, in fixed form where the exponent allows and exponential beyond.
+pub fn precision(value: f64, digits: u32, out: &mut [u16]) -> usize {
+    if !value.is_finite() {
+        return shortest_text(value, out);
+    }
+    let count = digits as usize;
+    // Negative zero formats without its sign: the specification tests
+    // `x < 0`, which a negative zero fails.
+    let negative = value < 0.0;
+    let magnitude = f64::from_bits(value.to_bits() & !(1 << 63));
+    let mut written = 0usize;
+    if negative {
+        written += write_ascii(&mut out[written..], b"-");
+    }
+    if magnitude == 0.0 {
+        written += write_ascii(&mut out[written..], b"0");
+        if count > 1 {
+            written += write_ascii(&mut out[written..], b".");
+            written += write_repeat(&mut out[written..], b'0', count - 1);
+        }
+        return written;
+    }
+    let (rounded, length, exponent) = significant(magnitude, count);
+    let e = exponent - 1;
+    let padded = count.saturating_sub(length);
+    if e < -6 || e >= count as i32 {
+        written += write_exponential(&mut out[written..], &rounded[..length], count, exponent);
+        return written;
+    }
+    if e == count as i32 - 1 {
+        written += write_digits(&mut out[written..], &rounded[..length]);
+        written += write_repeat(&mut out[written..], b'0', padded);
+        return written;
+    }
+    if e >= 0 {
+        let split = (e as usize + 1).min(length);
+        written += write_digits(&mut out[written..], &rounded[..split]);
+        written += write_repeat(
+            &mut out[written..],
+            b'0',
+            (e as usize + 1).saturating_sub(split),
+        );
+        written += write_ascii(&mut out[written..], b".");
+        written += write_digits(&mut out[written..], &rounded[split..length]);
+        written += write_repeat(&mut out[written..], b'0', padded);
+        return written;
+    }
+    written += write_ascii(&mut out[written..], b"0.");
+    written += write_repeat(&mut out[written..], b'0', (-(e + 1)) as usize);
+    written += write_digits(&mut out[written..], &rounded[..length]);
+    written += write_repeat(&mut out[written..], b'0', padded);
+    written
+}
+
 /// The text of a Number, as `ToString` defines it: the shortest digits that
 /// identify the value, in fixed or exponential form as its exponent decides.
 pub fn shortest_text(value: f64, out: &mut [u16]) -> usize {

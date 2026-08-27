@@ -720,3 +720,80 @@ mod arm {
         }
     }
 }
+
+/// The nearest `f32`, as its bits: the double's mantissa rounded to
+/// twenty-three bits, ties to even, with overflow to infinity and the
+/// subnormal range handled — in integer steps, since a target without a
+/// double unit has no conversion to lean on either.
+pub fn to_f32_bits(value: f64) -> u32 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 63) as u32) << 31;
+    let exponent = ((bits >> 52) & 0x7FF) as i32;
+    let mantissa = bits & ((1u64 << 52) - 1);
+    if exponent == 0x7FF {
+        // Infinity, or a NaN kept quiet.
+        let payload = if mantissa == 0 {
+            0
+        } else {
+            0x40_0000 | (mantissa >> 29) as u32
+        };
+        return sign | 0x7F80_0000 | payload;
+    }
+    let narrowed = exponent - 1023 + 127;
+    if narrowed >= 0xFF {
+        return sign | 0x7F80_0000;
+    }
+    if narrowed <= 0 {
+        if narrowed < -24 || exponent == 0 {
+            return sign;
+        }
+        // A subnormal single: the whole significand shifted down into the
+        // fraction, rounded once.
+        let significand = mantissa | (1u64 << 52);
+        let shift = (29 + 1 - narrowed) as u32;
+        return sign | round_shift(significand, shift);
+    }
+    // A normal single: a carry out of the rounded fraction steps the
+    // exponent, and at the top becomes infinity, as rounding should.
+    sign | (((narrowed as u32) << 23) + round_shift(mantissa, 29))
+}
+
+/// `value >> shift`, rounded to nearest with ties to even.
+fn round_shift(value: u64, shift: u32) -> u32 {
+    if shift >= 64 {
+        return 0;
+    }
+    let kept = value >> shift;
+    let rest = value & ((1u64 << shift) - 1);
+    let half = 1u64 << (shift - 1);
+    let up = rest > half || (rest == half && kept & 1 == 1);
+    (kept + u64::from(up)) as u32
+}
+
+/// The double an `f32`'s bits denote, exactly.
+pub fn from_f32_bits(bits: u32) -> f64 {
+    let sign = u64::from(bits >> 31) << 63;
+    let exponent = (bits >> 23) & 0xFF;
+    let mantissa = u64::from(bits & 0x7F_FFFF);
+    if exponent == 0xFF {
+        return f64::from_bits(sign | (0x7FFu64 << 52) | (mantissa << 29));
+    }
+    if exponent == 0 {
+        if mantissa == 0 {
+            return f64::from_bits(sign);
+        }
+        // A subnormal single is a normal double once its leading bit is
+        // found.
+        let mut significand = mantissa;
+        let mut power = -126i64;
+        while significand & (1u64 << 23) == 0 {
+            significand <<= 1;
+            power -= 1;
+        }
+        let fraction = significand & 0x7F_FFFF;
+        let widened = (power + 1023) as u64;
+        return f64::from_bits(sign | (widened << 52) | (fraction << 29));
+    }
+    let widened = u64::from(exponent) - 127 + 1023;
+    f64::from_bits(sign | (widened << 52) | (mantissa << 29))
+}

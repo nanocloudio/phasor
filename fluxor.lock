@@ -6,7 +6,7 @@ kind = "module"
 name = "adc_rp"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:16565934dc8ff4361b11f37a7da0d1b9351e8d9a5ed191c297789565bf962f9b"
+digest = "sha256:8161ff310465384018517ebb5a175f6bde93393dd0df7e9315ef91e69bba7860"
 reference = "rp2350/adc_rp:0.0.1"
 
 [[artifact]]
@@ -14,7 +14,7 @@ kind = "module"
 name = "button"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:ae543ff2ad11cc169aa999a7f2ac5a903404f97a688dff8d7b26215a1849e8d3"
+digest = "sha256:e85363e37b8a3a2c9b181dd14c4e7a3002f4ad6bb7ddc7108124ca68828d1c7e"
 reference = "rp2350/button:0.0.1"
 
 [[artifact]]
@@ -22,7 +22,7 @@ kind = "module"
 name = "ch9120"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:357309ca6b297085fc37e99d3773b84f5500504852729356e1c1b79186763469"
+digest = "sha256:820bd8666f58c7fbb2c3efe6effd9dbca6ff1a60b378ce004ed4e9544a8a5b1e"
 reference = "rp2350/ch9120:0.0.1"
 
 [[artifact]]
@@ -30,7 +30,7 @@ kind = "module"
 name = "conn_demux"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:54f75402641398062a5952ffc2ad63bd6a70a3c226f338aac46b6639950eb863"
+digest = "sha256:1db5b43e5408872d731d857665e7d27d13b0f4cf878a2eeefd63143576b74692"
 reference = "bcm2712/conn_demux:0.0.1"
 
 [[artifact]]
@@ -38,7 +38,7 @@ kind = "module"
 name = "conn_demux"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:ea93380950ee1716eb0a566d9286239dbd0253c57c6f0c9fb29680ccc08f510b"
+digest = "sha256:71a9f6cbb0a62d990aa2383478a894c35450bb1b85e6301bf989a6d20c771f66"
 reference = "rp2350/conn_demux:0.0.1"
 
 [[artifact]]
@@ -46,7 +46,7 @@ kind = "module"
 name = "conn_guard"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:4259113af89411816f3314028fcb2620b296625bfee1c9371dd931ddc9814442"
+digest = "sha256:e64546d06c01599a4611f51e94098c0146d886586c2a0815d98970d9c920c9f1"
 reference = "bcm2712/conn_guard:0.0.1"
 
 [[artifact]]
@@ -54,7 +54,7 @@ kind = "module"
 name = "conn_guard"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:4fed2282928fa6e31bdcbd2a5c2fb57f6d35c85a981d69eadfbb0197ea0bbfe0"
+digest = "sha256:8bc47978561eed27b125c90d1a8d28008104a54bcf59159a080dd987d89cdcb7"
 reference = "rp2350/conn_guard:0.0.1"
 
 [[artifact]]
@@ -62,7 +62,7 @@ kind = "module"
 name = "cyw43"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:18f71cb72243d44635d8888dc47a978d1d03b889d97a6b0ef21861cc42f593b1"
+digest = "sha256:4ef3a2a519af0abdf470676f6a7ada82145ea30f8b7b4b8d8bb53cdca71d8c21"
 reference = "rp2350/cyw43:0.0.1"
 
 [[artifact]]
@@ -70,7 +70,7 @@ kind = "module"
 name = "debug"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:e98d9bd5dd5071bd2f01023e9a88da4523d786b81ab4c330ddcae0b83b1c7907"
+digest = "sha256:e82d95a933afb578b0d52d17e4990f0d9122952dfabc0629f641ac8d87b06d0e"
 reference = "bcm2712/debug:0.0.1"
 
 [[artifact]]
@@ -78,7 +78,7 @@ kind = "module"
 name = "debug"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:f0303dc6a25b7c3ac397e3fc022ae8b836d00f1fb0e443062a58fc8c531c79bb"
+digest = "sha256:2949b96043986b3084686fa262a590021039d46465f6fd992b4ef8afcde63c7c"
 reference = "rp2350/debug:0.0.1"
 
 [[artifact]]
@@ -86,7 +86,7 @@ kind = "module"
 name = "demux"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:3d643433dccf29073533fafe4147fb3c40d714856495aacefea8bb6416246c03"
+digest = "sha256:5d844b69a2e784183a462ce27e8b0d275d0ab06a9eedd831939b92ec69aa28c0"
 reference = "bcm2712/demux:0.0.1"
 
 [[artifact]]
@@ -94,7 +94,7 @@ kind = "module"
 name = "demux"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:f5697d046ebe8da6fb2547daf044b16ca4cdca52c01568fbd7a93628b287979d"
+digest = "sha256:a26222657b769614c4e63db123381a333398c2070bfc469bcb8de7974a8ef8b4"
 reference = "rp2350/demux:0.0.1"
 
 [[artifact]]
@@ -102,7 +102,7 @@ kind = "module"
 name = "dma_probe"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:af406946936c683379cdaf3a57518c2c1637773891b10cd0a1c4766ca55d4e92"
+digest = "sha256:0c3595239ee4598c6e1fa91a732afb4869c22aaf06896e03854ff656e002f2e1"
 reference = "bcm2712/dma_probe:0.0.1"
 
 [[artifact]]
@@ -110,7 +110,7 @@ kind = "module"
 name = "dns"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:4d2e40d52f90ddd26a4563db61e7790ff53f3be0c93bb726de15a0add507bb76"
+digest = "sha256:877d68871b1bf848377d26261e457c40fe59f3d212475ba77e0635fc65b33109"
 reference = "bcm2712/dns:0.0.1"
 
 [[artifact]]
@@ -118,7 +118,7 @@ kind = "module"
 name = "dns"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:e91dec99c8aa305bd29c13a8c992095252a548b52111eec3f2da305a603002c6"
+digest = "sha256:a7f3a04a476b803474353c00b1381a7a1d9ca15e893c5466d2de98591dc8aa0e"
 reference = "rp2350/dns:0.0.1"
 
 [[artifact]]
@@ -126,7 +126,7 @@ kind = "module"
 name = "e810"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:694ae0af116e13e32352b25aa0d3e2395d273e86af0e5f66f26000c50349b0e1"
+digest = "sha256:292d5364090c63ad48295c2423921384c64dc6b8771f5c0554375f8f11c0f934"
 reference = "bcm2712/e810:0.0.1"
 
 [[artifact]]
@@ -134,7 +134,7 @@ kind = "module"
 name = "echo_anchor"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:7c5dc00390b5e1f7651d449d60e5e68c1df8fbe4a7f84694b247351a1c8896a9"
+digest = "sha256:291c7181fb16bab8825b4c41ca2fefb72c6cb6671bc2511518e3731f2b082e08"
 reference = "bcm2712/echo_anchor:0.0.1"
 
 [[artifact]]
@@ -142,7 +142,7 @@ kind = "module"
 name = "echo_anchor"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:7268fd2da45164e4f29e077dbaf360bd55e297f1488f7c54713db8a099ac539b"
+digest = "sha256:8e984cd08469aed692b39c0909212ecc282d93ddd2922e7104ee0026a7d50bf6"
 reference = "rp2350/echo_anchor:0.0.1"
 
 [[artifact]]
@@ -150,7 +150,7 @@ kind = "module"
 name = "echo_worker"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:94e563c1a2e86f062459bbe43587e140feabcf88886eba2238bc22e5eae25176"
+digest = "sha256:66c04af417e52a29d3967def6da611acdc93e652c81b176d16afd7a50cd8e0aa"
 reference = "bcm2712/echo_worker:0.0.1"
 
 [[artifact]]
@@ -158,7 +158,7 @@ kind = "module"
 name = "echo_worker"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:0cde4459e75d7f2474a7bed9e881090590e3122d535b78e0e9865ffde16cbca5"
+digest = "sha256:c64b23ad7b50df3af2a43b0028ab4a02897699f6e0d64ddfe5a9d5158eca7a83"
 reference = "rp2350/echo_worker:0.0.1"
 
 [[artifact]]
@@ -166,7 +166,7 @@ kind = "module"
 name = "enc28j60"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:0a3b5071e58c8e02f85df4637c9f305ebcb9fc8f69c96de97e9a5cd7df6d7259"
+digest = "sha256:e79e3a2c896042bcfebb6793e4d961800646c2942df64497e23cd74c8569aaf7"
 reference = "rp2350/enc28j60:0.0.1"
 
 [[artifact]]
@@ -174,7 +174,7 @@ kind = "module"
 name = "eth_parser"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:7abb30d465f70db2a03b8a844dde0e785812e1ab434097f7683a7bdff232a35c"
+digest = "sha256:3e95303f3c926959ced24ed4ccdbf1dfd2e2ce9f83f67ddd9d731893be8feabd"
 reference = "bcm2712/eth_parser:0.0.1"
 
 [[artifact]]
@@ -182,7 +182,7 @@ kind = "module"
 name = "eth_parser"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:331c37f5a7731f163405ac24b568cd564aca1e23b666f4d8ba9df7f101b99b8c"
+digest = "sha256:6cf901d802453a40a4981d1c05ecff82e5ff886312962ed3f666899abe4c4beb"
 reference = "rp2350/eth_parser:0.0.1"
 
 [[artifact]]
@@ -190,7 +190,7 @@ kind = "module"
 name = "fat32"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:622d1a383849cc195485805cd6ed2d2f0e5621957a6d963e68e66dbc99f6262c"
+digest = "sha256:3cdf5e02383419cb84f6bacb656a76da39068094bfc7deac06db155b641264e1"
 reference = "bcm2712/fat32:0.0.1"
 
 [[artifact]]
@@ -198,7 +198,7 @@ kind = "module"
 name = "fat32"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:52b22f1d73a9d500f283cf4c87c525e0b3d61d9d492321471f4e06ec6bffafd4"
+digest = "sha256:b5d317c45ebf4c615535e16666dea69ea25bf77e10c2d5e9d7b015a998bc8030"
 reference = "rp2350/fat32:0.0.1"
 
 [[artifact]]
@@ -206,7 +206,7 @@ kind = "module"
 name = "fat32_seed"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:c5869825205c5cc2536b42277697d7acf8b2c1b571efb6ace8fc7f70d771a6ab"
+digest = "sha256:66693550a0bfe5f55bf5aef0c2d415cde8d66f8fb454e3b6e89559c41f44ffb3"
 reference = "bcm2712/fat32_seed:0.0.1"
 
 [[artifact]]
@@ -214,7 +214,7 @@ kind = "module"
 name = "fat32_seed"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:e8c15c0d0a262ef7153644ba9d5d5e6b02b4e2dcfa240007c875cc05666ee80a"
+digest = "sha256:301eb9ad22ed58853cb9bbff0f8161467baafa1047b53942b3f57dceafac0e8e"
 reference = "rp2350/fat32_seed:0.0.1"
 
 [[artifact]]
@@ -222,7 +222,7 @@ kind = "module"
 name = "flash_rp"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:17211b12e679dca3284142f9459bad3b11b6870ae05086472db3c61f5beb57a8"
+digest = "sha256:52280f632bbb8ef1e471a257cbbf23b51b7febf60303b1bfb5d1aa517b3acec7"
 reference = "rp2350/flash_rp:0.0.1"
 
 [[artifact]]
@@ -230,7 +230,7 @@ kind = "module"
 name = "format"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:3b7d5b5da2f549f5f29c9dc87715035c34de6b107b599be803307fe9a029e6da"
+digest = "sha256:d84ff35e2e5776fc812667f5704fc2cb746ba9928dae621f3034ea218dd1a241"
 reference = "rp2350/format:0.0.1"
 
 [[artifact]]
@@ -238,7 +238,7 @@ kind = "module"
 name = "fs_bank"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:fa130f8d1e470d31d422842f0c057df9f94763beac816e48bc11300ad7ea8ea1"
+digest = "sha256:2e607d399af0c56aca36dac7e6d6931d7bc539ab146408f747fec63022a0771d"
 reference = "bcm2712/fs_bank:0.0.1"
 
 [[artifact]]
@@ -246,7 +246,7 @@ kind = "module"
 name = "fs_bank"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:0990adea932f947cb5bda69a780da265ddec6a087fc58b14971a81dd5ff05be0"
+digest = "sha256:691ecb274a9b2c20b6de9f7c66a52d421b1850532f1cb1c6fa46af06ced7b494"
 reference = "rp2350/fs_bank:0.0.1"
 
 [[artifact]]
@@ -254,7 +254,7 @@ kind = "module"
 name = "fs_bank"
 project = "fluxor"
 target = "wasm"
-digest = "sha256:742700d7d775c351091a241d85f2207fe53bbccdab5099d795c11d3363cb05be"
+digest = "sha256:b6ee03575975c8ecafa8573346d9459b4521660829304e4cf284843cc593d0bd"
 reference = "wasm/fs_bank:0.0.1"
 
 [[artifact]]
@@ -262,7 +262,7 @@ kind = "module"
 name = "fs_selftest"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:7ef4c1d2718e8f2200eefd5056802653f7e25c9f801c4b1c080b63e5ac3f5e2c"
+digest = "sha256:e9a7f9f3c81ebdf346a18e56f8aa4efe41a70d81ad927ab1e83e1dd5faca0f2a"
 reference = "bcm2712/fs_selftest:0.0.1"
 
 [[artifact]]
@@ -270,7 +270,7 @@ kind = "module"
 name = "fs_tap"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:4608e8684bd81d5424de6a0dee72bc74c4e945e336e5516eb78e8f6ba454acb9"
+digest = "sha256:f4137d14ecdde36a9a876318bd61fad390dc71eb6a89543dab0036c9cf345caf"
 reference = "bcm2712/fs_tap:0.0.1"
 
 [[artifact]]
@@ -278,7 +278,7 @@ kind = "module"
 name = "fs_tap"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:f0cce68b62a3eb11c98eb4032e1f7d19026049968b201ec4cd379451e0253886"
+digest = "sha256:61c7692367147e1675207f360b034f3612d9d2e1eb55f049abbb144acc7ede92"
 reference = "rp2350/fs_tap:0.0.1"
 
 [[artifact]]
@@ -286,7 +286,7 @@ kind = "module"
 name = "gallery_stage"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:32696dc11a0aa6e93304225fe2592e378b5c209dccf725f4f5e45dee86d9427d"
+digest = "sha256:e3d356a91ff2aeab31529cbcf4d7e9ad36116b801b57999c1ea134f3a39d5e80"
 reference = "bcm2712/gallery_stage:0.0.1"
 
 [[artifact]]
@@ -294,7 +294,7 @@ kind = "module"
 name = "gesture"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:d7b1b5de7e76a495dfeb28a6b8e7f7b5d4c8f029aa233c18700f192ef83a3bc8"
+digest = "sha256:caf8a61900f92e6973a6ec188378dc57718ca0c1522d7c5f383277a5af038cf4"
 reference = "bcm2712/gesture:0.0.1"
 
 [[artifact]]
@@ -302,7 +302,7 @@ kind = "module"
 name = "gesture"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:5d3da4136964edecb229dd85ceb89bb016ec3c0051b3ac1e5c6d1a15d58581fa"
+digest = "sha256:232e399f94b79d1dff97d3c2f0653baed8f404ca07fb5b86f2c958ca2eb6794e"
 reference = "rp2350/gesture:0.0.1"
 
 [[artifact]]
@@ -310,7 +310,7 @@ kind = "module"
 name = "gesture"
 project = "fluxor"
 target = "wasm"
-digest = "sha256:daad9cfe8293b28a7fde91dd8ceae43365f241c800622ef745da31508d7a68fb"
+digest = "sha256:316b763c644ac6eeed89ca2d33e22a0cbc04c7cbccc6acd40fc54c29be7607eb"
 reference = "wasm/gesture:0.0.1"
 
 [[artifact]]
@@ -318,7 +318,7 @@ kind = "module"
 name = "graph_slot"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:bf3f8dd27697b09f35434a4a5d18a901f2010dbf7238a07fffc7e6e219130253"
+digest = "sha256:56eeaef7f9f96dc0257e803b954c6aea58b8fa3c84586a2b11a68c8153d44e33"
 reference = "rp2350/graph_slot:0.0.1"
 
 [[artifact]]
@@ -326,7 +326,7 @@ kind = "module"
 name = "gt911"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:e934f179c83d7bb63944d4dbd60acf05b9a4a816621f13817b459683446457ce"
+digest = "sha256:1bc8b2cf1ded32f181275f1f143cb49b2046dc868609f7968941574227466674"
 reference = "rp2350/gt911:0.0.1"
 
 [[artifact]]
@@ -334,7 +334,7 @@ kind = "module"
 name = "i2c_dw"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:44564613695ec60f2a5e726e36f20dd777ce43a04cb43d879faa4c802474da12"
+digest = "sha256:20e3b486601907d055c0facd2597dcc54a71eb24af93f9ec683ab3f315952c34"
 reference = "rp2350/i2c_dw:0.0.1"
 
 [[artifact]]
@@ -342,7 +342,7 @@ kind = "module"
 name = "i2s_pio"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:9e57c414998a5b8332b89cbd9982a2338f9a1be956d292dac4fd7dbe9a8827f5"
+digest = "sha256:775f718fa48cf0db9963acda142f7a111ea04a21af1ebcf1ffe2af56279f1213"
 reference = "rp2350/i2s_pio:0.0.1"
 
 [[artifact]]
@@ -350,7 +350,7 @@ kind = "module"
 name = "ip"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:221b68dfbe135e1c4b6bbe23ed5784678f98f0299b05b1102a3e089b34dad0a5"
+digest = "sha256:3bbbc5072584f4fd78b2ffa241e6ddf9b0045ae902d96fbbf93083070719a4b4"
 reference = "bcm2712/ip:0.0.1"
 
 [[artifact]]
@@ -358,7 +358,7 @@ kind = "module"
 name = "ip"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:0ff19590dae008f5efd88afffcf05f150cd90e13c9df691e708b8ddb2f3b4c87"
+digest = "sha256:429f0fc3fd7ba3d6e1086d348c4bd2b0886902d6f12da52e47c86505d8c99211"
 reference = "rp2350/ip:0.0.1"
 
 [[artifact]]
@@ -366,7 +366,7 @@ kind = "module"
 name = "iso_heap"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:149a9c8cc14f7cec130147e7170a75bf7141a9bc9896830d3b1728df5d08181b"
+digest = "sha256:fb0aecdb284682773289218347c0d586782e8b52dd11d94407f52de12f1159dd"
 reference = "bcm2712/iso_heap:0.0.1"
 
 [[artifact]]
@@ -374,7 +374,7 @@ kind = "module"
 name = "iso_probe"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:0320b949f2a9cb43eb2ea5b4dcf12623a1fbb42e172340c4a90f11bd76d69b6e"
+digest = "sha256:3f6e73ff127921977fbd2447f0bb70d43ccc4996ea00302a736bd30746742967"
 reference = "bcm2712/iso_probe:0.0.1"
 
 [[artifact]]
@@ -382,7 +382,7 @@ kind = "module"
 name = "iso_transform"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:109ef5b091b89c6afc7372dc64ae052b1567fdc05e27bb4c3fd9a5aa7f3d7c00"
+digest = "sha256:375380a24d9a690144cf4124436b404e079b59d88e968495ea041c0bf6065a63"
 reference = "bcm2712/iso_transform:0.0.1"
 
 [[artifact]]
@@ -390,7 +390,7 @@ kind = "module"
 name = "kv_store"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:76715b2bb97b4e60bbc76252d111ebfc04b6653b83fd3f5888aa442ce8e48f2e"
+digest = "sha256:a9fa3a5c31c1b905c57eb12d0a2cd00e0ae8a18beaac311b96b13272a31dae30"
 reference = "bcm2712/kv_store:0.0.1"
 
 [[artifact]]
@@ -398,7 +398,7 @@ kind = "module"
 name = "kv_store"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:5349498cd1ef76b897544cdbd92637fae27d0989cf0b14de87c31c90135a98e3"
+digest = "sha256:63240ce9425e5289f33b6e05758f121913e6f310dc70f100ba32d7396e977afb"
 reference = "rp2350/kv_store:0.0.1"
 
 [[artifact]]
@@ -406,7 +406,7 @@ kind = "module"
 name = "link"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:95e64cc3cc3f580a9332b0678547b08f823f6f216eb0b4a98e2ad811fc0e0dcf"
+digest = "sha256:a3b262be932add0c85083b14aad92bd59f9638f67e10bba7c358d5a39c48e0c9"
 reference = "rp2350/link:0.0.1"
 
 [[artifact]]
@@ -414,7 +414,7 @@ kind = "module"
 name = "load_gen"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:58d7ffda22fe407d39c347981e9e345b8d7886668730ef2b6af9ac28a64cb81e"
+digest = "sha256:3f03ff2524fffdb474f99683c8c3cd3221c8740fe61e8ef760ea653c84264582"
 reference = "bcm2712/load_gen:0.0.1"
 
 [[artifact]]
@@ -422,7 +422,7 @@ kind = "module"
 name = "load_gen"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:a1aed4247913049bc6d203222032684e5a7675d43dbfa93e18ff068c00c41cd1"
+digest = "sha256:77a8c1637ea19e47d4a1d9bbfa3a652d337189b5c11222a444890f4a437c07cb"
 reference = "rp2350/load_gen:0.0.1"
 
 [[artifact]]
@@ -430,7 +430,7 @@ kind = "module"
 name = "log_net"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:e709c544686555b901cdbaa81d24b280b7a916bddd02c9387fd77340adde2707"
+digest = "sha256:5054356a60c68620af9e026fbe70fed4f1cb636261877611080eaacfd2b3e43d"
 reference = "bcm2712/log_net:0.0.1"
 
 [[artifact]]
@@ -438,7 +438,7 @@ kind = "module"
 name = "log_net"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:8762bfa0e080bf04cc626a221a7009256651ea84f3180524799fc9d19e10b15f"
+digest = "sha256:f4826886658f860ee04c5c350520e09c256a2df124a97863e29af2d59aea7c6d"
 reference = "rp2350/log_net:0.0.1"
 
 [[artifact]]
@@ -446,7 +446,7 @@ kind = "module"
 name = "mem_ns"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:df58ef9569ad88ac763dba8e3a3fa26b590caacb0ccb72e5836566e7fec06cc5"
+digest = "sha256:385a950405dba335159294fea9e666890650bc6a9014ac757a817b2884d568bd"
 reference = "bcm2712/mem_ns:0.0.1"
 
 [[artifact]]
@@ -454,7 +454,7 @@ kind = "module"
 name = "mem_ns"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:189b68449f4786a22995afed2df4f2dcf903aa7e76e4351302df3661fa9a481d"
+digest = "sha256:9f4838339af55ca73eab03d47fb58be9c303282b4a7edd4b6644ab18ef124b87"
 reference = "rp2350/mem_ns:0.0.1"
 
 [[artifact]]
@@ -462,7 +462,7 @@ kind = "module"
 name = "mic_pio"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:e5c852ec325bb39074224f2c4cb2305615757c31ff214d0fccd32221bd26fa91"
+digest = "sha256:8e09178da342b22e6fff6e92f637a92cf4019ad720691fe8d127ffe6dc69be47"
 reference = "rp2350/mic_pio:0.0.1"
 
 [[artifact]]
@@ -470,7 +470,7 @@ kind = "module"
 name = "monitor"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:b863aebc69623bae9cadb9a257583b5caa3740e4154e5b8a05ee6813c410cdde"
+digest = "sha256:208e0b65eae5424d62c5638b58e5fcf0887ffd5441484d0f3fdb4d629b02075f"
 reference = "bcm2712/monitor:0.0.1"
 
 [[artifact]]
@@ -478,7 +478,7 @@ kind = "module"
 name = "monitor"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:f984413428019cd13cbe34385b803d4c4ad7d8861ea89ed5db5f13bf625e563f"
+digest = "sha256:441ed27cdbe6f0ccaa05d9e5317c96cb5347fd597a7887794d19eab8b6ea944c"
 reference = "rp2350/monitor:0.0.1"
 
 [[artifact]]
@@ -486,7 +486,7 @@ kind = "module"
 name = "mount"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:35d97087e1cb8f422a7e4ef8341e736aede24ada654e88b49a4d44ac5a4e79c0"
+digest = "sha256:5bbad85be66bcd58ca101d0d6f9703144aad3ca0476ef35e6aa0e6f5254b8147"
 reference = "bcm2712/mount:0.0.1"
 
 [[artifact]]
@@ -494,7 +494,7 @@ kind = "module"
 name = "mount"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:dd630cc52ed79db6a02efb634956a0a36c27f8fe1fcc2ce2b916369112b1cb55"
+digest = "sha256:8ccf779cc32a87b4f3f961d06c6ef7d2a0ccc585317df8a551add718621b9551"
 reference = "rp2350/mount:0.0.1"
 
 [[artifact]]
@@ -502,7 +502,7 @@ kind = "module"
 name = "mux_echo"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:16cc69d17fb7e628e26a9f9d9951d953d817fc2594c50d34834e635a7fdaf36d"
+digest = "sha256:338ea85de7a6c0af2b453bdbb628ca0181d12724f1f375837f7167e526489e37"
 reference = "bcm2712/mux_echo:0.0.1"
 
 [[artifact]]
@@ -510,7 +510,7 @@ kind = "module"
 name = "mux_echo"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:abc6f4fb9b63f4a4297be4f5dfe2111416d2e0a8d4f8e5c22b631ae7c8c08f60"
+digest = "sha256:8e19a2c1c4e92a1cb38a171345e6cd8af769c773b5e6f7756260f99e36a00a4b"
 reference = "rp2350/mux_echo:0.0.1"
 
 [[artifact]]
@@ -518,7 +518,7 @@ kind = "module"
 name = "nvme"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:5514863e0eff75fb055e2eb6c770d683ff6c02bb4e8e02a5e240319935204ea0"
+digest = "sha256:6ccb5766b0c4d54ec5bf1233b248c9254f35f2da28a25ee8baa0687d295cd74c"
 reference = "bcm2712/nvme:0.0.1"
 
 [[artifact]]
@@ -526,7 +526,7 @@ kind = "module"
 name = "nvme_arena_probe"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:e4d8cadf043e26ee9f56441c647dfa0405e3919cd01fcf39109b19d51a183a85"
+digest = "sha256:2e5b56d9923aac03b462c685544912bc074b728923ef76ce4622fb4d7a531ba5"
 reference = "bcm2712/nvme_arena_probe:0.0.1"
 
 [[artifact]]
@@ -534,7 +534,7 @@ kind = "module"
 name = "nvme_perf_probe"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:e33512510f9def807280e05c1666a12e7d48155532e9e038bacb6b73270bd47f"
+digest = "sha256:6cfdf985521460daaec9658a35f3a4579f9597d37b1380fff11041cbab5640da"
 reference = "bcm2712/nvme_perf_probe:0.0.1"
 
 [[artifact]]
@@ -542,7 +542,7 @@ kind = "module"
 name = "object_bank"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:95b38df3d34c4b24083d76934645fa3941ac69bf7a3d5700289aad7860e2c691"
+digest = "sha256:d12c5c479733f0fd1892803b7eedec33e90e83bc8399d7b1c8ac94ec966a4779"
 reference = "bcm2712/object_bank:0.0.1"
 
 [[artifact]]
@@ -550,7 +550,7 @@ kind = "module"
 name = "object_bank"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:9a4a74e709720c53cd8e4889e0eacfa84dd4b1f2a3b76efc3542a5a5048d38e0"
+digest = "sha256:a74a391a3f2aa5e2c20409bb3533b78741a77ca6c5d25c45e6482f25a8110899"
 reference = "rp2350/object_bank:0.0.1"
 
 [[artifact]]
@@ -558,7 +558,7 @@ kind = "module"
 name = "object_bank"
 project = "fluxor"
 target = "wasm"
-digest = "sha256:aed333ee508a69dc85c56fe41faff31bd452f8e27c1e91ae2f6f45c189ad7ea8"
+digest = "sha256:77eacf3b7081578f7aa83e3a1ebc37c66a94cd8bf2a455aeb2eb8c6782919cde"
 reference = "wasm/object_bank:0.0.1"
 
 [[artifact]]
@@ -566,7 +566,7 @@ kind = "module"
 name = "observe"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:fd9a4938e88ffec6e63168019b31e64d25797b05db1fe9f4d64aa84ef701cf29"
+digest = "sha256:0f2997e745ced6a457cf82b2857ab80990eac35387797dc4990ee697cb73c20b"
 reference = "bcm2712/observe:0.0.1"
 
 [[artifact]]
@@ -574,7 +574,7 @@ kind = "module"
 name = "observe"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:3172c72e1210170b61578c8bfc4771100bd477bf9cc03da16a73ad86405dfb4d"
+digest = "sha256:37f0a3018602df5a7fe020cfbbaca59fad71c3a113063da0b5cb9ce80f9191f8"
 reference = "rp2350/observe:0.0.1"
 
 [[artifact]]
@@ -582,7 +582,7 @@ kind = "module"
 name = "ota_ingest"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:1f15208ab9d59e3376f2ad8b5e7fcb7a347dae95fa5d6703a55eb78268ccc34d"
+digest = "sha256:fb6a0f23883561dcc9d7d8cc49d9c69e08ce3f27be5d81857795a332167259bb"
 reference = "rp2350/ota_ingest:0.0.1"
 
 [[artifact]]
@@ -590,7 +590,7 @@ kind = "module"
 name = "ota_registry"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:a0350b67cdf8402e2dcb9b42e36ef954c2c3689f0351b34e53faffe2e63f95e2"
+digest = "sha256:31d20ebbd7049ddceb94e6910cff3f2483ca613668ed44c00f80fecafe446c07"
 reference = "bcm2712/ota_registry:0.0.1"
 
 [[artifact]]
@@ -598,7 +598,7 @@ kind = "module"
 name = "otel"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:89609bbeea6b02876126d06a5a9dbefc6a677a370c2595b7d696ca8e65020e2f"
+digest = "sha256:7c7f1d12a70bd54e3de098bc0c532c8688b505383c09a48f6a72ce93d9453699"
 reference = "bcm2712/otel:0.0.1"
 
 [[artifact]]
@@ -606,7 +606,7 @@ kind = "module"
 name = "otel"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:5b564161a46c716804bb64b889f486fc2135b2126d31cf95b832b9bf01712512"
+digest = "sha256:aa3584eb5325ffc7bcd6eea52892987b19b1aaff1bbbf2853e3c322d9849ac12"
 reference = "rp2350/otel:0.0.1"
 
 [[artifact]]
@@ -614,7 +614,7 @@ kind = "module"
 name = "panel_surface_traits"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:6a30ad0d80aba27f45e113ca92d64e60082060b4f70f986f04c60bd99d22acdd"
+digest = "sha256:66604bf1edc28868cd886ce6fbb21de9f3b76810a49a0ff8ba3fa77dcca4906a"
 reference = "bcm2712/panel_surface_traits:0.0.1"
 
 [[artifact]]
@@ -622,7 +622,7 @@ kind = "module"
 name = "panel_surface_traits"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:c943c10b2de3d5899a6f816bb7aa492d3d9dc26e9abcf1bdb401d1c4b95f9f1a"
+digest = "sha256:03eb51bc60b68bb0c14a0c44147c79fcfc5c623cbc5df91b22ce7eb52dc994ac"
 reference = "rp2350/panel_surface_traits:0.0.1"
 
 [[artifact]]
@@ -630,7 +630,7 @@ kind = "module"
 name = "pause_driver"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:4aecd82f30a8b37b25bda400f313804ba72b7567f23d81004faa028911e0e06f"
+digest = "sha256:32a1498a67523bb8aa9aacc313af9ff991dfa7080642cba17dd8094906bb2557"
 reference = "bcm2712/pause_driver:0.0.1"
 
 [[artifact]]
@@ -638,7 +638,7 @@ kind = "module"
 name = "pause_probe"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:b0362ba1a63eb4768e6db83f8e5094adf557e1e8330963c1e4ba8a96040f6a90"
+digest = "sha256:bb1fc0a1ec0a3969758d9daf0ac07b0266d0e179c4f54c140c8b5132ca748fb7"
 reference = "bcm2712/pause_probe:0.0.1"
 
 [[artifact]]
@@ -646,7 +646,7 @@ kind = "module"
 name = "pcie_scan"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:11c1f49082657d0440887389ad871e16e01492e7139aa738d0c11ffc9536b150"
+digest = "sha256:7bb15c78d6a078e543247dcb349d529eb3f288f1cd15f539c834461571c8bd43"
 reference = "bcm2712/pcie_scan:0.0.1"
 
 [[artifact]]
@@ -654,7 +654,7 @@ kind = "module"
 name = "pio_rp"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:e7719bad4262ca07ca4b6b428c35e14fb072be86b27ace0e76dcf42e26205405"
+digest = "sha256:0d75ae821f8bb92bcd7f5550cb21574ea141317e10a82d02dd5d653b8844c708"
 reference = "rp2350/pio_rp:0.0.1"
 
 [[artifact]]
@@ -662,7 +662,7 @@ kind = "module"
 name = "pkt_filter"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:354d315bca3ef8a5d4d92109ba698aa44816971f42583d45c809f58737231e37"
+digest = "sha256:02fb18af3669dca7fce03261316c336a9104f0f129b9f1d7bc875a51dfb59a80"
 reference = "bcm2712/pkt_filter:0.0.1"
 
 [[artifact]]
@@ -670,7 +670,7 @@ kind = "module"
 name = "pkt_filter"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:2209d91c4fc3c74b8ca5fc326aadeafbff47c405671cbd318acee030286d1b10"
+digest = "sha256:e5c817e0e16e0990211ed83c6845b944ab34f6b082d49ac381a5d7c1633f74b2"
 reference = "rp2350/pkt_filter:0.0.1"
 
 [[artifact]]
@@ -678,7 +678,7 @@ kind = "module"
 name = "presentation_resolver"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:065b215eada9396c7f4a7914a25f2a65661f8df30ed675052e06571c7e48e6de"
+digest = "sha256:1353bf91bdaf9d90ac5b584a663bbf3301c7619cbf881464d19632d510632885"
 reference = "bcm2712/presentation_resolver:0.0.1"
 
 [[artifact]]
@@ -686,7 +686,7 @@ kind = "module"
 name = "presentation_resolver"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:bc37702d7656417f55f1f9d3705ab83a1f4630457449affcfe164e1a1e476acb"
+digest = "sha256:f0556396843303e20d742e4b0b2e6e520d05cb8bba0bdc209773969cb7649ab8"
 reference = "rp2350/presentation_resolver:0.0.1"
 
 [[artifact]]
@@ -694,7 +694,7 @@ kind = "module"
 name = "presentation_resolver"
 project = "fluxor"
 target = "wasm"
-digest = "sha256:019fb60e174f5cc0dd0108b8804be74aa4b78f4cd0477ec326b501b792bfab4f"
+digest = "sha256:86dba7269365b09dd971769d57a2f410fe7eacdc1555b3c8db09dfeb05b4b936"
 reference = "wasm/presentation_resolver:0.0.1"
 
 [[artifact]]
@@ -702,7 +702,7 @@ kind = "module"
 name = "pwm_out"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:c5aef1752a6510ecc863ec707b11d3d704e95776fe77f6e84d24a84e70525863"
+digest = "sha256:476fc1c50ee55bb7dfbbb9588cb58c7c3a14489f9f6f34b102eff5618f9ebd02"
 reference = "rp2350/pwm_out:0.0.1"
 
 [[artifact]]
@@ -710,7 +710,7 @@ kind = "module"
 name = "pwm_rp"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:b9101d23c3f37e28078ba481398b969a87eb3e003417127d47bffbd2a9be9f6e"
+digest = "sha256:0ba53c3a7de884524002d4a189907fdc266fbb28fcb0af0201c1c90b5d5e8a68"
 reference = "rp2350/pwm_rp:0.0.1"
 
 [[artifact]]
@@ -718,7 +718,7 @@ kind = "module"
 name = "quic"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:37e8210a46892267fd5e31ab32c4cb2e4e926c8e7e8b647fe3b3abf781251182"
+digest = "sha256:acd414405ffb0fdb48c76b3adb40b41c43e9ac1db1c9f01e0ef87885e07a6966"
 reference = "bcm2712/quic:0.0.1"
 
 [[artifact]]
@@ -726,7 +726,7 @@ kind = "module"
 name = "reconfigure"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:1673692b923c136a9acf80953dee5850f9e270eea1c362cb85bdc6797fa6cb15"
+digest = "sha256:3bf4a39b68f345ada77ae9e57ca141c0725bf66c791eb6bbb6f8ba2e24d50a7d"
 reference = "bcm2712/reconfigure:0.0.1"
 
 [[artifact]]
@@ -734,7 +734,7 @@ kind = "module"
 name = "reconfigure"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:dbce61c8c26776ed18fc4946922abf0336675aa09350c5438d6292dd1117ab55"
+digest = "sha256:3c2e5380031d8562e55b2643be741a2ead2eb3c4263941ed6ff757b7da1fefd8"
 reference = "rp2350/reconfigure:0.0.1"
 
 [[artifact]]
@@ -742,7 +742,7 @@ kind = "module"
 name = "remote_channel"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:cfba6bf9539a90f0632e247bc8670c6cdae3724faadb45b13e4139bf50f10e86"
+digest = "sha256:2691d8ac780cc1fee7471da85a840b342bb70fd9db84e9cc84d8de049ab16df2"
 reference = "bcm2712/remote_channel:0.0.1"
 
 [[artifact]]
@@ -750,7 +750,7 @@ kind = "module"
 name = "remote_channel"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:f9915a93d69005d48ac9732d4e7b3f745589b36937c38c57036cc1b1c346b53a"
+digest = "sha256:0a89c37edd5b0d1ee7f9fb13d3ab38b4b3a281eab97521c93ecfef058c9a018e"
 reference = "rp2350/remote_channel:0.0.1"
 
 [[artifact]]
@@ -758,7 +758,7 @@ kind = "module"
 name = "remote_channel"
 project = "fluxor"
 target = "wasm"
-digest = "sha256:096789088aa45292a920eaed2feb766fb7b9722ccfef5aae4a2b55d0d3fb95df"
+digest = "sha256:07ee081b533cfae079a39cc3f4cf3a80b4b7b79e50b01bff7550ae17cf4df1b6"
 reference = "wasm/remote_channel:0.0.1"
 
 [[artifact]]
@@ -766,7 +766,7 @@ kind = "module"
 name = "rp1_gem"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:42b6f37ae4138efbdeca06d58aa1bddc2f4a645dcda9b40c30d2690462bbf539"
+digest = "sha256:6047ab2f87afd751adf2a9c4e4529fa39710e6de145b0d1f69a5e1868ef00bed"
 reference = "bcm2712/rp1_gem:0.0.1"
 
 [[artifact]]
@@ -774,7 +774,7 @@ kind = "module"
 name = "rules"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:f901ddebb83fe1c60a685332d568891642832cbccf0de4f00ba516ef1e411e2f"
+digest = "sha256:19ff771cabe003cf99dac27870919d24273c603165f1dcd31430b848e736d9f2"
 reference = "rp2350/rules:0.0.1"
 
 [[artifact]]
@@ -782,7 +782,7 @@ kind = "module"
 name = "sd"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:a3200da0157e0d735a094b1dc8e7b206ec7913b1c9add4b7cd2fa26f6146dd6b"
+digest = "sha256:e2ca0e6d0b7b50b2afb07c357a6dd227ee6599632baa6dbf35af687947716e3f"
 reference = "rp2350/sd:0.0.1"
 
 [[artifact]]
@@ -790,7 +790,7 @@ kind = "module"
 name = "smmu"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:52db88a87d948df661dead49c680c326b0308d66134bc4958fe2a0e12aec0591"
+digest = "sha256:f024fa325ad8eb2afbf65583eaffb054203d9cac373b88cddd1ad148afc7e93b"
 reference = "bcm2712/smmu:0.0.1"
 
 [[artifact]]
@@ -798,7 +798,7 @@ kind = "module"
 name = "spi_pl022"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:3f7c8c98a3d7e96675a72b63439aedb290c6309253a5f540c7e4175f469e880e"
+digest = "sha256:1084e64c12d44ec3438601ed1232832c1a59b3b6fbe60629d73f63cf41641ce2"
 reference = "rp2350/spi_pl022:0.0.1"
 
 [[artifact]]
@@ -806,7 +806,7 @@ kind = "module"
 name = "st7701s"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:4b7f3531b55a4824adde8cea6e072ee46a3584dc755954597b6fce529cf1559d"
+digest = "sha256:976a154141f03be9d34fa6795efa30213b016c4d2f36083fd9bcb257d9bcfbc0"
 reference = "rp2350/st7701s:0.0.1"
 
 [[artifact]]
@@ -814,7 +814,7 @@ kind = "module"
 name = "synth_source"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:69375e2092f2d2522b3c8984fcf7beb44d7b77f1498949f2fd5e27cefe2be53c"
+digest = "sha256:d501302da020bba14fab238b0ab45bdad6cb059a7bffe3f8bba9928a9d4a2e92"
 reference = "bcm2712/synth_source:0.0.1"
 
 [[artifact]]
@@ -822,7 +822,7 @@ kind = "module"
 name = "synth_source"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:4970a5fb5d1fa8efe36000bd64d12eabda515da1d3ea4cb04b9284d552b6f4e2"
+digest = "sha256:3b1f75ea1228ac862c6d1d764f3b5c424fb133be1f92f2ec09924189b50c9ca9"
 reference = "rp2350/synth_source:0.0.1"
 
 [[artifact]]
@@ -830,7 +830,7 @@ kind = "module"
 name = "temp_sensor"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:c5dfaee02b3979bf8ae7907782af36fbcc566c06ff37eed6327a27af241b867a"
+digest = "sha256:f84f93e7e5b60d5c8e395bf5b1d12c9d246d5c5f4e0d8c9f4a06e0ad8b643209"
 reference = "rp2350/temp_sensor:0.0.1"
 
 [[artifact]]
@@ -838,7 +838,7 @@ kind = "module"
 name = "test_fault"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:93eba0a4ff8706e65b5fdc71c111a72102d0e2c44a5c7b43fef537730bc90df2"
+digest = "sha256:781ed1e9670a80e85e645474bb46842498a190781afc7a384f6903f980e72134"
 reference = "bcm2712/test_fault:0.0.1"
 
 [[artifact]]
@@ -846,7 +846,7 @@ kind = "module"
 name = "test_fault"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:e78b4006942125a8e17e89cb7ed4c78c755dd8c02e41fd712bf51292baf82045"
+digest = "sha256:8fffffc6e383e0867590058b16eed590d9541369a2b87440639cd7e29292f7ce"
 reference = "rp2350/test_fault:0.0.1"
 
 [[artifact]]
@@ -854,7 +854,7 @@ kind = "module"
 name = "tier2_probe"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:13ddb79f2b34a67f597d8dbbe211f3696dc672f9dee449139caf35656d996594"
+digest = "sha256:8de4714ade4ae877fcedb24d461fe418d3d88ff87684cd8d7bd16b172ad46f99"
 reference = "bcm2712/tier2_probe:0.0.1"
 
 [[artifact]]
@@ -862,7 +862,7 @@ kind = "module"
 name = "tls"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:6f37c0aeff6112b81902930f9eef041ab7ad58066e14e57a410b0447dc24ee62"
+digest = "sha256:c417595fd819277faba8f3879806591961effa7a7dd341d50e4af225ccfbc29e"
 reference = "bcm2712/tls:0.0.1"
 
 [[artifact]]
@@ -870,7 +870,7 @@ kind = "module"
 name = "tls"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:66e4f3a594bea921ec4a6593a5f82ddcf36fa06541a527d0d97fd8cd00790456"
+digest = "sha256:0fc48db8f741ce2ca3f0600fae750628c912f6b1cdb9164bcb220be27aa09a90"
 reference = "rp2350/tls:0.0.1"
 
 [[artifact]]
@@ -878,7 +878,7 @@ kind = "module"
 name = "transport_buffer"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:46c435b16d3b705fdd2c3dae423edffc4c68099225a546871301b0bfcab288c1"
+digest = "sha256:3f4fd6ec5346290b6fe314ed33e4e7d4480191723f99c3fb20a713be27bbe892"
 reference = "bcm2712/transport_buffer:0.0.1"
 
 [[artifact]]
@@ -886,7 +886,7 @@ kind = "module"
 name = "transport_buffer"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:a42351dcdec2e71f7782d03af4e39ab577f00179c194c0031283b9fc080144af"
+digest = "sha256:d5456de5b0e53b2ad0ed22d21215d0e55fd23eb923e6709915f071c34ddea4b8"
 reference = "rp2350/transport_buffer:0.0.1"
 
 [[artifact]]
@@ -894,7 +894,7 @@ kind = "module"
 name = "uart_pl011"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:0425e3b29a30f204faa38fe9a5eb56bc8f1befa0190c7f7499dae04013466d6a"
+digest = "sha256:57ca6f959b9bdcec68b086c1679b17fbb30ec5d4a58d39fe8fcf04860d568e2b"
 reference = "rp2350/uart_pl011:0.0.1"
 
 [[artifact]]
@@ -902,7 +902,7 @@ kind = "module"
 name = "usb_midi_host"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:cabb6ea7abf77021394d092552de8931a490c2c6f07449c97e0cf7c402281209"
+digest = "sha256:5ef0f3a7b676500d680f28fd030a64eeb73a742c9fa4c96ee61a9e090592097c"
 reference = "bcm2712/usb_midi_host:0.0.1"
 
 [[artifact]]
@@ -910,7 +910,7 @@ kind = "module"
 name = "usb_midi_host"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:450144a924c09ce2d39ec335ee7b63e57058b427327c287371a425992a4f85cc"
+digest = "sha256:c3705b34f2d326b4d028590060cabaca7f50888f0c4bef285b678c2f885e034c"
 reference = "rp2350/usb_midi_host:0.0.1"
 
 [[artifact]]
@@ -918,7 +918,7 @@ kind = "module"
 name = "virtio_net"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:9fe8d222703349bb1adc32ccf6992fa9583eb11068a7274fcb035f413d558cc5"
+digest = "sha256:9e6fb9356b3bf4d39b594477802ea673fd1289584a60f99e46fe706f71464e83"
 reference = "bcm2712/virtio_net:0.0.1"
 
 [[artifact]]
@@ -926,7 +926,7 @@ kind = "module"
 name = "wake_snk"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:9b6ab9d5e1cf4a7e5e6557bafe956fc6f55ca06db782965cb392cc7e297583b3"
+digest = "sha256:9d5c1906df9f7343004be57360aedcc4872acb041c3fa8aec829c4031d783f49"
 reference = "bcm2712/wake_snk:0.0.1"
 
 [[artifact]]
@@ -934,7 +934,7 @@ kind = "module"
 name = "wake_src"
 project = "fluxor"
 target = "bcm2712"
-digest = "sha256:6d696e6a8280b67dca91b2890ba8a9248a6ac90f428e3a8a688fbb569b231fdb"
+digest = "sha256:165f06464f3d564c27af1d9f5d068357f184118f85cbc3c3baae6d663517ead2"
 reference = "bcm2712/wake_src:0.0.1"
 
 [[artifact]]
@@ -942,7 +942,7 @@ kind = "module"
 name = "wifi"
 project = "fluxor"
 target = "rp2350"
-digest = "sha256:26f5edc69950d04a3f2c8ac8db1ab8a10787a4a4b3979e35e0d716e416a89712"
+digest = "sha256:801a6bb61e82bcbb36f42292e2e4b14b1a565d97e4aad7a1cae754318cdc3f53"
 reference = "rp2350/wifi:0.0.1"
 
 [[artifact]]
@@ -950,7 +950,7 @@ kind = "runtime"
 name = "fluxor"
 project = "fluxor"
 target = "aarch64-unknown-linux-gnu"
-digest = "sha256:38a0a990d15ecb55deb95b7e1e104d907083dd64eb6c1abd6046eb745476c7b5"
+digest = "sha256:fb5a58a5e421089e7e31b3d597e8f746dd946c3b461815027703a9e876c2ed7e"
 reference = "fluxor/run/fluxor-aarch64-unknown-linux-gnu:0.0.1"
 
 [[artifact]]
@@ -958,19 +958,19 @@ kind = "runtime"
 name = "fluxor-linux"
 project = "fluxor"
 target = "aarch64-unknown-linux-gnu"
-digest = "sha256:d49ae0aeffb27bf28006e5db136f1995d03b49a905d4080c87d50ec09f57be9f"
+digest = "sha256:cbf9ad5a3230ccf288fbbcf9a46d61a53d78c391b10e1c9fd38518598b691064"
 reference = "fluxor/run/fluxor-linux-aarch64-unknown-linux-gnu:0.0.1"
 
 [[artifact]]
 kind = "source"
 name = "fluxor-abi"
 project = "fluxor"
-digest = "sha256:27a7778502010033411c17ebba48dace8839dfadf4b849ef7964b23ad854e81a"
+digest = "sha256:d2d0fbd76e6be5e60ae42259f88d55e51bd564e4a3bb46ff2882627e0100aa07"
 reference = "fluxor/src/fluxor-abi:0.0.1"
 
 [[artifact]]
 kind = "source"
 name = "fluxor-contracts"
 project = "fluxor"
-digest = "sha256:33765716159c7b33cb24fd027bb9c315a5ede8c1440f461b3995114ac349c855"
+digest = "sha256:188cbea378e4c7f34a5c8a12dc2f3e3d0429acbb278c37cbe06cc15a5049041d"
 reference = "fluxor/src/fluxor-contracts:0.0.1"

@@ -20,7 +20,7 @@ const HEADER: usize = 8;
 /// working value is held in limbs on the stack, and an isolate's stack is small
 /// enough that a bigger one would not fit beside the frames a program is
 /// already using.
-pub const MAX_LIMBS: usize = 64;
+pub const MAX_LIMBS: usize = 128;
 /// Limbs an operation may work through on the stack.
 const WORK_LIMBS: usize = MAX_LIMBS + 2;
 
