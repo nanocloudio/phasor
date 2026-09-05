@@ -1,6 +1,7 @@
 # The Library the Engine Implements
 
-Source: `modules/common/realm.rs`, `modules/common/vm.rs`.
+Source: `modules/common/realm.rs`, `modules/common/realm/`,
+`modules/common/vm/natives/`.
 
 This document defines what a program finds in its realm before it has done
 anything: the intrinsic objects, what each of them holds, and the rule that
@@ -22,12 +23,12 @@ realm costs about twenty kilobytes of heap rather than a megabyte.
 
 | Object | Holds |
 |---|---|
-| `Object` | `keys`, `values`, `entries`, `assign`, `freeze`, `isFrozen`, `getPrototypeOf`, `setPrototypeOf`, `defineProperty`, `getOwnPropertyDescriptor`, `getOwnPropertyNames`, `create`, `is` |
-| `Object.prototype` | `toString`, `valueOf`, `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable` |
+| `Object` | `keys`, `values`, `entries`, `assign`, `freeze`, `isFrozen`, `seal`, `isSealed`, `preventExtensions`, `isExtensible`, `getPrototypeOf`, `setPrototypeOf`, `defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyNames`, `create`, `is` |
+| `Object.prototype` | `toString`, `valueOf`, `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, and the legacy `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Array` | `isArray`, `of`, `from` |
 | `Array.prototype` | `push`, `pop`, `shift`, `unshift`, `slice`, `indexOf`, `includes`, `concat`, `join`, `map`, `filter`, `reduce`, `forEach`, `some`, `every`, `find`, `findIndex`, `reverse`, `fill`, `sort`, `values`, `keys`, `entries`, `toString`, `[Symbol.iterator]` |
 | `String` | `fromCharCode` |
-| `String.prototype` | `charAt`, `charCodeAt`, `codePointAt`, `at`, `indexOf`, `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `slice`, `substring`, `split`, `toUpperCase`, `toLowerCase`, `trim`, `repeat`, `padStart`, `padEnd`, `concat`, `replace`, `toString`, `valueOf`, `[Symbol.iterator]` |
+| `String.prototype` | `charAt`, `charCodeAt`, `codePointAt`, `at`, `indexOf`, `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `slice`, `substring`, `split`, `toUpperCase`, `toLowerCase`, `trim`, `repeat`, `padStart`, `padEnd`, `concat`, `replace`, `match`, `search`, `toString`, `valueOf`, `[Symbol.iterator]` |
 | `Number` | `isInteger`, `isFinite`, `isNaN`, `isSafeInteger`, `parseInt`, `parseFloat`, and the value constants |
 | `Number.prototype` | `toString` with a radix, `toFixed`, `toExponential`, `toPrecision`, `valueOf` |
 | `Boolean.prototype` | `toString`, `valueOf` |
@@ -36,17 +37,19 @@ realm costs about twenty kilobytes of heap rather than a megabyte.
 | `Symbol.prototype` | `toString`, `description` |
 | `Math` | `abs`, `floor`, `ceil`, `round`, `trunc`, `sqrt`, `pow`, `sign`, `min`, `max`, `hypot`, the transcendentals, and `PI`, `E`, `LN2`, `SQRT2`; `random` only where the host installs it, drawing a fixed-seed sequence that replays exactly |
 | `JSON` | `parse` with a reviver and `stringify` with a replacer function or list and a gap, pure functions of their arguments |
+| `Map`, `Set` | the keyed collections, deterministic in insertion order: `get`/`set`/`has`/`delete`/`clear`/`forEach` and `add`/`has`/`delete`/`clear`/`forEach`, with `keys`, `values`, and `entries` iterators |
+| `Reflect` | the object operations as callables over ordinary objects: `get`, `set`, `has`, `deleteProperty`, `ownKeys`, `getPrototypeOf`, `setPrototypeOf`, `isExtensible`, `preventExtensions`, `defineProperty`, `apply`, `construct` |
 | `WeakRef` | the constructor and `deref`, which always answers the target: no collection is ever observed |
 | `WeakMap`, `WeakSet` | `get`/`set`/`has`/`delete` and `add`/`has`/`delete`, keyed by objects and symbols only; nothing enumerates or counts the members, so a member stays until deleted |
 | `Proxy` | a handler between every operation and its target: the `get`, `set`, `has`, `deleteProperty`, `defineProperty`, `ownKeys`, `getOwnPropertyDescriptor`, `apply`, and `construct` traps, the target answering where a trap is absent; a `with` object, an object spread or rest, and `Reflect.set`'s receiver all go through them; `Proxy.revocable`; no `prototype` of its own |
-| `ArrayBuffer`, `SharedArrayBuffer`, the typed arrays, `DataView` | bytes held as numbers in an array the buffer owns, resizable to a `maxByteLength` given at construction; `slice` through the receiver's species; the eleven element kinds from `Int8Array` to `BigUint64Array` under `%TypedArray%` — `of`, `from`, the length and buffer accessors, iteration, `subarray`, `set`, `fill` — each view reading and writing its buffer little-endian by index, fixed or tracking its buffer's length; `SharedArrayBuffer` is the same bytes under its own name, since no thread here shares them |
-| `Date` | time values in UTC — the constructor in every form, `now`, `UTC`, `parse` of the ISO form, the getters, `setTime`, `toString`, `toISOString`, `toUTCString`, `toDateString`, `toTimeString`, `toJSON`, and `Symbol.toPrimitive`; "now" is the epoch unless the host provides a clock |
+| `ArrayBuffer`, `SharedArrayBuffer`, the typed arrays, `DataView` | bytes held as numbers in an array the buffer owns, resizable to a `maxByteLength` given at construction, or made immutable by `transferToImmutable`; `slice` through the receiver's species; the eleven element kinds from `Int8Array` to `BigUint64Array` under `%TypedArray%` — `of`, `from`, the length and buffer accessors, iteration, `subarray`, `set`, `fill` — each view reading and writing its buffer little-endian by index, fixed or tracking its buffer's length; `SharedArrayBuffer` is the same bytes under its own name, since no thread here shares them |
+| `Date` | time values in UTC — the constructor in every form, `now`, `UTC`, `parse` of the ISO form, the getters, `setTime` and the setters, `toString`, `toISOString`, `toUTCString`, `toDateString`, `toTimeString`, `toJSON`, and `Symbol.toPrimitive`; "now" is the epoch unless the host provides a clock |
 | `Function` | the constructor, which compiles its body — see §8 |
 | `Function.prototype` | `call`, `apply`, `bind`, and the poisoned `caller` and `arguments` accessors, which refuse |
 | `GeneratorFunction`, `AsyncGeneratorFunction`, and `AsyncFunction` | reached through such a function's `constructor`, never a global; each builds from source only where a host compiles for `Function`, and the generator kinds' `prototype` chains run through the generator prototypes to `%IteratorPrototype%` or `%AsyncIteratorPrototype%` |
-| `Promise` | `resolve`, `reject`, and `then` on its prototype — see `jobs.md` |
-| `Error` and its kinds | `name`, `message`, `toString`; the kinds are `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `EvalError`, and `URIError` |
-| The global object | the above by name, plus `eval`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `undefined`, `NaN`, `Infinity`, `globalThis` |
+| `Promise` | `resolve`, `reject`, and `then`, `catch`, `finally` on its prototype — see `jobs.md` |
+| `Error` and its kinds | `name`, `message`, `toString`; the kinds are `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `EvalError`, `URIError`, `SuppressedError`, and `AggregateError` |
+| The global object | the above by name, plus `eval`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `encodeURI`, `encodeURIComponent`, `decodeURI`, `decodeURIComponent`, `undefined`, `NaN`, `Infinity`, `globalThis` |
 | A host's `$262` | installed by a conformance host: `evalScript` runs a source as a script, `global` names the global object, and `createRealm` makes a fresh realm of intrinsics beside this one — up to four in a machine, each function running in the realm it was made in |
 
 `sort` is an insertion sort: it is stable, it allocates nothing, and the arrays
@@ -168,10 +171,11 @@ or after its group — a match's `groups` object holds the named captures on no
 prototype, and `$<name>` in a replacement string reads one.
 
 Not admitted, and refused rather than mis-read: lookbehind, Unicode property
-escapes, and the `u`, `v`, and `d` flags.
-The flags `g`, `i`, `m`, `s`, and `y` are admitted. Semantics are over code
-units, which is what the absence of `u` means; `ignoreCase` folds the ASCII and
-Latin-1 letters with a simple one-to-one mapping.
+escapes, and the `v` and `d` flags. The flags `g`, `i`, `m`, `s`, `u`, and
+`y` are admitted. Without `u` semantics are over code units; with it a
+character class holds code points and a surrogate pair is one character.
+`ignoreCase` folds the ASCII and Latin-1 letters with a simple one-to-one
+mapping.
 
 A counted repetition is written out rather than counted at run time, so
 `{n,m}` costs `m` copies of its body and a pattern that asks for more than the

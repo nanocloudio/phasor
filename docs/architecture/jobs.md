@@ -1,13 +1,13 @@
 # Jobs and Promises
 
 Source: `modules/common/job.rs`, `modules/common/promise.rs`,
-`modules/common/vm.rs`.
+`modules/common/vm/host.rs`, `modules/common/vm/coroutines.rs`.
 
 This document defines how work is deferred and how a promise settles: the
-queue, the promise state machine, `then`, the `Promise` constructor,
-`Promise.resolve`, `Promise.reject`, and the adoption of a thenable. Async
-function syntax is outside the admitted grammar and is refused by name, so
-deferral is written with promises directly.
+queue, the promise state machine, `then`, the `Promise` constructor, its
+statics, and the adoption of a thenable. An async function is a coroutine
+over the same machinery: `await` records a reaction on the awaited promise and
+suspends the frame, and the reaction's job resumes it.
 
 ## 1. The queue
 
@@ -17,9 +17,10 @@ queue is an ordinary failure, because the number of jobs a task may create is
 part of what a deployment admits.
 
 The machine runs jobs only when a host asks it to, and a host asks between
-tasks. Nothing runs a job in the middle of an expression, which is what makes
-the ordering a program observes the specification's rather than an artefact of
-when the engine happened to look.
+slices, after the running job has finished or yielded at a safe point. Nothing
+runs a job in the middle of an expression, which is what makes the ordering a
+program observes the specification's rather than an artefact of when the
+engine happened to look.
 
 ## 2. Promises
 
@@ -50,6 +51,16 @@ executor that throws rejects the promise, and an executor that settles nothing
 leaves it pending for ever, which is exactly what the language says.
 
 `Promise.resolve` and `Promise.reject` produce an already-settled promise.
+`Promise.withResolvers` produces a pending one with its two settling functions
+beside it. `Promise.all`, `allSettled`, `race`, and `any` combine an iterable
+of promises into one, each with the specification's ordering and its own
+rejection rule; `catch` and `finally` on the prototype are `then` with one
+handler fixed.
+`Promise.withResolvers` produces a pending one with its two settling functions
+beside it. `Promise.all`, `allSettled`, `race`, and `any` combine an iterable
+of promises into one, each with the specification's ordering and its own
+rejection rule; `catch` and `finally` on the prototype are `then` with one
+handler fixed.
 
 Resolving is not settling. A promise resolved with a value that has a callable
 `then` follows it rather than holding it: a job is queued that calls that `then`

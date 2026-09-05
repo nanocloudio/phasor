@@ -8,7 +8,7 @@
 //! Nothing here converts the sample into an ECMAScript value: what crosses the
 //! boundary is a number, and what the language makes of it is the engine's.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -16,14 +16,16 @@
     reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
 )]
 
-use core::ffi::c_void;
-
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
 
 #[path = "../../common/binding.rs"]
 mod binding;
@@ -35,11 +37,10 @@ mod numeric;
 mod softfloat;
 #[path = "../../common/value.rs"]
 mod value;
+#[path = "../../common/wire.rs"]
+mod wire;
 
 use binding::{CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
-
-const POLL_INPUT: u32 = 0x01;
-const POLL_OUTPUT: u32 = 0x02;
 
 /// Which observation a call is answered with.
 const SOURCE_MONOTONIC_MS: u8 = 0;
@@ -82,11 +83,7 @@ define_params! {
 /// # Safety
 /// `params` must be valid for reads of `params_len` bytes, or null.
 unsafe fn apply_params(state: &mut State, params: *const u8, params_len: usize) {
-    let tlv = !params.is_null()
-        && params_len >= 4
-        && *params == TLV_MAGIC
-        && *params.add(1) == TLV_VERSION;
-    if tlv {
+    if wire::params_are_tlv(params, params_len, TLV_MAGIC, TLV_VERSION) {
         parse_tlv(state, params, params_len);
     } else {
         set_defaults(state);
@@ -104,6 +101,8 @@ fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> Comple
             value: None,
         };
     }
+    // SAFETY: each sample is one call through the loader's syscall table, live
+    // for the module's lifetime.
     let sample = unsafe {
         match state.source {
             SOURCE_MONOTONIC_US => dev_micros(syscalls),
@@ -120,123 +119,64 @@ fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> Comple
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
+entry! {
+    State;
+    primary { request_in, reply_out }
+    inputs {}
+    outputs {}
+    params apply_params
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "the ABI fixes this signature: the loader passes the parameter block as a raw pointer and length, and the module reads it once under the contract that it is valid for that length"
-)]
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    params: *const u8,
-    params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<State>() {
-        return -2;
-    }
-    unsafe {
-        let table = syscalls.cast::<SyscallTable>();
-        let state = state.cast::<State>();
-        core::ptr::write_bytes(state.cast::<u8>(), 0, core::mem::size_of::<State>());
-        core::ptr::addr_of_mut!((*state).syscalls).write(table);
-        core::ptr::addr_of_mut!((*state).request_in).write(in_chan);
-        core::ptr::addr_of_mut!((*state).reply_out).write(out_chan);
-        apply_params(&mut *state, params, params_len);
-    }
-    0
-}
-
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.request_in < 0 || state.reply_out < 0 {
         return -2;
     }
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
     if state.phase == 1 {
         return 1;
     }
     // One request is taken only when there is room for its answer.
-    if state.staged + COMPLETION_FRAME <= state.replies.len() {
-        let poll = unsafe { (syscalls.channel_poll)(state.request_in, POLL_INPUT) };
-        if poll > 0 && (poll as u32) & POLL_INPUT != 0 {
-            let remaining = CALL_FRAME.saturating_sub(state.filled);
-            if remaining > 0 {
-                let read = unsafe {
-                    (syscalls.channel_read)(
-                        state.request_in,
-                        state.request.as_mut_ptr().add(state.filled),
-                        remaining,
-                    )
-                };
-                if read > 0 {
-                    state.filled += usize::try_from(read).unwrap_or(0).min(remaining);
-                }
+    if state.staged + COMPLETION_FRAME <= state.replies.len()
+        && wire::take_frame(
+            syscalls,
+            state.request_in,
+            &mut state.request,
+            &mut state.filled,
+        )
+    {
+        state.filled = 0;
+        if let Some(record) = CallRecord::decode(&state.request) {
+            let reply = answer(state, &record, syscalls);
+            let at = state.staged;
+            let frame = reply.encode();
+            if let Some(slot) = state.replies.get_mut(at..at + COMPLETION_FRAME) {
+                slot.copy_from_slice(&frame);
+                state.staged = at + COMPLETION_FRAME;
             }
-            if state.filled == CALL_FRAME {
-                state.filled = 0;
-                if let Some(record) = CallRecord::decode(&state.request) {
-                    let reply = answer(state, &record, syscalls);
-                    let at = state.staged;
-                    let frame = reply.encode();
-                    if let Some(slot) = state.replies.get_mut(at..at + COMPLETION_FRAME) {
-                        slot.copy_from_slice(&frame);
-                        state.staged = at + COMPLETION_FRAME;
-                    }
-                    state.answered = state.answered.saturating_add(1);
-                }
-            }
+            state.answered = state.answered.saturating_add(1);
         }
     }
 
-    if state.written < state.staged {
-        let poll = unsafe { (syscalls.channel_poll)(state.reply_out, POLL_OUTPUT) };
-        if poll > 0 && (poll as u32) & POLL_OUTPUT != 0 {
-            let remaining = state.staged.saturating_sub(state.written);
-            let count = unsafe {
-                (syscalls.channel_write)(
-                    state.reply_out,
-                    state.replies.as_ptr().add(state.written),
-                    remaining,
-                )
-            };
-            if count > 0 {
-                state.written += usize::try_from(count).unwrap_or(0).min(remaining);
-            }
-            if state.written >= state.staged {
-                state.written = 0;
-                state.staged = 0;
-            }
-        }
-    }
+    wire::push_staged(
+        syscalls,
+        state.reply_out,
+        &state.replies,
+        &mut state.staged,
+        &mut state.written,
+    );
 
-    if !state.hung_up {
-        let poll = unsafe { (syscalls.channel_poll)(state.request_in, POLL_HUP) };
-        if poll > 0 && (poll as u32) & POLL_HUP != 0 {
-            state.hung_up = true;
-        }
+    if !state.hung_up && wire::hung_up(syscalls, state.request_in) {
+        state.hung_up = true;
     }
     if state.hung_up && state.staged == 0 && state.filled == 0 {
         state.phase = 1;

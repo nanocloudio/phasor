@@ -4,8 +4,11 @@
 //! points at. Keeping the layouts here means the heap needs no knowledge of the
 //! object model, and the object model needs none of collection.
 
+use crate::env::layout as environment;
 use crate::heap::{CellKind, Heap, HeapError, Phase};
-use crate::value::{Handle, Tag, Value};
+use crate::object::layout as object;
+use crate::promise::layout as reactions;
+use crate::value::{field, Handle, Tag, Value};
 
 /// Child handles read from one cell before they are shaded.
 const CHUNK: usize = 32;
@@ -59,8 +62,7 @@ fn trace(heap: &mut Heap<'_>, handle: Handle) {
         CellKind::PropertyTable => trace_property_table(heap, handle),
         CellKind::Environment => trace_environment(heap, handle),
         CellKind::Elements => trace_reactions(heap, handle),
-        // A string, symbol, or BigInt holds no reference, and the remaining
-        // kinds are not built yet.
+        // A string, symbol, or BigInt holds no reference.
         _ => {}
     }
 }
@@ -72,37 +74,29 @@ fn trace_object(heap: &mut Heap<'_>, handle: Handle) {
         let Ok(cell) = heap.cell(handle) else {
             return;
         };
-        push_value(&mut children, &mut count, read_value(cell, 0));
-        let Some(table) = field8(cell, 12) else {
+        push_value(
+            &mut children,
+            &mut count,
+            Value::decode_at(cell, object::PROTOTYPE),
+        );
+        if cell.len() < object::INTERNAL {
             return;
-        };
-        let table_index = u32::from_le_bytes([table[0], table[1], table[2], table[3]]);
-        if table_index != u32::MAX {
-            let generation = u32::from_le_bytes([table[4], table[5], table[6], table[7]]);
-            push_handle(
-                &mut children,
-                &mut count,
-                Handle::new(table_index, generation),
-            );
         }
-        push_value(&mut children, &mut count, read_value(cell, 28));
+        if let Some(table) = Handle::read_at(cell, object::TABLE) {
+            push_handle(&mut children, &mut count, table);
+        }
+        push_value(
+            &mut children,
+            &mut count,
+            Value::decode_at(cell, object::SLOT),
+        );
         // A method's home object, when it has one.
-        if let Some(home) = field8(cell, 48) {
-            let index = u32::from_le_bytes([home[0], home[1], home[2], home[3]]);
-            if index != u32::MAX {
-                let generation = u32::from_le_bytes([home[4], home[5], home[6], home[7]]);
-                push_handle(&mut children, &mut count, Handle::new(index, generation));
-            }
+        if let Some(home) = Handle::read_at(cell, object::HOME) {
+            push_handle(&mut children, &mut count, home);
         }
         // A promise's reaction list, when it has one.
-        if let Some(reactions) = field8(cell, 40) {
-            let index =
-                u32::from_le_bytes([reactions[0], reactions[1], reactions[2], reactions[3]]);
-            if index != u32::MAX {
-                let generation =
-                    u32::from_le_bytes([reactions[4], reactions[5], reactions[6], reactions[7]]);
-                push_handle(&mut children, &mut count, Handle::new(index, generation));
-            }
+        if let Some(reactions) = Handle::read_at(cell, object::REACTIONS) {
+            push_handle(&mut children, &mut count, reactions);
         }
     }
     for &child in children.get(..count).unwrap_or(&[]) {
@@ -111,8 +105,8 @@ fn trace_object(heap: &mut Heap<'_>, handle: Handle) {
 }
 
 fn trace_property_table(heap: &mut Heap<'_>, handle: Handle) {
-    const HEADER: usize = 8;
-    const RECORD: usize = 32;
+    const HEADER: usize = object::TABLE_HEADER;
+    const RECORD: usize = object::RECORD;
     let mut index = 0usize;
     loop {
         let mut children = [Handle::new(0, 0); CHUNK];
@@ -122,7 +116,7 @@ fn trace_property_table(heap: &mut Heap<'_>, handle: Handle) {
             let Ok(cell) = heap.cell(handle) else {
                 return;
             };
-            let Some(header) = field4(cell, 0) else {
+            let Some(header) = field::<4>(cell, object::TABLE_COUNT) else {
                 return;
             };
             let total = u32::from_le_bytes(header) as usize;
@@ -135,18 +129,21 @@ fn trace_property_table(heap: &mut Heap<'_>, handle: Handle) {
                     break;
                 };
                 // A name or symbol key is a handle; an index key is not.
-                if record.first().copied().unwrap_or(0) != 0 {
-                    if let Some(payload) = field8(record, 8) {
-                        let value = u64::from_le_bytes(payload);
+                if record.get(object::record::KIND).copied().unwrap_or(0) != 0 {
+                    if let Some(payload) = field::<8>(record, object::record::KEY) {
                         push_handle(
                             &mut children,
                             &mut count,
-                            Handle::new((value & 0xFFFF_FFFF) as u32, (value >> 32) as u32),
+                            Handle::unpack(u64::from_le_bytes(payload)),
                         );
                     }
                 }
-                push_value(&mut children, &mut count, read_value(record, 16));
-                push_short(&mut children, &mut count, record, 25);
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(record, object::record::FIRST),
+                );
+                push_short(&mut children, &mut count, record, object::record::SECOND);
                 index += 1;
                 records += 1;
             }
@@ -161,8 +158,8 @@ fn trace_property_table(heap: &mut Heap<'_>, handle: Handle) {
 }
 
 fn trace_environment(heap: &mut Heap<'_>, handle: Handle) {
-    const HEADER: usize = 56;
-    const BINDING: usize = 24;
+    const HEADER: usize = environment::HEADER;
+    const BINDING: usize = environment::BINDING;
     let mut index = 0usize;
     let mut first = true;
     loop {
@@ -174,13 +171,29 @@ fn trace_environment(heap: &mut Heap<'_>, handle: Handle) {
                 return;
             };
             if first {
-                push_value(&mut children, &mut count, read_value(cell, 12));
-                push_value(&mut children, &mut count, read_value(cell, 21));
-                push_value(&mut children, &mut count, read_value(cell, 32));
-                push_value(&mut children, &mut count, read_value(cell, 41));
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(cell, environment::PARENT),
+                );
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(cell, environment::THIS),
+                );
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(cell, environment::NEW_TARGET),
+                );
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(cell, environment::FUNCTION),
+                );
                 first = false;
             }
-            let Some(header) = field4(cell, 4) else {
+            let Some(header) = field::<4>(cell, environment::COUNT) else {
                 return;
             };
             let total = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
@@ -192,7 +205,7 @@ fn trace_environment(heap: &mut Heap<'_>, handle: Handle) {
                 let Some(record) = cell.get(at..at + BINDING) else {
                     break;
                 };
-                if let Some(name) = field8(record, 4) {
+                if let Some(name) = field::<8>(record, environment::binding::NAME) {
                     push_handle(
                         &mut children,
                         &mut count,
@@ -202,7 +215,11 @@ fn trace_environment(heap: &mut Heap<'_>, handle: Handle) {
                         ),
                     );
                 }
-                push_value(&mut children, &mut count, read_value(record, 12));
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(record, environment::binding::VALUE),
+                );
                 index += 1;
                 bindings += 1;
             }
@@ -218,8 +235,8 @@ fn trace_environment(heap: &mut Heap<'_>, handle: Handle) {
 
 /// A reaction list: a count, then records of a kind and two values.
 fn trace_reactions(heap: &mut Heap<'_>, handle: Handle) {
-    const HEADER: usize = 8;
-    const RECORD: usize = 32;
+    const HEADER: usize = reactions::HEADER;
+    const RECORD: usize = reactions::RECORD;
     let mut index = 0usize;
     loop {
         let mut children = [Handle::new(0, 0); CHUNK];
@@ -229,7 +246,7 @@ fn trace_reactions(heap: &mut Heap<'_>, handle: Handle) {
             let Ok(cell) = heap.cell(handle) else {
                 return;
             };
-            let Some(header) = field4(cell, 0) else {
+            let Some(header) = field::<4>(cell, reactions::COUNT) else {
                 return;
             };
             let total = u32::from_le_bytes(header) as usize;
@@ -241,9 +258,21 @@ fn trace_reactions(heap: &mut Heap<'_>, handle: Handle) {
                 let Some(record) = cell.get(at..at + RECORD) else {
                     break;
                 };
-                push_value(&mut children, &mut count, read_value(record, 1));
-                push_value(&mut children, &mut count, read_value(record, 10));
-                push_value(&mut children, &mut count, read_value(record, 19));
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(record, reactions::record::ON_FULFILLED),
+                );
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(record, reactions::record::ON_REJECTED),
+                );
+                push_value(
+                    &mut children,
+                    &mut count,
+                    Value::decode_at(record, reactions::record::DERIVED),
+                );
                 index += 1;
                 records += 1;
             }
@@ -272,15 +301,7 @@ fn push_handle(children: &mut [Handle], count: &mut usize, handle: Handle) {
 }
 
 fn push_short(children: &mut [Handle], count: &mut usize, bytes: &[u8], at: usize) {
-    let Some(fields) = field7(bytes, at) else {
-        return;
-    };
-    if fields[0] != Tag::Object as u8 {
-        return;
-    }
-    let index = u32::from_le_bytes([fields[1], fields[2], fields[3], fields[4]]);
-    let generation = u32::from(u16::from_le_bytes([fields[5], fields[6]]));
-    push_handle(children, count, Handle::new(index, generation));
+    push_value(children, count, Value::decode_short_at(bytes, at));
 }
 
 const fn holds_reference(value: &Value) -> bool {
@@ -288,42 +309,4 @@ const fn holds_reference(value: &Value) -> bool {
         value.tag(),
         Tag::String | Tag::Symbol | Tag::BigInt | Tag::Object
     )
-}
-
-/// Fixed-width reads, each checked once, so no access can fail at run time.
-fn field4(bytes: &[u8], at: usize) -> Option<[u8; 4]> {
-    <[u8; 4]>::try_from(bytes.get(at..at + 4)?).ok()
-}
-
-fn field7(bytes: &[u8], at: usize) -> Option<[u8; 7]> {
-    <[u8; 7]>::try_from(bytes.get(at..at + 7)?).ok()
-}
-
-fn field8(bytes: &[u8], at: usize) -> Option<[u8; 8]> {
-    <[u8; 8]>::try_from(bytes.get(at..at + 8)?).ok()
-}
-
-fn field9(bytes: &[u8], at: usize) -> Option<[u8; 9]> {
-    <[u8; 9]>::try_from(bytes.get(at..at + 9)?).ok()
-}
-
-/// Decode a value stored as a tag byte and eight payload bytes.
-fn read_value(bytes: &[u8], at: usize) -> Value {
-    let Some(fields) = field9(bytes, at) else {
-        return Value::UNDEFINED;
-    };
-    let payload = u64::from_le_bytes([
-        fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7], fields[8],
-    ]);
-    let handle = Handle::new((payload & 0xFFFF_FFFF) as u32, (payload >> 32) as u32);
-    match fields[0] {
-        1 => Value::NULL,
-        2 => Value::boolean(payload != 0),
-        3 => Value::number(f64::from_bits(payload)),
-        4 => Value::string(handle),
-        5 => Value::symbol(handle),
-        6 => Value::big_int(handle),
-        7 => Value::object(handle),
-        _ => Value::UNDEFINED,
-    }
 }

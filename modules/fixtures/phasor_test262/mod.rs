@@ -24,7 +24,7 @@
 //! measures how much of the corpus the implemented grammar reaches rather than
 //! how correct it is.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -32,13 +32,15 @@
     reason = "the Fluxor ABI source is mounted as one surface and this fixture consumes a subset"
 )]
 
-use core::ffi::c_void;
-
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
 
 #[path = "../../common/arena.rs"]
 mod arena;
@@ -54,18 +56,19 @@ mod parse;
 mod softfloat;
 #[path = "../../common/source.rs"]
 mod source;
+#[path = "../../common/text.rs"]
+mod text;
 #[path = "../../common/unicode_id.rs"]
 mod unicode_id;
 #[path = "../../common/value.rs"]
 mod value;
+#[path = "../../common/wire.rs"]
+mod wire;
 
 use arena::{Arena, Node, NodeKind};
 use lex::{Goal, Keyword, Lexer, Punctuator, TokenKind};
 use parse::Parser;
 use source::{Limits, LineStart, LineTable};
-
-const POLL_INPUT: u32 = 0x01;
-const POLL_OUTPUT: u32 = 0x02;
 
 /// Largest case this module tokenizes. Larger cases are counted as skipped
 /// rather than silently dropped.
@@ -278,30 +281,6 @@ fn drain(state: &mut State) {
     }
 }
 
-/// Write a decimal number into `out`, returning the bytes used.
-fn write_u32(value: u32, out: &mut [u8]) -> usize {
-    let mut digits = [0u8; 10];
-    let mut count = 0usize;
-    let mut remaining = value;
-    loop {
-        digits[count] = b'0' + u8::try_from(remaining % 10).unwrap_or(0);
-        count += 1;
-        remaining /= 10;
-        if remaining == 0 {
-            break;
-        }
-    }
-    if out.len() < count {
-        return 0;
-    }
-    let mut index = 0usize;
-    while index < count {
-        out[index] = digits[count - 1 - index];
-        index += 1;
-    }
-    count
-}
-
 /// Render one report line into `state.report`.
 fn compose(state: &mut State, line: u16) -> usize {
     let mut out = [0u8; 64];
@@ -314,7 +293,7 @@ fn compose(state: &mut State, line: u16) -> usize {
         out[at + 3] = b'a';
         out[at + 4] = b' ';
         at += 5;
-        at += write_u32(u32::from(line), &mut out[at..]);
+        at += text::put_u32(&mut out[at..], u32::from(line));
         for value in [
             area.positive,
             area.passed,
@@ -324,17 +303,17 @@ fn compose(state: &mut State, line: u16) -> usize {
         ] {
             out[at] = b' ';
             at += 1;
-            at += write_u32(value, &mut out[at..]);
+            at += text::put_u32(&mut out[at..], value);
         }
     } else {
         let prefix = b"phasor-test262: ";
         out[at..at + prefix.len()].copy_from_slice(prefix);
         at += prefix.len();
-        at += write_u32(state.unexpected, &mut out[at..]);
+        at += text::put_u32(&mut out[at..], state.unexpected);
         let suffix = b" unexpected failures in ";
         out[at..at + suffix.len()].copy_from_slice(suffix);
         at += suffix.len();
-        at += write_u32(state.cases, &mut out[at..]);
+        at += text::put_u32(&mut out[at..], state.cases);
         let tail = b" cases";
         out[at..at + tail.len()].copy_from_slice(tail);
         at += tail.len();
@@ -345,56 +324,27 @@ fn compose(state: &mut State, line: u16) -> usize {
     at
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
+entry! {
+    State;
+    primary { input, report_out }
+    inputs {}
+    outputs { exit_out = 1 }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<State>() {
-        return -2;
-    }
-    unsafe {
-        let table = syscalls.cast::<SyscallTable>();
-        let state = state.cast::<State>();
-        core::ptr::write_bytes(state.cast::<u8>(), 0, core::mem::size_of::<State>());
-        core::ptr::addr_of_mut!((*state).syscalls).write(table);
-        core::ptr::addr_of_mut!((*state).input).write(in_chan);
-        core::ptr::addr_of_mut!((*state).report_out).write(out_chan);
-        core::ptr::addr_of_mut!((*state).exit_out).write(dev_channel_port(&*table, 1, 1));
-    }
-    0
-}
-
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.input < 0 || state.report_out < 0 {
         return -2;
     }
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
 
     if state.phase == 3 {
@@ -403,16 +353,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     // Finish any report line that is still being written.
     if state.report_length > state.report_offset {
-        let offset = state.report_offset;
-        let remaining = state.report_length - offset;
-        let written = unsafe {
-            (syscalls.channel_write)(state.report_out, state.report[offset..].as_ptr(), remaining)
-        };
-        if written <= 0 {
-            return 0;
-        }
-        state.report_offset += usize::try_from(written).unwrap_or(0).min(remaining);
-        if state.report_length > state.report_offset {
+        let report = state.report.get(..state.report_length).unwrap_or(&[]);
+        if !wire::push_progress(syscalls, state.report_out, report, &mut state.report_offset) {
             return 0;
         }
         state.report_offset = 0;
@@ -434,39 +376,29 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     if state.phase == 2 {
-        let code = i32::from(state.unexpected != 0).to_le_bytes();
-        let written =
-            unsafe { (syscalls.channel_write)(state.exit_out, code.as_ptr(), code.len()) };
-        if written != i32::try_from(code.len()).unwrap_or(i32::MAX) {
+        if !wire::push_exit(syscalls, state.exit_out, state.unexpected != 0) {
             return 0;
         }
         state.phase = 3;
         return 1;
     }
 
-    let poll = unsafe { (syscalls.channel_poll)(state.input, POLL_INPUT | POLL_HUP) };
-    if poll <= 0 {
-        return 0;
-    }
-
-    if (poll as u32) & POLL_INPUT != 0 {
+    if wire::has_input(syscalls, state.input) {
         let offset = state.filled;
-        let capacity = state.buffer.len().saturating_sub(offset);
-        if capacity == 0 {
+        let room = state.buffer.get_mut(offset..).unwrap_or(&mut []);
+        if room.is_empty() {
             drain(state);
             return 0;
         }
-        let read = unsafe {
-            (syscalls.channel_read)(state.input, state.buffer.as_mut_ptr().add(offset), capacity)
-        };
+        let read = wire::read_available(syscalls, state.input, room);
         if read > 0 {
-            state.filled += usize::try_from(read).unwrap_or(0).min(capacity);
+            state.filled += read;
             drain(state);
         }
         return 0;
     }
 
-    if (poll as u32) & POLL_HUP == 0 {
+    if !wire::hung_up(syscalls, state.input) {
         return 0;
     }
 

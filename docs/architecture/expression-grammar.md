@@ -1,14 +1,15 @@
 # Grammar and Syntax Arena
 
-Source: `modules/common/parse.rs`, `modules/common/arena.rs`.
+Source: `modules/common/parse.rs`, `modules/common/parse/`, `modules/common/arena.rs`.
 
 This document defines the surface Phasor parses, the tree it builds, and the
 bounds that parse works within. A source is a script or a module: a list of
 statements, in which expressions, declarations, functions, classes,
 generators, async functions, and destructuring patterns appear, and — in a
 module — `import` and `export` declarations at the top level. What remains
-outside the admitted grammar — decorators and private-name deletion among
-them — is refused by name rather than mis-parsed.
+outside the admitted grammar — `import.meta`, a `super` reference outside a
+method, `new.target` outside a function, `await` and `yield` outside their
+contexts, `with` in strict code — is refused by name rather than mis-parsed.
 
 ## 1. Feature versioning
 
@@ -22,7 +23,7 @@ different list is refused rather than run.
 | `syntax.primary` | 3 | Identifier references, `this`, `null`, `true`, `false`, numeric, BigInt, string and template literals |
 | `syntax.array` | 3 | Array literals with elisions, spread elements, and a trailing comma |
 | `syntax.object` | 3 | Object literals with named, string, numeric, computed, shorthand, and spread properties, accessors, and plain, generator, and async methods |
-| `syntax.member` | 4 | `.`, `[]`, calls with spread arguments, `new` (over a tagged template too), tagged templates, and `import(…)` with its `source` and `defer` phases, answered by a rejecting promise |
+| `syntax.member` | 4 | `.`, `[]`, calls with spread arguments, `new` (over a tagged template too), tagged templates, `import(…)` resolving against the closure the host staged, `import.defer(…)` answering a namespace whose module runs on first meaningful use, and `import.source(…)`, answered by a rejecting promise |
 | `syntax.optional-chain` | 1 | `?.`, `?.[`, and `?.(` |
 | `syntax.operators` | 1 | Unary, update, binary, relational, equality, bitwise, logical, and nullish operators |
 | `syntax.conditional` | 1 | `test ? consequent : alternate` |
@@ -69,10 +70,10 @@ other reading of a token already scanned, the parser rewinds the lexer to that
 token's own start and re-scans it, which crosses no trivia and so leaves the
 line table exact.
 
-Automatic semicolon insertion belongs to the statement grammar, which does not
-exist yet. The one place a line terminator already matters is a postfix `++` or
-`--`: a terminator before it ends the expression instead, and the token records
-whether one appeared.
+Automatic semicolon insertion is decided in the statement grammar (§1a) from
+the line-terminator flag each token carries. Inside an expression the one place
+a terminator matters is a postfix `++` or `--`: a terminator before it ends the
+expression instead.
 
 ## 3. The syntax arena
 
@@ -94,7 +95,7 @@ moved, mapped, or handed to a later phase without relocation.
 
 | Limit | Ceiling | Diagnostic |
 |---|---|---|
-| Parser recursion entries | 128 | `expression-too-deep` |
+| Parser recursion entries | 512 | `expression-too-deep` |
 | Syntax nodes per unit | 262144 | `too-many-syntax-nodes` |
 
 The depth limit counts parser recursion entries rather than source nesting
@@ -111,12 +112,17 @@ is published.
 
 These are rejected during the parse rather than deferred:
 
-- an assignment or update target that is not an identifier, member access, or
-  index access;
+- an assignment or update target that is not an identifier, member access,
+  index access, or destructuring pattern;
 - an assignment to any part of an optional chain;
 - `**` applied to an unparenthesised unary expression;
-- `??` mixed with `&&` or `||` without parentheses; and
-- a private name, which has no admitted context while classes are unparsed.
+- `??` mixed with `&&` or `||` without parentheses;
+- an arrow head that cannot be a parameter list; and
+- a private name outside a class body.
 
-The remaining early errors belong to the static-semantics phase, which is not
-implemented.
+The remaining early errors — duplicate bindings, assignment to a constant, an
+undeclared label, a `break` or `continue` with nowhere to go, a `return`
+outside a function, the strict-mode restrictions on `eval`, `arguments`, and
+parameter names, and the restrictions on `super`, `new.target`, and `await` —
+are enforced when the tree is lowered, where the scopes that decide them exist.
+Each has its own code in the [diagnostic vocabulary](../reference/diagnostics.md).

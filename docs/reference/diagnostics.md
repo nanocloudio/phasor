@@ -155,6 +155,7 @@ token that revealed it, so an invalid assignment target spans the target.
 | `0x0215` | `return-outside-function` | error | none |
 | `0x0216` | `strict-assignment-to-restricted-name` | error | none |
 | `0x0217` | `strict-invalid-parameter` | error | none |
+| `0x0218` | `eval-restricted-declaration` | error | none |
 
 Enumerated arguments:
 
@@ -165,7 +166,7 @@ belong to something other than the code assigning to them.
 - syntax feature: `0` arrow function, `1` function expression, `2` class
   expression, `3` async, `4` yield, `5` super, `6` import, `7` `new.target`,
   `8` destructuring, `9` method definition, `10` regular-expression pattern,
-  `11` statement.
+  `11` statement, `12` class fields.
 
 ## 6. Bytecode codes
 
@@ -207,17 +208,19 @@ Enumerated arguments:
 
 - image failure: `0` magic, `1` format digest, `2` truncated, `3` overflow,
   `4` feature digest.
-- image feature: `0` BigInt.
+- image feature: `0` BigInt (retired with its code).
 
 `feature-list-mismatch` means the image was compiled against a different
 admitted language. The encoding may match exactly; the semantics behind it do
 not, so the image is refused rather than reinterpreted.
 
-`image-not-admitted` names a construct this build does not implement. It is
-raised when the image is admitted rather than when the construct is reached, so
-a program either runs or never starts. `lowering-not-admitted` is the same rule
-one phase earlier: source this build cannot lower is refused where it is
-written. Both sides matter, because an image may have been compiled elsewhere.
+`image-not-admitted` is retired: it named a construct the machine could not
+run, refused when the image was admitted rather than when the construct was
+reached. Every construct the admitted feature list names runs, so no path
+raises it, and the number is kept rather than reassigned (§8).
+`lowering-not-admitted` is the same rule at the front end: source the lowering
+cannot express is refused where it is written, so a program either compiles
+whole or not at all.
 
 ## 6a. Termination codes
 

@@ -1,13 +1,13 @@
 # Bytecode, Verification, and Content Identity
 
 Source: `modules/common/bytecode.rs`, `modules/common/emit.rs`,
-`modules/common/lower.rs`, `modules/common/verify.rs`,
+`modules/common/lower.rs`, `modules/common/lower/`, `modules/common/verify.rs`,
 `modules/common/digest.rs`.
 
-This document defines the instruction encoding, the unit image, how an
-expression is lowered into it, what the verifier proves before anything
-executes, and how an artefact is identified. There is no virtual machine yet:
-the instructions are produced and verified, not interpreted.
+This document defines the instruction encoding, the unit image, how a program
+is lowered into it, what the verifier proves before anything executes, and how
+an artefact is identified. The machine that runs the result is defined in
+[interpreter.md](interpreter.md).
 
 ## 1. Machine model
 
@@ -48,11 +48,14 @@ A unit is one canonical byte image: little-endian fixed-width integers, explicit
 offsets, no implicit padding, and no pointers. Sections appear in one order:
 
 ```text
-header | functions | constants | constant data | code | exception regions | safe points
+header | functions | constants | constant data | code | exception regions | safe points | imports | exports | eval sites
 ```
 
-The header carries the magic `PHBC`, the format digest, the section counts, and
-the entry function. Function records are fixed-width, so a function is addressed
+The header carries the magic `PHBC`, the format digest, the feature digest, the
+section counts, the entry function, and the unit's flags, of which one says the
+unit is a module. The import and export tables exist for a module — see
+[modules.md](modules.md) — and the eval-site records say, for each direct
+`eval`, which bindings are visible there. Function records are fixed-width, so a function is addressed
 by index without a table scan. Constant records carry a kind and two payload
 words: a Number holds the two halves of its binary64 bits, and a string, key, or
 BigInt holds an offset and length into the constant data. Strings and keys are
@@ -76,23 +79,19 @@ naming the first register is the receiver, the count includes it, and the
 verifier checks the whole window against the frame. A construct passes its
 arguments the same way without a receiver.
 
-An identifier reference lowers to a global load, because lexical environments do
-not exist yet; the same instruction will resolve through a scope chain when they
-do. Short-circuiting constructs lower to branches: `&&`, `||`, `??`, their
+An identifier reference lowers to a context slot when a scope declares it and
+to a global load otherwise (§4a). Short-circuiting constructs lower to branches: `&&`, `||`, `??`, their
 assignment forms, the conditional operator, and each optional link in a chain.
 A template lowers to a running concatenation, a string literal to a constant
 load, and a numeric literal to an immediate when its value is exactly a signed
 32-bit integer and to a constant otherwise.
 
-A construct the parser accepts but this build has no value for — a BigInt
-literal — is reported as `lowering-not-admitted` rather than silently dropped.
-A spread walks whatever its operand iterates, so it lowers to an iteration
-rather than to an opcode of its own. An image is checked for the same constructs when it is admitted, and
-refused as `image-not-admitted`: an image may have been compiled by another
-build, and a run that stops half way through is worse than one that never
-started. The context operations are not refused there. Nothing this build lowers
-emits them, the verifier models their depth, and the machine refuses them where
-they are reached.
+A construct the parser accepts but the lowering cannot express — a label the
+builder ran out of room for, a target no reference form covers — is reported as
+`lowering-not-admitted` rather than silently dropped, where it is written. A
+spread walks whatever its operand iterates, so it lowers to an iteration rather
+than to an opcode of its own. A BigInt literal is carried as its digits and
+radix and becomes an exact integer when the image runs.
 
 ## 4a. Names, scopes, and closures
 

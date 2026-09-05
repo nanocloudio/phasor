@@ -4,10 +4,10 @@ Source: `modules/common/lex.rs`, `modules/common/source.rs`,
 `modules/common/numeric.rs`, `modules/common/unicode_id.rs`.
 
 This document defines the token surface Phasor admits, the exact bounds every
-source transfer is checked against, and the way that surface is versioned. It
-covers phase 1 of the front end: decoding and lexing. Syntactic production,
-static semantics, and lowering are the phases after it, and `phasor_compile`
-hosts them all.
+source is checked against, and the way that surface is versioned. It covers
+the first stage of the front end: decoding and lexing. Parsing, static
+semantics, and lowering are the stages after it, and `phasor_compile` hosts
+them all.
 
 ## 1. Feature versioning
 
@@ -37,19 +37,19 @@ The whole list — lexical, syntax, and runtime records — is what the digest
 covers; each layer's own records are documented with that layer. The tokenizer
 implements exactly the surface these records describe.
 
-Absent from version 1, and therefore a diagnostic rather than a silent
-acceptance: HTML-like comments, legacy octal literals, legacy octal escape
-sequences, and the regular-expression pattern grammar. Each becomes a separate
-feature record with its own version when it is implemented. Raising any version
-changes the feature digest and invalidates every unit compiled under the old
-one.
+HTML-like comments are not admitted: `<!--` and `-->` lex as punctuators and
+fail in the parser. A legacy octal literal or escape is scanned and marked, so
+sloppy code keeps it and strict code refuses it by name. The
+regular-expression pattern grammar belongs to the library, where the pattern
+is compiled when the image runs. Raising any version changes the feature
+digest and invalidates every unit compiled under the old one.
 
 ## 2. Source admission and decoding
 
-A source transfer arrives as bytes with a declared total, a logical digest, and
-the limits it was admitted under. The compiler reserves storage for the declared
-total before accepting the transfer and rejects it if the total exceeds any
-limit in section 3. Nothing is lexed before the transfer commits.
+A source arrives as one stream of bytes ended by the writer's hang-up. The
+compiler stages it whole into storage of a declared capacity, refuses a stream
+that overflows it, and checks the staged bytes against every limit in section
+3. Nothing is lexed before the stream is complete.
 
 Decoding rules:
 
@@ -85,7 +85,7 @@ ordinary diagnostic, never a panic, truncation, or partial unit.
 | Lines per unit | 262144 | `too-many-lines` |
 | Bytes per line | 65536 | `line-too-long` |
 | Tokens per unit | 262144 | `too-many-tokens` |
-| UTF-16 code units per identifier | 256 | `identifier-too-long` |
+| UTF-16 code units per identifier | 1024 | `identifier-too-long` |
 | UTF-16 code units per string literal | 65536 | `literal-too-long` |
 | UTF-16 code units per template part | 65536 | `literal-too-long` |
 | Source bytes per numeric literal | 4096 | `numeric-literal-too-long` |
@@ -99,16 +99,16 @@ each line, so a line and column pair is derived on demand rather than carried on
 every token. The table has one entry per line and is bounded by the line
 ceiling.
 
-## 4. Bounded, resumable scanning
+## 4. Bounded scanning
 
-The compiler scans a bounded number of source bytes per module step and stores
-its cursor in fmod state. A step ends at a token boundary or inside a
-long literal at a code-unit boundary, and the next step resumes from the stored
-cursor with identical results. No scan loop runs until the input is exhausted.
-
-Fuel is charged for consumed source bytes, produced tokens, and code units
-copied into literal storage, so a single pathological token cannot hide
-unbounded work behind one token count.
+The lexer holds its cursor in the storage its caller hands it and spends fuel
+as it scans: fuel is charged for consumed source bytes, produced tokens, and
+code units copied into literal storage, so a single pathological token cannot
+hide unbounded work behind one token count. Running out is
+`compile-budget-exhausted`, a fatal diagnostic, because a compiler that ran
+out of fuel has not finished checking. No scan loop runs past the fuel it was
+granted, and a compile that ends leaves the compiler able to take the next
+source.
 
 ## 5. Goal symbols and lexer context
 

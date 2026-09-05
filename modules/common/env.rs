@@ -68,10 +68,44 @@ impl From<HeapError> for EnvironmentError {
 /// The longest scope chain a lookup walks.
 pub const MAX_SCOPE_DEPTH: u32 = 256;
 
-/// Bytes before the bindings.
-const HEADER: usize = 56;
-/// Bytes in one binding.
-const BINDING: usize = 24;
+/// Where each field of an environment record sits. The collector traces
+/// through these names.
+pub mod layout {
+    /// The kind, from `EnvironmentKind`.
+    pub const KIND: usize = 0;
+    /// Bindings in use, a `u32`.
+    pub const COUNT: usize = 4;
+    /// Bindings the record has room for, a `u32`.
+    pub const CAPACITY: usize = 8;
+    /// The parent environment: an encoded value.
+    pub const PARENT: usize = 12;
+    /// A function environment's `this`, or an object environment's binding
+    /// object: an encoded value.
+    pub const THIS: usize = 21;
+    /// Non-zero while a derived constructor's `this` is still unbound.
+    pub const THIS_UNINITIALISED: usize = 30;
+    /// A function environment's `new.target`: an encoded value.
+    pub const NEW_TARGET: usize = 32;
+    /// The function a function environment was made for: an encoded value.
+    pub const FUNCTION: usize = 41;
+    /// Bytes before the bindings.
+    pub const HEADER: usize = 56;
+
+    /// Bytes in one binding.
+    pub const BINDING: usize = 24;
+    /// Where each field of a binding sits.
+    pub mod binding {
+        /// The flags, from `binding`.
+        pub const FLAGS: usize = 0;
+        /// The name: a handle as index and generation.
+        pub const NAME: usize = 4;
+        /// The value: an encoded value.
+        pub const VALUE: usize = 12;
+    }
+}
+
+const HEADER: usize = layout::HEADER;
+const BINDING: usize = layout::BINDING;
 
 /// Create an environment record with room for `capacity` bindings.
 pub fn create(
@@ -84,14 +118,14 @@ pub fn create(
         .map_err(|_| EnvironmentError::Heap(HeapError::ArenaFull))?;
     let handle = heap.allocate(CellKind::Environment, size)?;
     let cell = heap.cell_mut(handle)?;
-    cell[0] = kind as u8;
-    cell[4..8].copy_from_slice(&0u32.to_le_bytes());
-    cell[8..12].copy_from_slice(&capacity.to_le_bytes());
-    write_value(&mut cell[12..21], parent);
-    write_value(&mut cell[21..30], Value::UNDEFINED);
-    cell[30] = 0;
-    write_value(&mut cell[32..41], Value::UNDEFINED);
-    write_value(&mut cell[41..50], Value::UNDEFINED);
+    cell[layout::KIND] = kind as u8;
+    write_u32(cell, layout::COUNT, 0);
+    write_u32(cell, layout::CAPACITY, capacity);
+    parent.encode_at(cell, layout::PARENT);
+    Value::UNDEFINED.encode_at(cell, layout::THIS);
+    cell[layout::THIS_UNINITIALISED] = 0;
+    Value::UNDEFINED.encode_at(cell, layout::NEW_TARGET);
+    Value::UNDEFINED.encode_at(cell, layout::FUNCTION);
     Ok(handle)
 }
 
@@ -99,7 +133,7 @@ pub fn create(
 /// `super()` constructs through.
 pub fn function(heap: &Heap<'_>, environment: Handle) -> Result<Value, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(read_value(&cell[41..50]))
+    Ok(Value::decode_at(cell, layout::FUNCTION))
 }
 
 /// Record the function a function environment was made for.
@@ -109,7 +143,7 @@ pub fn set_function(
     value: Value,
 ) -> Result<(), EnvironmentError> {
     let cell = heap.cell_mut(environment)?;
-    write_value(&mut cell[41..50], value);
+    value.encode_at(cell, layout::FUNCTION);
     Ok(())
 }
 
@@ -117,7 +151,7 @@ pub fn set_function(
 /// derived constructor's, before `super()` binds it.
 pub fn this_uninitialised(heap: &Heap<'_>, environment: Handle) -> Result<bool, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(cell[30] != 0)
+    Ok(cell[layout::THIS_UNINITIALISED] != 0)
 }
 
 /// Put a function environment's `this` in its dead zone until `set_this`.
@@ -126,7 +160,7 @@ pub fn mark_this_uninitialised(
     environment: Handle,
 ) -> Result<(), EnvironmentError> {
     let cell = heap.cell_mut(environment)?;
-    cell[30] = 1;
+    cell[layout::THIS_UNINITIALISED] = 1;
     Ok(())
 }
 
@@ -138,13 +172,13 @@ pub fn create_object_environment(
 ) -> Result<Handle, EnvironmentError> {
     let handle = create(heap, EnvironmentKind::Object, parent, 0)?;
     let cell = heap.cell_mut(handle)?;
-    write_value(&mut cell[21..30], Value::object(object));
+    Value::object(object).encode_at(cell, layout::THIS);
     Ok(handle)
 }
 
 pub fn kind(heap: &Heap<'_>, environment: Handle) -> Result<EnvironmentKind, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(match cell[0] {
+    Ok(match cell[layout::KIND] {
         1 => EnvironmentKind::Function,
         2 => EnvironmentKind::Object,
         3 => EnvironmentKind::Arrow,
@@ -154,19 +188,19 @@ pub fn kind(heap: &Heap<'_>, environment: Handle) -> Result<EnvironmentKind, Env
 
 pub fn parent(heap: &Heap<'_>, environment: Handle) -> Result<Value, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(read_value(&cell[12..21]))
+    Ok(Value::decode_at(cell, layout::PARENT))
 }
 
 /// The object whose properties are this environment's bindings, if it has one.
 pub fn binding_object(heap: &Heap<'_>, environment: Handle) -> Result<Value, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(read_value(&cell[21..30]))
+    Ok(Value::decode_at(cell, layout::THIS))
 }
 
 /// The `this` value a function environment carries.
 pub fn this_value(heap: &Heap<'_>, environment: Handle) -> Result<Value, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(read_value(&cell[21..30]))
+    Ok(Value::decode_at(cell, layout::THIS))
 }
 
 /// Give a function environment its `this` value.
@@ -176,15 +210,15 @@ pub fn set_this(
     value: Value,
 ) -> Result<(), EnvironmentError> {
     let cell = heap.cell_mut(environment)?;
-    write_value(&mut cell[21..30], value);
-    cell[30] = 0;
+    value.encode_at(cell, layout::THIS);
+    cell[layout::THIS_UNINITIALISED] = 0;
     Ok(())
 }
 
 /// The `new.target` a function environment carries.
 pub fn new_target(heap: &Heap<'_>, environment: Handle) -> Result<Value, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(read_value(&cell[32..41]))
+    Ok(Value::decode_at(cell, layout::NEW_TARGET))
 }
 
 /// Give a function environment its `new.target`.
@@ -194,7 +228,7 @@ pub fn set_new_target(
     value: Value,
 ) -> Result<(), EnvironmentError> {
     let cell = heap.cell_mut(environment)?;
-    write_value(&mut cell[32..41], value);
+    value.encode_at(cell, layout::NEW_TARGET);
     Ok(())
 }
 
@@ -215,11 +249,10 @@ pub fn declare(
     let record = cell
         .get_mut(at..at + BINDING)
         .ok_or(EnvironmentError::Full)?;
-    record[0] = flags & !binding::INITIALISED;
-    record[4..8].copy_from_slice(&name.index.to_le_bytes());
-    record[8..12].copy_from_slice(&name.generation.to_le_bytes());
-    write_value(&mut record[12..21], Value::UNDEFINED);
-    cell[4..8].copy_from_slice(&(count + 1).to_le_bytes());
+    record[layout::binding::FLAGS] = flags & !binding::INITIALISED;
+    name.write_at(record, layout::binding::NAME);
+    Value::UNDEFINED.encode_at(record, layout::binding::VALUE);
+    write_u32(cell, layout::COUNT, count + 1);
     Ok(count)
 }
 
@@ -249,8 +282,8 @@ pub fn initialise(
     let record = cell
         .get_mut(at..at + BINDING)
         .ok_or(EnvironmentError::Unresolvable)?;
-    record[0] |= binding::INITIALISED;
-    write_value(&mut record[12..21], value);
+    record[layout::binding::FLAGS] |= binding::INITIALISED;
+    value.encode_at(record, layout::binding::VALUE);
     Ok(())
 }
 
@@ -297,7 +330,7 @@ pub fn set_parent(
     parent: Value,
 ) -> Result<(), EnvironmentError> {
     let cell = heap.cell_mut(environment)?;
-    write_value(&mut cell[12..21], parent);
+    parent.encode_at(cell, layout::PARENT);
     Ok(())
 }
 
@@ -308,10 +341,10 @@ pub fn slot_value(
     index: u32,
 ) -> Result<Value, EnvironmentError> {
     let record = binding_record(heap, environment, index)?;
-    if record[0] & binding::INITIALISED == 0 {
+    if record[layout::binding::FLAGS] & binding::INITIALISED == 0 {
         return Err(EnvironmentError::Uninitialised);
     }
-    Ok(read_value(&record[12..21]))
+    Ok(Value::decode_at(record, layout::binding::VALUE))
 }
 
 /// Write a binding by index in this record.
@@ -333,7 +366,7 @@ pub fn set_slot(
     let record = cell
         .get_mut(at..at + BINDING)
         .ok_or(EnvironmentError::Unresolvable)?;
-    write_value(&mut record[12..21], value);
+    value.encode_at(record, layout::binding::VALUE);
     Ok(())
 }
 
@@ -354,9 +387,9 @@ pub fn remove(
     let record = cell
         .get_mut(at..at + BINDING)
         .ok_or(EnvironmentError::Unresolvable)?;
-    record[0] = binding::MUTABLE;
-    record[4..12].copy_from_slice(&[0u8; 8]);
-    write_value(&mut record[12..21], Value::UNDEFINED);
+    record[layout::binding::FLAGS] = binding::MUTABLE;
+    Handle::new(0, 0).write_at(record, layout::binding::NAME);
+    Value::UNDEFINED.encode_at(record, layout::binding::VALUE);
     Ok(())
 }
 
@@ -420,12 +453,23 @@ pub fn resolve(
 
 pub fn count(heap: &Heap<'_>, environment: Handle) -> Result<u32, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(u32::from_le_bytes([cell[4], cell[5], cell[6], cell[7]]))
+    Ok(read_u32(cell, layout::COUNT))
 }
 
 pub fn capacity(heap: &Heap<'_>, environment: Handle) -> Result<u32, EnvironmentError> {
     let cell = environment_cell(heap, environment)?;
-    Ok(u32::from_le_bytes([cell[8], cell[9], cell[10], cell[11]]))
+    Ok(read_u32(cell, layout::CAPACITY))
+}
+
+/// Little-endian integer fields, each checked once.
+fn read_u32(bytes: &[u8], at: usize) -> u32 {
+    crate::value::field::<4>(bytes, at).map_or(0, u32::from_le_bytes)
+}
+
+fn write_u32(bytes: &mut [u8], at: usize, value: u32) {
+    if let Some(field) = bytes.get_mut(at..at + 4) {
+        field.copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 fn binding_record<'h>(
@@ -455,36 +499,4 @@ fn environment_cell<'h>(
         return Err(EnvironmentError::Heap(HeapError::StaleHandle));
     }
     Ok(cell)
-}
-
-/// Encode a value as a tag byte and eight payload bytes.
-fn write_value(out: &mut [u8], value: Value) {
-    out[0] = value.tag() as u8;
-    let payload = match value.tag() {
-        Tag::Number => value.as_number().to_bits(),
-        Tag::Boolean => u64::from(value.as_boolean()),
-        Tag::Undefined | Tag::Null => 0,
-        _ => {
-            let handle = value.as_handle();
-            (u64::from(handle.generation) << 32) | u64::from(handle.index)
-        }
-    };
-    out[1..9].copy_from_slice(&payload.to_le_bytes());
-}
-
-fn read_value(bytes: &[u8]) -> Value {
-    let payload = u64::from_le_bytes([
-        bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
-    ]);
-    let handle = Handle::new((payload & 0xFFFF_FFFF) as u32, (payload >> 32) as u32);
-    match bytes[0] {
-        1 => Value::NULL,
-        2 => Value::boolean(payload != 0),
-        3 => Value::number(f64::from_bits(payload)),
-        4 => Value::string(handle),
-        5 => Value::symbol(handle),
-        6 => Value::big_int(handle),
-        7 => Value::object(handle),
-        _ => Value::UNDEFINED,
-    }
 }

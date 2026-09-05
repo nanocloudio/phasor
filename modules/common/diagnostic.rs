@@ -108,9 +108,8 @@ pub mod code {
     pub const FEATURE_LIST_MISMATCH: u16 = 0x0418;
 }
 
-/// Enumerated `image feature` argument values, naming what an image asked for
-/// that this build does not implement. An image is refused for one of these
-/// when it is admitted, rather than terminating part-way through a run.
+/// Enumerated `image feature` argument values of the retired
+/// `image-not-admitted` code, kept so the number is never reassigned.
 pub mod image_feature {
     pub const BIG_INT: u32 = 0;
 }
@@ -133,6 +132,116 @@ pub mod termination {
     pub const REJECTED: u16 = 0x0509;
     /// The task threw, and nothing caught it.
     pub const UNCAUGHT_THROW: u16 = 0x050A;
+}
+
+/// The name a diagnostic code goes by, or `None` for a number no table names.
+///
+/// The names are the ones `docs/reference/diagnostics.md` lists, so what a
+/// person reads and what the reference says are the same word; a renderer
+/// shows an unnamed code as its number, which a reader can still look up.
+pub fn name_of(value: u16) -> Option<&'static [u8]> {
+    let name: &[u8] = match value {
+        code::TRANSFER_INCOMPLETE => b"transfer-incomplete",
+        code::TRANSFER_OVERFLOW => b"transfer-overflow",
+        code::DIGEST_MISMATCH => b"digest-mismatch",
+        code::FEATURE_DIGEST_MISMATCH => b"feature-digest-mismatch",
+        code::UNSUPPORTED_GOAL => b"unsupported-goal",
+        code::COMPILE_BUDGET_EXHAUSTED => b"compile-budget-exhausted",
+        code::TOO_MANY_DIAGNOSTICS => b"too-many-diagnostics",
+        code::SOURCE_TOO_LARGE => b"source-too-large",
+        code::TOO_MANY_LINES => b"too-many-lines",
+        code::LINE_TOO_LONG => b"line-too-long",
+        code::TOO_MANY_TOKENS => b"too-many-tokens",
+        code::IDENTIFIER_TOO_LONG => b"identifier-too-long",
+        code::LITERAL_TOO_LONG => b"literal-too-long",
+        code::NUMERIC_LITERAL_TOO_LONG => b"numeric-literal-too-long",
+        code::REGEXP_LITERAL_TOO_LONG => b"regexp-literal-too-long",
+        code::TEMPLATE_NESTING_TOO_DEEP => b"template-nesting-too-deep",
+        code::FEATURE_NOT_ADMITTED => b"feature-not-admitted",
+        code::INVALID_UTF8 => b"invalid-utf8",
+        code::INVALID_CHARACTER => b"invalid-character",
+        code::UNTERMINATED_COMMENT => b"unterminated-comment",
+        code::HASHBANG_NOT_AT_START => b"hashbang-not-at-start",
+        code::INVALID_IDENTIFIER_ESCAPE => b"invalid-identifier-escape",
+        code::ESCAPED_RESERVED_WORD => b"escaped-reserved-word",
+        code::INVALID_NUMERIC_SEPARATOR => b"invalid-numeric-separator",
+        code::LEGACY_OCTAL_LITERAL => b"legacy-octal-literal",
+        code::INVALID_NUMERIC_TERMINATOR => b"invalid-numeric-terminator",
+        code::MISSING_RADIX_DIGITS => b"missing-radix-digits",
+        code::INVALID_BIGINT_LITERAL => b"invalid-bigint-literal",
+        code::UNTERMINATED_STRING => b"unterminated-string",
+        code::INVALID_ESCAPE => b"invalid-escape",
+        code::LEGACY_OCTAL_ESCAPE => b"legacy-octal-escape",
+        code::INVALID_CODE_POINT => b"invalid-code-point",
+        code::UNTERMINATED_TEMPLATE => b"unterminated-template",
+        code::INVALID_REGEXP_LITERAL => b"invalid-regexp-literal",
+        code::INVALID_REGEXP_FLAG => b"invalid-regexp-flag",
+        code::DUPLICATE_REGEXP_FLAG => b"duplicate-regexp-flag",
+        code::REGEXP_PATTERN_UNSUPPORTED => b"regexp-pattern-unsupported",
+        code::UNEXPECTED_TOKEN => b"unexpected-token",
+        code::UNEXPECTED_END_OF_SOURCE => b"unexpected-end-of-source",
+        code::EXPECTED_EXPRESSION => b"expected-expression",
+        code::EXPECTED_CLOSE_PAREN => b"expected-close-paren",
+        code::EXPECTED_CLOSE_BRACKET => b"expected-close-bracket",
+        code::EXPECTED_CLOSE_BRACE => b"expected-close-brace",
+        code::EXPECTED_COLON => b"expected-colon",
+        code::EXPECTED_PROPERTY_NAME => b"expected-property-name",
+        code::INVALID_ASSIGNMENT_TARGET => b"invalid-assignment-target",
+        code::OPTIONAL_CHAIN_ASSIGNMENT => b"optional-chain-assignment",
+        code::EXPONENT_OF_UNARY => b"exponent-of-unary",
+        code::PRIVATE_NAME_OUT_OF_CONTEXT => b"private-name-out-of-context",
+        code::EXPRESSION_TOO_DEEP => b"expression-too-deep",
+        code::TOO_MANY_SYNTAX_NODES => b"too-many-syntax-nodes",
+        code::SYNTAX_NOT_ADMITTED => b"syntax-not-admitted",
+        code::MISSING_INITIALISER => b"missing-initialiser",
+        code::INVALID_ARROW_PARAMETERS => b"invalid-arrow-parameters",
+        code::DUPLICATE_BINDING => b"duplicate-binding",
+        code::ASSIGNMENT_TO_CONSTANT => b"assignment-to-constant",
+        code::UNDECLARED_LABEL => b"undeclared-label",
+        code::ILLEGAL_BREAK_OR_CONTINUE => b"illegal-break-or-continue",
+        code::RETURN_OUTSIDE_FUNCTION => b"return-outside-function",
+        code::STRICT_ASSIGNMENT_TO_RESTRICTED_NAME => b"strict-assignment-to-restricted-name",
+        code::STRICT_INVALID_PARAMETER => b"strict-invalid-parameter",
+        code::EVAL_RESTRICTED_DECLARATION => b"eval-restricted-declaration",
+        code::UNKNOWN_OPCODE => b"unknown-opcode",
+        code::TRUNCATED_OPERAND => b"truncated-operand",
+        code::MISPLACED_PREFIX => b"misplaced-prefix",
+        code::REGISTER_OUT_OF_RANGE => b"register-out-of-range",
+        code::CONSTANT_OUT_OF_RANGE => b"constant-out-of-range",
+        code::INVALID_JUMP_TARGET => b"invalid-jump-target",
+        code::BACKWARD_JUMP_WITHOUT_SAFE_POINT => b"backward-jump-without-safe-point",
+        code::INVALID_EXCEPTION_REGION => b"invalid-exception-region",
+        code::OVERLAPPING_EXCEPTION_REGIONS => b"overlapping-exception-regions",
+        code::CONTEXT_DEPTH_MISMATCH => b"context-depth-mismatch",
+        code::CONTEXT_DEPTH_OUT_OF_RANGE => b"context-depth-out-of-range",
+        code::FALLS_OFF_END => b"falls-off-end",
+        code::INVALID_SAFE_POINT => b"invalid-safe-point",
+        code::UNREACHABLE_CODE => b"unreachable-code",
+        code::INCONSISTENT_DECLARED_BOUNDS => b"inconsistent-declared-bounds",
+        code::MALFORMED_IMAGE => b"malformed-image",
+        code::BYTECODE_FORMAT_MISMATCH => b"bytecode-format-mismatch",
+        code::VERIFIER_STORAGE_TOO_SMALL => b"verifier-storage-too-small",
+        code::CODE_TOO_LARGE => b"code-too-large",
+        code::TOO_MANY_CONSTANTS => b"too-many-constants",
+        code::TOO_MANY_REGISTERS => b"too-many-registers",
+        code::JUMP_TOO_FAR => b"jump-too-far",
+        code::LOWERING_NOT_ADMITTED => b"lowering-not-admitted",
+        code::IMAGE_NOT_ADMITTED => b"image-not-admitted",
+        code::FEATURE_LIST_MISMATCH => b"feature-list-mismatch",
+        termination::FUEL_EXHAUSTED => b"fuel-exhausted",
+        termination::QUOTA_EXCEEDED => b"quota-exceeded",
+        termination::CANCELLED => b"cancelled",
+        termination::DEADLINE_REACHED => b"deadline-reached",
+        termination::STACK_OVERFLOW => b"stack-overflow",
+        termination::REGISTERS_EXHAUSTED => b"registers-exhausted",
+        termination::HEAP_EXHAUSTED => b"heap-exhausted",
+        termination::NOT_IMPLEMENTED => b"not-implemented",
+        termination::MALFORMED_IMAGE_AT_RUN_TIME => b"malformed-image-at-run-time",
+        termination::REJECTED => b"rejected",
+        termination::UNCAUGHT_THROW => b"uncaught-throw",
+        _ => return None,
+    };
+    Some(name)
 }
 
 /// Enumerated `phase` argument values.

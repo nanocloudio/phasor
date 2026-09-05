@@ -44,25 +44,75 @@ pub fn link(
     if entry >= total {
         return Err(Rejection::WrongState);
     }
-    let Some(state) = state.get_mut(..total) else {
-        return Err(Rejection::RegistryFull);
-    };
+    let state = reset(state, total)?;
+    let mut order = 0u32;
+    walk(registry, entry, stack, state, &mut order)?;
+    Ok(Closure {
+        count: order,
+        digest: registry.closure_digest(),
+        entry_order: registry.order(entry).unwrap_or(u32::MAX),
+    })
+}
+
+/// Link every registered module, walking from each in registration order.
+///
+/// This is the order a linker gives a stream of modules: a module comes after
+/// everything it imports, and the entry — the module nothing imports, which a
+/// stream carries last — is the last one ordered. A module reached from an
+/// earlier root keeps the place that walk gave it.
+pub fn link_all(
+    registry: &mut Registry<'_>,
+    stack: &mut [(u32, u32)],
+    state: &mut [u8],
+) -> Result<Closure, Rejection> {
+    let total = registry.count();
+    if total == 0 {
+        return Err(Rejection::WrongState);
+    }
+    let state = reset(state, total)?;
+    let mut order = 0u32;
+    let mut root = 0usize;
+    while root < total {
+        if state.get(root).copied().unwrap_or(DONE) == UNVISITED {
+            walk(registry, root, stack, state, &mut order)?;
+        }
+        root += 1;
+    }
+    Ok(Closure {
+        count: order,
+        digest: registry.closure_digest(),
+        entry_order: order.saturating_sub(1),
+    })
+}
+
+/// The walk's per-module state, one slot per registered module, all unvisited.
+fn reset(state: &mut [u8], total: usize) -> Result<&mut [u8], Rejection> {
+    let state = state.get_mut(..total).ok_or(Rejection::RegistryFull)?;
     for slot in state.iter_mut() {
         *slot = UNVISITED;
     }
+    Ok(state)
+}
 
+/// Order everything reachable from `root` that is not ordered yet, in
+/// depth-first finishing order, continuing the numbering at `order`.
+fn walk(
+    registry: &mut Registry<'_>,
+    root: usize,
+    stack: &mut [(u32, u32)],
+    state: &mut [u8],
+    order: &mut u32,
+) -> Result<(), Rejection> {
     // Everything reachable enters linking first, so a failure part-way leaves
     // no module claiming to be linked.
-    let mut order = 0u32;
     let mut depth = 0usize;
-    let mut entry_order = u32::MAX;
 
-    push(stack, &mut depth, entry)?;
-    if let Some(slot) = state.get_mut(entry) {
+    push(stack, &mut depth, root)?;
+    if let Some(slot) = state.get_mut(root) {
         *slot = VISITING;
     }
-    if registry.status(entry) == Some(Status::New) {
-        registry.set_status(entry, Status::Linking)?;
+    if registry.status(root) == Some(Status::New) {
+        registry.set_status(root, Status::Linking)?;
     }
 
     while depth > 0 {
@@ -103,21 +153,13 @@ pub fn link(
         if let Some(slot) = state.get_mut(module_index) {
             *slot = DONE;
         }
-        registry.set_order(module_index, order)?;
+        registry.set_order(module_index, *order)?;
         if registry.status(module_index) == Some(Status::Linking) {
             registry.set_status(module_index, Status::Linked)?;
         }
-        if module_index == entry {
-            entry_order = order;
-        }
-        order += 1;
+        *order += 1;
     }
-
-    Ok(Closure {
-        count: order,
-        digest: registry.closure_digest(),
-        entry_order,
-    })
+    Ok(())
 }
 
 fn push(stack: &mut [(u32, u32)], depth: &mut usize, module: usize) -> Result<(), Rejection> {

@@ -20,4 +20,4 @@ mode                = "strict"
 # This glob is also the CI materialisation guard: a primary-only checkout has
 # no matching script, and the no-vacuous-phase rule fails the gate explicitly.
 [ci.test]
-scripts = ["tests/e2e/*.sh"]
+scripts = ["tests/e2e/*.sh", "tests/gates/*.sh", "tests/wasm/*.sh"]

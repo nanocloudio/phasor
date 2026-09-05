@@ -1,6 +1,7 @@
 # Isolate Lifecycle and Resource Policy
 
-Source: `modules/common/policy.rs`, `modules/common/vm.rs`.
+Source: `modules/common/policy.rs`, `modules/common/agent.rs`,
+`modules/common/vm.rs`, `modules/common/vm/host.rs`.
 
 This document defines what an isolate is admitted against, the states it moves
 through, the outcomes a task can end with, and how a task is stopped.
@@ -34,6 +35,11 @@ proves once that the storage handed to the isolate satisfies the policy; after
 that, no step has to check whether its own storage is large enough, because the
 inequality has already been established.
 
+`phasor_isolate` builds its policy from the constants that size its storage
+and the fuel the graph named, clamped to the ceiling, and brings its machine
+up under that policy through `agent.rs`: the fuel and the collection slice the
+machine runs with are the fields it admitted against, never a second copy.
+
 ## 3. States
 
 ```text
@@ -48,6 +54,18 @@ task in progress. `Suspended` is a task stopped at a safe point waiting for a
 host completion, which is the only way a task waits. `Idle` has finished a task
 and can take another. `Stopped` admits nothing further. The transitions above
 are the whole set; anything else is a rejection rather than an undefined state.
+
+`policy.rs` defines the lifecycle and the invariant probe proves its
+transitions. `phasor_isolate` runs one task per image and moves through four
+phases of its own — staging the image, advancing the task, publishing the
+result and its diagnostic, and done — which are `Empty` to `Ready`, `Running`
+with `Suspended` while a call is outstanding, and then `Idle` or `Stopped`.
+
+`policy.rs` defines the lifecycle and the invariant probe proves its
+transitions. `phasor_isolate` runs one task per image and moves through four
+phases of its own — staging the image, advancing the task, publishing the
+result and its diagnostic, and done — which are `Empty` to `Ready`, `Running`
+with `Suspended` while a call is outstanding, and then `Idle` or `Stopped`.
 
 ## 4. Outcomes
 
@@ -129,7 +147,9 @@ module's own state. So it is rebuilt. The heap, the atom table, the job queue,
 the binding table, and the machine each save the state that is not in their
 storage, and each can take up storage they were already using without clearing
 it — the slot table is the handle table, and clearing it would invalidate every
-handle the module still holds.
+handle the module still holds. `agent::fresh` does the first bring-up and
+`agent::adopt` every later one, in one attachment order shared with every
+other host of the machine.
 
 What this buys is that a step is bounded by its own slice rather than by how
 long an answer takes, and that a task waiting for a completion costs nothing

@@ -96,6 +96,15 @@ pub struct Import {
     pub resolved: Option<Key>,
 }
 
+impl Import {
+    /// An empty slot of a registry's storage.
+    pub const EMPTY: Self = Self {
+        specifier_start: 0,
+        specifier_end: 0,
+        resolved: None,
+    };
+}
+
 /// One registered module.
 #[derive(Clone, Copy, Debug)]
 pub struct Record {
@@ -107,6 +116,18 @@ pub struct Record {
     pub import_count: u32,
     /// Position in the evaluation order, once the closure is ordered.
     pub order: u32,
+}
+
+impl Record {
+    /// An empty slot of a registry's storage.
+    pub const EMPTY: Self = Self {
+        key: Key(Digest([0; 32])),
+        form: Form::Image,
+        status: Status::New,
+        imports_at: 0,
+        import_count: 0,
+        order: u32::MAX,
+    };
 }
 
 /// The largest module closure this build admits.

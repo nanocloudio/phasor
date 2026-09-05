@@ -1,6 +1,6 @@
 # Capability Bindings
 
-Source: `modules/common/binding.rs`, `modules/common/vm.rs`.
+Source: `modules/common/binding.rs`, `modules/common/vm/host.rs`.
 
 This document defines how a program reaches anything outside itself. The engine
 holds the seam; the router that admits and correlates a call, and the adapters
@@ -8,11 +8,12 @@ that answer one, are separate fmods on the graph — `phasor_host_router`, and
 `phasor_time`, `phasor_entropy`, or in tests `phasor_fault_host`.
 `examples/capabilities` wires them together.
 
-This is why there is no `Math.random` and no `Date`: a program that could help
-itself to the time or to unpredictability would have authority nobody granted
-it. A deployment that wants a program to have either wires the adapter that
-provides it, under a quota, and the program reaches it through the binding it
-was granted and through nothing else.
+This is why there is no `Math.random` and why `Date` cannot tell the time: a
+program that could help itself to the clock or to unpredictability would have
+authority nobody granted it. `Date` does arithmetic on time values and answers
+the epoch for "now". A deployment that wants a program to have either wires
+the adapter that provides it, under a quota, and the program reaches it through
+the binding it was granted and through nothing else.
 
 ## 1. Nothing is ambient
 

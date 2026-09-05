@@ -331,7 +331,7 @@ impl<'a> UnitWriter<'a> {
     /// Write the whole image. Sections appear in the order the reader expects:
     /// header, functions, constants, constant data, code, exception regions,
     /// safe points.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "the sections are the image's canonical order and grouping them would hide it"
     )]
@@ -362,7 +362,7 @@ impl<'a> UnitWriter<'a> {
 
     /// Write a unit that is a module: it also carries what it imports and what
     /// it exports.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "the sections are the image's canonical order and grouping them would hide which is which"
     )]

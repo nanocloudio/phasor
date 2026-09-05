@@ -26,7 +26,7 @@
 //! `R` and `S` are scope, not verdicts on behaviour: the front-end lane is
 //! where refusals are measured. `F`, `X`, and `T` are the hunt list.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -41,6 +41,10 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
 
 #[path = "../../common/arena.rs"]
 mod arena;
@@ -99,6 +103,8 @@ mod softfloat;
 mod source;
 #[path = "../../common/string.rs"]
 mod string;
+#[path = "../../common/text.rs"]
+mod text;
 #[path = "../../common/unicode_id.rs"]
 mod unicode_id;
 #[path = "../../common/value.rs"]
@@ -107,6 +113,8 @@ mod value;
 mod verify;
 #[path = "../../common/vm.rs"]
 mod vm;
+#[path = "../../common/wire.rs"]
+mod wire;
 
 use arena::{Arena, Node};
 use bytecode::{Constant, ExceptionRegion, ExportRecord, Function, ImportRecord, Unit};
@@ -125,9 +133,6 @@ use source::{Limits, LineStart, LineTable};
 use string::Atoms;
 use value::{Handle, Value};
 use vm::{Compiled, Completion, EvalRequest, Frame, ModuleInstance, Progress, Termination, Vm};
-
-const POLL_INPUT: u32 = 0x01;
-const POLL_OUTPUT: u32 = 0x02;
 
 /// Largest case this module stages; the harness prelude has the same bound.
 const CASE_CAPACITY: usize = 128 * 1024;
@@ -293,6 +298,16 @@ struct Storage {
     module_names: [([u8; 128], usize, u32); MODULE_SLOTS + 1],
     module_name_count: usize,
     instances: [ModuleInstance; EVAL_SLOTS + 1 + NESTED_UNITS + MODULE_SLOTS],
+    /// Every unit compiled for the current case, folded into one number:
+    /// the case, its prelude, each eval and `Function` body, each companion.
+    /// A case that asks for it (expectation bit `0x10`) folds this into the
+    /// batch digest the summary line reports.
+    image_digest: u64,
+}
+
+/// Fold one compiled image into the case's digest.
+fn fold_image(digest: &mut u64, image: &[u8]) {
+    *digest = digest.rotate_left(13) ^ digest_of(image);
 }
 
 /// How a case ended, before the expectation is applied.
@@ -401,6 +416,10 @@ fn compile_into(
         )
     }
     .ok()?;
+    fold_image(
+        storage.image_digest,
+        image.get(..compiled.length).unwrap_or(&[]),
+    );
     Some(compiled.length)
 }
 
@@ -428,6 +447,7 @@ struct FrontEnd<'a> {
     imports: &'a mut [ImportRecord; IMPORT_CAPACITY],
     exports: &'a mut [ExportRecord; EXPORT_CAPACITY],
     eval_sites: &'a mut [u8; EVAL_SITE_CAPACITY],
+    image_digest: &'a mut u64,
 }
 
 /// The machine's in-place compiler: the front end over its storage, a
@@ -889,6 +909,13 @@ fn prepare_module_closure(
             continue;
         };
         storage.module_offsets[slot] = (used, compiled);
+        fold_image(
+            &mut storage.image_digest,
+            storage
+                .module_region
+                .get(used..used + compiled)
+                .unwrap_or(&[]),
+        );
         used = used.checked_add(compiled)?;
         if used > MODULE_REGION {
             return None;
@@ -1450,6 +1477,10 @@ fn execute(
     if storage.image.get(..length).is_none() {
         return Ran::Refused;
     }
+    fold_image(
+        &mut storage.image_digest,
+        storage.image.get(..length).unwrap_or(&[]),
+    );
     // A module's imports resolve against the companions staged beside it:
     // each compiled as a module of its own, registered, linked, and put in
     // evaluation order before anything runs. A closure that cannot be built
@@ -1523,6 +1554,10 @@ fn execute(
                 Err(_) => return Ran::Refused,
             }
         };
+        fold_image(
+            &mut storage.image_digest,
+            storage.prelude_image.get(..compiled).unwrap_or(&[]),
+        );
         storage.prelude_unit_length = compiled;
         prelude_pending = true;
     }
@@ -1688,6 +1723,7 @@ fn execute(
                     imports: &mut storage.imports,
                     exports: &mut storage.exports,
                     eval_sites: &mut storage.eval_sites,
+                    image_digest: &mut storage.image_digest,
                 },
                 region: &mut nested_free,
                 digests: &mut storage.nested_digests,
@@ -2167,6 +2203,7 @@ fn execute(
                         imports: &mut storage.imports,
                         exports: &mut storage.exports,
                         eval_sites: &mut storage.eval_sites,
+                        image_digest: &mut storage.image_digest,
                     };
                     let source = storage.eval_source.get(..source_length).unwrap_or(&[]);
                     // The caller's recorded scope, when the pause was a
@@ -2291,6 +2328,9 @@ struct State {
     cases: u32,
     verdicts: [u8; 256],
     verdict_length: usize,
+    /// The digests of every case that carried the digest flag, folded.
+    batch_digest: u64,
+    digest_cases: u32,
     verdict_offset: usize,
     report: [u8; 160],
     report_length: usize,
@@ -2311,7 +2351,9 @@ fn judge(state: &mut State, length: usize, expectation: u8) -> u8 {
     }
     let strict = expectation & 4 != 0;
     let module = expectation & 8 != 0;
+    let wants_digest = expectation & 0x10 != 0;
     let expectation = expectation & 3;
+    state.storage.image_digest = 0;
     let ran = if module {
         // A module case keeps the prelude apart: it runs as a script of its
         // own, so its declarations are globals the whole closure sees.
@@ -2331,6 +2373,10 @@ fn judge(state: &mut State, length: usize, expectation: u8) -> u8 {
         let source = state.source.get(..total).unwrap_or(&[]);
         execute(&mut state.storage, source, &[], strict, false)
     };
+    if wants_digest {
+        state.batch_digest = state.batch_digest.rotate_left(7) ^ state.storage.image_digest;
+        state.digest_cases = state.digest_cases.saturating_add(1);
+    }
     if expectation == 3 {
         // An async case reports through the harness's `$DONE`: the run must
         // finish and the completion line must have been printed.
@@ -2429,29 +2475,6 @@ fn drain_one(state: &mut State) {
     state.filled -= HEADER + length;
 }
 
-fn write_u32(value: u32, out: &mut [u8]) -> usize {
-    let mut digits = [0u8; 10];
-    let mut count = 0usize;
-    let mut remaining = value;
-    loop {
-        digits[count] = b'0' + u8::try_from(remaining % 10).unwrap_or(0);
-        count += 1;
-        remaining /= 10;
-        if remaining == 0 {
-            break;
-        }
-    }
-    if out.len() < count {
-        return 0;
-    }
-    let mut index = 0usize;
-    while index < count {
-        out[index] = digits[count - 1 - index];
-        index += 1;
-    }
-    count
-}
-
 fn compose(state: &mut State) -> usize {
     let mut out = [0u8; 160];
     let mut at = 0usize;
@@ -2467,68 +2490,57 @@ fn compose(state: &mut State) -> usize {
         (state.refused, &b" refused "[..]),
         (state.skipped, &b" skipped of "[..]),
     ] {
-        at += write_u32(value, &mut out[at..]);
+        at += text::put_u32(&mut out[at..], value);
         out[at..at + label.len()].copy_from_slice(label);
         at += label.len();
     }
-    at += write_u32(state.cases, &mut out[at..]);
-    let tail = b" cases\n";
+    at += text::put_u32(&mut out[at..], state.cases);
+    let tail = b" cases";
     out[at..at + tail.len()].copy_from_slice(tail);
     at += tail.len();
+    if state.digest_cases > 0 {
+        let label = b" digest ";
+        out[at..at + label.len()].copy_from_slice(label);
+        at += label.len();
+        let mut shift = 64;
+        while shift > 0 {
+            shift -= 4;
+            let nibble = ((state.batch_digest >> shift) & 0xF) as u8;
+            out[at] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+            at += 1;
+        }
+    }
+    out[at] = b'\n';
+    at += 1;
     state.report[..at].copy_from_slice(&out[..at]);
     at
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
+entry! {
+    State;
+    primary { input, report_out }
+    inputs {}
+    outputs { exit_out = 1 }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<State>() {
-        return -2;
-    }
-    unsafe {
-        let table = syscalls.cast::<SyscallTable>();
-        let state = state.cast::<State>();
-        core::ptr::write_bytes(state.cast::<u8>(), 0, core::mem::size_of::<State>());
-        core::ptr::addr_of_mut!((*state).syscalls).write(table);
-        core::ptr::addr_of_mut!((*state).input).write(in_chan);
-        core::ptr::addr_of_mut!((*state).report_out).write(out_chan);
-        core::ptr::addr_of_mut!((*state).exit_out).write(dev_channel_port(&*table, 1, 1));
-    }
-    0
-}
-
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.input < 0 || state.report_out < 0 {
         return -2;
     }
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
 
     if state.phase == 3 {
@@ -2538,19 +2550,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // Verdicts leave before anything else happens, so the stream stays in
     // case order and the staging buffer stays small.
     if state.verdict_length > state.verdict_offset {
-        let offset = state.verdict_offset;
-        let remaining = state.verdict_length - offset;
-        let written = unsafe {
-            (syscalls.channel_write)(
-                state.report_out,
-                state.verdicts[offset..].as_ptr(),
-                remaining,
-            )
-        };
-        if written > 0 {
-            state.verdict_offset += usize::try_from(written).unwrap_or(0).min(remaining);
-        }
-        if state.verdict_length > state.verdict_offset {
+        let verdicts = state.verdicts.get(..state.verdict_length).unwrap_or(&[]);
+        if !wire::push_progress(
+            syscalls,
+            state.report_out,
+            verdicts,
+            &mut state.verdict_offset,
+        ) {
             return 0;
         }
         state.verdict_length = 0;
@@ -2562,66 +2568,31 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.report_length = compose(state);
             state.report_offset = 0;
         }
-        let offset = state.report_offset;
-        let remaining = state.report_length - offset;
-        if remaining > 0 {
-            let written = unsafe {
-                (syscalls.channel_write)(
-                    state.report_out,
-                    state.report[offset..].as_ptr(),
-                    remaining,
-                )
-            };
-            if written <= 0 {
-                return 0;
-            }
-            state.report_offset += usize::try_from(written).unwrap_or(0).min(remaining);
-            if state.report_length > state.report_offset {
-                return 0;
-            }
+        let report = state.report.get(..state.report_length).unwrap_or(&[]);
+        if !wire::push_progress(syscalls, state.report_out, report, &mut state.report_offset) {
+            return 0;
         }
         state.phase = 2;
         return 0;
     }
 
     if state.phase == 2 {
-        if state.exit_out >= 0 {
-            let code = i32::from(state.failed != 0).to_le_bytes();
-            let written =
-                unsafe { (syscalls.channel_write)(state.exit_out, code.as_ptr(), code.len()) };
-            if written != i32::try_from(code.len()).unwrap_or(i32::MAX) {
-                return 0;
-            }
+        if !wire::push_exit(syscalls, state.exit_out, state.failed != 0) {
+            return 0;
         }
         state.phase = 3;
         return 1;
     }
 
-    let poll = unsafe { (syscalls.channel_poll)(state.input, POLL_INPUT | POLL_HUP) };
-    if poll <= 0 {
-        return 0;
-    }
-
-    if (poll as u32) & POLL_INPUT != 0 {
+    if wire::has_input(syscalls, state.input) {
         let offset = state.filled;
-        let capacity = state.buffer.len().saturating_sub(offset);
-        if capacity > 0 {
-            let read = unsafe {
-                (syscalls.channel_read)(
-                    state.input,
-                    state.buffer.as_mut_ptr().add(offset),
-                    capacity,
-                )
-            };
-            if read > 0 {
-                state.filled += usize::try_from(read).unwrap_or(0).min(capacity);
-            }
-        }
+        let room = state.buffer.get_mut(offset..).unwrap_or(&mut []);
+        state.filled += wire::read_available(syscalls, state.input, room);
         drain_one(state);
         return 0;
     }
 
-    if (poll as u32) & POLL_HUP == 0 {
+    if !wire::hung_up(syscalls, state.input) {
         return 0;
     }
 

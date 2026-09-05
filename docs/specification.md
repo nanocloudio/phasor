@@ -107,5 +107,6 @@ telemetry. Script source, values, credentials, and provider payloads are not
 logged by default.
 
 All input is untrusted. Parsers, verifiers, bytecode execution, module loading,
-and capability responses must fail without panics for malformed bytes. Fuzzing
-and adversarial corpus tests accompany each expanding input surface.
+and capability responses must fail without panics for malformed bytes. Every
+input surface has a fixture probe that feeds it malformed and oversized bytes,
+and the Test262 lanes run the corpus's negative cases through the same paths.

@@ -1115,7 +1115,7 @@ impl<'s, 't> Lexer<'s, 't> {
         outcome
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "the token fields are flat scalars and packing them into a temporary struct would not make the call clearer"
     )]

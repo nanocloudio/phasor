@@ -9,7 +9,7 @@
 //! Nothing here fetches anything. What a specifier resolves to is what the
 //! stream said it was, which is what makes a closure a closed thing.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -17,13 +17,15 @@
     reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
 )]
 
-use core::ffi::c_void;
-
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
 
 #[path = "../../common/bytecode.rs"]
 mod bytecode;
@@ -35,13 +37,17 @@ mod diagnostic;
 mod digest;
 #[path = "../../common/feature.rs"]
 mod feature;
+#[path = "../../common/link.rs"]
+mod link;
+#[path = "../../common/module.rs"]
+mod module;
 #[path = "../../common/verify.rs"]
 mod verify;
+#[path = "../../common/wire.rs"]
+mod wire;
 
 use bytecode::Unit;
-
-const POLL_INPUT: u32 = 0x01;
-const POLL_OUTPUT: u32 = 0x02;
+use module::{Form, Import, Key, Registry};
 
 /// Modules one closure may hold.
 const MAX_MODULES: usize = 16;
@@ -53,26 +59,8 @@ const VERIFIER_CAPACITY: usize = 4096;
 /// Bytes in one record's header: the two lengths.
 const RECORD_HEADER: usize = 8;
 
-/// One module the stream carried.
-#[derive(Clone, Copy)]
-struct Record {
-    specifier_at: u32,
-    specifier_length: u32,
-    image_at: u32,
-    image_length: u32,
-    /// Where the module sits in the order it will evaluate in.
-    order: u32,
-}
-
-impl Record {
-    const EMPTY: Self = Self {
-        specifier_at: 0,
-        specifier_length: 0,
-        image_at: 0,
-        image_length: 0,
-        order: u32::MAX,
-    };
-}
+/// Imports one closure may carry, over all its modules.
+const MAX_IMPORTS: usize = 128;
 
 #[repr(C)]
 struct State {
@@ -83,13 +71,9 @@ struct State {
     stream: [u8; STREAM_CAPACITY],
     closure: [u8; CLOSURE_CAPACITY],
     verifier_state: [i32; VERIFIER_CAPACITY],
-    records: [Record; MAX_MODULES],
-    order: [u32; MAX_MODULES],
-    visiting: [u8; MAX_MODULES],
     stream_length: usize,
     closure_length: usize,
     written: usize,
-    record_count: usize,
     overflowed: bool,
     failed: bool,
     phase: u8,
@@ -100,11 +84,23 @@ fn link(state: &mut State) -> bool {
     if state.overflowed {
         return false;
     }
-    // The stream is a sequence of records, each with its two lengths in front.
+    let State {
+        stream,
+        stream_length,
+        verifier_state,
+        closure,
+        closure_length,
+        ..
+    } = state;
+    let stream = stream.get(..*stream_length).unwrap_or(&[]);
+
+    // The stream is a sequence of records, each with its two lengths in front:
+    // a specifier and an image.
+    let mut modules = [(&[] as &[u8], &[] as &[u8]); MAX_MODULES];
+    let mut count = 0usize;
     let mut at = 0usize;
-    state.record_count = 0;
-    while at < state.stream_length {
-        let Some(header) = state.stream.get(at..at + RECORD_HEADER) else {
+    while at < stream.len() {
+        let Some(header) = stream.get(at..at + RECORD_HEADER) else {
             return false;
         };
         let specifier_length =
@@ -114,163 +110,133 @@ fn link(state: &mut State) -> bool {
         let specifier_at = at + RECORD_HEADER;
         let image_at = specifier_at + specifier_length;
         let end = image_at + image_length;
-        if end > state.stream_length || state.record_count >= MAX_MODULES {
+        if end > stream.len() || count >= MAX_MODULES {
             return false;
         }
-        state.records[state.record_count] = Record {
-            specifier_at: u32::try_from(specifier_at).unwrap_or(0),
-            specifier_length: u32::try_from(specifier_length).unwrap_or(0),
-            image_at: u32::try_from(image_at).unwrap_or(0),
-            image_length: u32::try_from(image_length).unwrap_or(0),
-            order: u32::MAX,
+        let (Some(specifier), Some(image)) = (
+            stream.get(specifier_at..image_at),
+            stream.get(image_at..end),
+        ) else {
+            return false;
         };
-        state.record_count += 1;
+        modules[count] = (specifier, image);
+        count += 1;
         at = end;
     }
-    if state.record_count == 0 {
+    if count == 0 {
         return false;
     }
+    let modules = &modules[..count];
 
     // Every image must be admissible before anything is linked: a closure of
     // images one of which does not verify is not a closure.
-    let stream: &[u8] =
-        unsafe { core::slice::from_raw_parts(state.stream.as_ptr(), state.stream_length) };
     let mut units = [Unit::EMPTY; MAX_MODULES];
     let mut index = 0usize;
-    while index < state.record_count {
-        let record = state.records[index];
-        let Some(image) =
-            stream.get(record.image_at as usize..(record.image_at + record.image_length) as usize)
-        else {
-            return false;
-        };
-        let Ok(unit) = verify::admit(image, &mut state.verifier_state) else {
+    while index < count {
+        let Ok(unit) = verify::admit(modules[index].1, verifier_state) else {
             return false;
         };
         units[index] = unit;
         index += 1;
     }
 
+    // Register the modules under their specifiers, each with its imports, then
+    // resolve every import to the module its specifier names. The name must be
+    // one that module exports, or the closure is not linked however it is
+    // ordered.
+    let mut records = [module::Record::EMPTY; MAX_MODULES];
+    let mut imports = [Import::EMPTY; MAX_IMPORTS];
+    let mut registry = Registry::new(&mut records, &mut imports);
+    let mut index = 0usize;
+    while index < count {
+        if registry.register(key_of(modules[index].0), Form::Image) != Ok(index) {
+            return false;
+        }
+        let mut import = 0u32;
+        while import < units[index].header().import_count {
+            if registry.add_import(index, 0, 0).is_err() {
+                return false;
+            }
+            import += 1;
+        }
+        index += 1;
+    }
+    let mut index = 0usize;
+    while index < count {
+        let mut import = 0u32;
+        while import < units[index].header().import_count {
+            let mut specifier = [0u16; 64];
+            let mut name = [0u16; 64];
+            let Some((specifier_length, name_length, _)) =
+                units[index].import_at(import, &mut specifier, &mut name)
+            else {
+                return false;
+            };
+            let Some(source) = find_module(modules, &specifier, specifier_length) else {
+                return false;
+            };
+            if name_length != 0
+                && units[source]
+                    .export_slot(name.get(..name_length).unwrap_or(&[]))
+                    .is_none()
+            {
+                return false;
+            }
+            if registry
+                .resolve(index, import as usize, key_of(modules[source].0))
+                .is_err()
+            {
+                return false;
+            }
+            import += 1;
+        }
+        index += 1;
+    }
+
     // Order the closure: a module comes after everything it imports. A cycle is
     // admitted — the specification allows one — and its members keep the order
     // they were reached in, which is what makes a read of a binding that has
-    // not been initialised the error it should be.
-    let mut ordered = 0u32;
-    let mut index = 0usize;
-    while index < state.record_count {
-        state.visiting[index] = 0;
-        index += 1;
-    }
-    let mut index = 0usize;
-    while index < state.record_count {
-        if !order_module(state, &units, index, &mut ordered) {
-            return false;
-        }
-        index += 1;
-    }
-
-    // The entry is the module nothing else imports, which is the last one the
-    // ordering reached.
-    let entry = ordered.saturating_sub(1);
-    let mut modules = [(&[] as &[u8], &[] as &[u8]); MAX_MODULES];
-    let mut index = 0usize;
-    while index < state.record_count {
-        let record = state.records[index];
-        let Some(specifier) = stream.get(
-            record.specifier_at as usize..(record.specifier_at + record.specifier_length) as usize,
-        ) else {
-            return false;
-        };
-        let Some(image) =
-            stream.get(record.image_at as usize..(record.image_at + record.image_length) as usize)
-        else {
-            return false;
-        };
-        let position = record.order as usize;
-        if position >= state.record_count {
-            return false;
-        }
-        modules[position] = (specifier, image);
-        index += 1;
-    }
-
-    let Ok(length) = closure::write(
-        &mut state.closure,
-        modules.get(..state.record_count).unwrap_or(&[]),
-        entry,
-    ) else {
+    // not been initialised the error it should be. The entry is the module
+    // nothing else imports, which is the last one the ordering reached.
+    let mut stack = [(0u32, 0u32); MAX_MODULES];
+    let mut walk = [0u8; MAX_MODULES];
+    let Ok(linked) = link::link_all(&mut registry, &mut stack, &mut walk) else {
         return false;
     };
-    state.closure_length = length;
+    let mut ordered = [(&[] as &[u8], &[] as &[u8]); MAX_MODULES];
+    let mut index = 0usize;
+    while index < count {
+        let position = registry.order(index).unwrap_or(u32::MAX) as usize;
+        if position >= count {
+            return false;
+        }
+        ordered[position] = modules[index];
+        index += 1;
+    }
+
+    let Ok(length) = closure::write(closure, &ordered[..count], linked.entry_order) else {
+        return false;
+    };
+    *closure_length = length;
     true
 }
 
-/// Give a module its place in the order, after everything it imports.
-fn order_module(
-    state: &mut State,
-    units: &[Unit<'_>; MAX_MODULES],
-    index: usize,
-    next: &mut u32,
-) -> bool {
-    if state.records[index].order != u32::MAX {
-        return true;
-    }
-    if state.visiting[index] == 1 {
-        // A cycle: the module is already on the way to being ordered, and the
-        // one that reached it keeps its own place.
-        return true;
-    }
-    state.visiting[index] = 1;
-    let imports = units[index].header().import_count;
-    let mut import = 0u32;
-    while import < imports {
-        let mut specifier = [0u16; 64];
-        let mut name = [0u16; 64];
-        let Some((specifier_length, name_length, _)) =
-            units[index].import_at(import, &mut specifier, &mut name)
-        else {
-            return false;
-        };
-        let Some(source) = find_module(state, &specifier, specifier_length) else {
-            return false;
-        };
-        // The name must be one that module exports, or the closure is not
-        // linked however it is ordered.
-        if name_length != 0
-            && units[source]
-                .export_slot(name.get(..name_length).unwrap_or(&[]))
-                .is_none()
-        {
-            return false;
-        }
-        if !order_module(state, units, source, next) {
-            return false;
-        }
-        import += 1;
-    }
-    state.visiting[index] = 2;
-    if state.records[index].order == u32::MAX {
-        state.records[index].order = *next;
-        *next += 1;
-    }
-    true
+/// A module's key in the registry: the digest of the specifier the stream
+/// carried it under, which is what an import names.
+fn key_of(specifier: &[u8]) -> Key {
+    Key(digest::digest(specifier))
 }
 
 /// The module a specifier names, compared as the bytes the stream carried.
-fn find_module(state: &State, specifier: &[u16], length: usize) -> Option<usize> {
+fn find_module(modules: &[(&[u8], &[u8])], specifier: &[u16], length: usize) -> Option<usize> {
     let mut index = 0usize;
-    while index < state.record_count {
-        let record = state.records[index];
-        if record.specifier_length as usize == length {
+    while index < modules.len() {
+        let carried = modules[index].0;
+        if carried.len() == length {
             let mut at = 0usize;
             let mut same = true;
             while at < length {
-                let byte = state
-                    .stream
-                    .get(record.specifier_at as usize + at)
-                    .copied()
-                    .unwrap_or(0);
-                if u16::from(byte) != specifier[at] {
+                if u16::from(carried[at]) != specifier[at] {
                     same = false;
                     break;
                 }
@@ -285,56 +251,27 @@ fn find_module(state: &State, specifier: &[u16], length: usize) -> Option<usize>
     None
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
+entry! {
+    State;
+    primary { unit_in, closure_out }
+    inputs {}
+    outputs { exit_out = 1 }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<State>() {
-        return -2;
-    }
-    unsafe {
-        let table = syscalls.cast::<SyscallTable>();
-        let state = state.cast::<State>();
-        core::ptr::write_bytes(state.cast::<u8>(), 0, core::mem::size_of::<State>());
-        core::ptr::addr_of_mut!((*state).syscalls).write(table);
-        core::ptr::addr_of_mut!((*state).unit_in).write(in_chan);
-        core::ptr::addr_of_mut!((*state).closure_out).write(out_chan);
-        core::ptr::addr_of_mut!((*state).exit_out).write(dev_channel_port(&*table, 1, 1));
-    }
-    0
-}
-
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.unit_in < 0 || state.closure_out < 0 {
         return -2;
     }
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
 
     if state.phase == 3 {
@@ -344,34 +281,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // The whole stream is staged before anything is linked: a closure is every
     // module of it, and a partial stream is not one.
     if state.phase == 0 {
-        let poll = unsafe { (syscalls.channel_poll)(state.unit_in, POLL_INPUT | POLL_HUP) };
-        if poll <= 0 {
-            return 0;
-        }
-        if (poll as u32) & POLL_INPUT != 0 {
-            let offset = state.stream_length;
-            let remaining = STREAM_CAPACITY.saturating_sub(offset);
-            if remaining == 0 {
-                state.overflowed = true;
-                let mut discard = [0u8; 64];
-                let _ = unsafe {
-                    (syscalls.channel_read)(state.unit_in, discard.as_mut_ptr(), discard.len())
-                };
-                return 0;
-            }
-            let read = unsafe {
-                (syscalls.channel_read)(
-                    state.unit_in,
-                    state.stream.as_mut_ptr().add(offset),
-                    remaining,
-                )
-            };
-            if read > 0 {
-                state.stream_length += usize::try_from(read).unwrap_or(0).min(remaining);
-            }
-            return 0;
-        }
-        if (poll as u32) & POLL_HUP == 0 {
+        let staged = wire::stage_stream(
+            syscalls,
+            state.unit_in,
+            &mut state.stream,
+            &mut state.stream_length,
+            &mut state.overflowed,
+        );
+        if staged != wire::Staged::Complete {
             return 0;
         }
         state.failed = !link(state);
@@ -384,36 +301,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.phase = 2;
             return 0;
         }
-        let poll = unsafe { (syscalls.channel_poll)(state.closure_out, POLL_OUTPUT) };
-        if poll <= 0 || (poll as u32) & POLL_OUTPUT == 0 {
-            return 0;
-        }
-        let offset = state.written;
-        let remaining = state.closure_length.saturating_sub(offset);
-        if remaining == 0 {
+        let closure = state.closure.get(..state.closure_length).unwrap_or(&[]);
+        if wire::push_progress(syscalls, state.closure_out, closure, &mut state.written) {
             state.phase = 2;
-            return 0;
-        }
-        let written = unsafe {
-            (syscalls.channel_write)(
-                state.closure_out,
-                state.closure.as_ptr().add(offset),
-                remaining,
-            )
-        };
-        if written > 0 {
-            state.written += usize::try_from(written).unwrap_or(0).min(remaining);
         }
         return 0;
     }
 
-    if state.exit_out >= 0 {
-        let code = i32::from(state.failed).to_le_bytes();
-        let written =
-            unsafe { (syscalls.channel_write)(state.exit_out, code.as_ptr(), code.len()) };
-        if written != i32::try_from(code.len()).unwrap_or(i32::MAX) {
-            return 0;
-        }
+    if !wire::push_exit(syscalls, state.exit_out, state.failed) {
+        return 0;
     }
     state.phase = 3;
     // A stream that does not compile is an outcome, not a fault: the exit status

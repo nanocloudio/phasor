@@ -1,21 +1,21 @@
 # Fmod Catalogue
 
 Every executable part of Phasor is an fmod. This page is the register of them:
-what is built, what each one owns, what crosses its ports, and what the design
-names that this build does not have yet. Names are ecosystem-unique. Port
-frames are bounded binary records with explicit lengths and checked offsets.
+what is built, what each one owns, what crosses its ports, and what each one
+takes as a parameter. Names are ecosystem-unique. Port frames are bounded
+binary records with explicit lengths and checked offsets.
 
 ## Engine fmods
 
 | Fmod | Kind | Inputs | Outputs | Owns |
 |---|---|---|---|---|
-| `phasor_compile` | Transformer | `source_in` | `image_out`, `diagnostic`, `exit` | Lexing, parsing, early errors, bytecode emission, verification, image serialisation. A parameter says whether the source is a script or a module |
+| `phasor_compile` | Transformer | `source_in` | `image_out`, `diagnostic`, `exit` | Lexing, parsing, early errors, bytecode emission, verification, image serialisation. The `goal` parameter says whether the source is a script or a module |
 | `phasor_link` | Transformer | `unit_in` | `closure_out`, `exit` | Module closure: admitting each image, resolving every specifier and imported name, ordering the closure, writing the container |
 | `phasor_isolate` | EventHandler | `image_in`, `completion_in`, `control_in` | `result_out`, `call_out`, `diagnostic`, `exit` | Realm, machine, objects, heap, collection, jobs, promises, pending calls, module evaluation |
 | `phasor_host_router` | Protocol | `call_in`, `reply_in` | `completion_out`, `request_out` | Binding admission, routing, correlation, bounded in-flight table |
 | `phasor_cli` | Cli | `result_in`, `diagnostic_in`, `runtime_in` | `stdout`, `stderr`, `exit` | Human framing: the only place that turns a diagnostic's numbers into words |
-| `phasor_time` | Adapter | `request_in` | `reply_out` | A time observation, in the unit a parameter names, under a quota it sets |
-| `phasor_entropy` | Adapter | `request_in` | `reply_out` | Seed bytes from the platform's own source, under a quota |
+| `phasor_time` | Adapter | `request_in` | `reply_out` | A time observation from the `source` its parameter names — monotonic milliseconds or microseconds, or Unix milliseconds — under the `quota` it sets |
+| `phasor_entropy` | Adapter | `request_in` | `reply_out` | A random number from the platform's own source, 32 or 53 bits wide as the `width` parameter says, under a `quota` |
 | `phasor_eval` | Transformer | `source_in` | `result_out`, `exit` | The bounded expression evaluator, kept as the smallest end-to-end path |
 
 A source stream ending in a hang-up is one source; an image stream ending in a
@@ -29,8 +29,9 @@ an image is content-addressed, so what runs is the bytes that arrived.
 
 | Fmod | Purpose | Shipping rule |
 |---|---|---|
-| `phasor_fault_host` | Answers a router's calls with a value, a refusal, an unavailable provider, or nothing at all | Fixture only |
-| `phasor_test262` | Runs admitted Test262 cases on the graph and reports per-feature evidence | Fixture only |
+| `phasor_fault_host` | Answers a router's calls the way its `mode` parameter says: with a `value`, a denial, an unavailable provider, or silence, after a `grace` | Fixture only |
+| `phasor_test262` | Tokenizes and parses a batch of Test262 cases on the graph and reports per-area evidence | Fixture only |
+| `phasor_run262` | Compiles and runs a batch of Test262 cases behind the harness and answers one verdict per case | Fixture only |
 | `phasor_lex_probe`, `phasor_parse_probe`, `phasor_compile_probe`, `phasor_bytecode_probe` | Front-end assertions | Fixture only |
 | `phasor_value_probe`, `phasor_string_probe`, `phasor_object_probe`, `phasor_gc_probe` | Value, string, object, and collection assertions | Fixture only |
 | `phasor_vm_probe`, `phasor_error_probe`, `phasor_promise_probe`, `phasor_control_probe` | Machine, unwinding, job, and budget assertions | Fixture only |
@@ -66,7 +67,7 @@ Every fmod's work is bounded per step and its state carries the rest.
 |---|---|
 | `phasor_compile` | source bytes staged per step, syntax nodes, constants, code bytes |
 | `phasor_link` | modules in a closure, bytes of stream and closure |
-| `phasor_isolate` | `steps` a program may run, `call_wait` steps before an unanswered call times out, instructions per slice, jobs per slice, collection slice, calls in flight |
+| `phasor_isolate` | `steps` a program may run and `call_wait` steps before an unanswered call times out, both parameters clamped to the compiled-in ceiling; instructions per slice, jobs per slice, collection slice, and calls in flight, all compiled in |
 | `phasor_host_router` | calls in flight, frames staged per output |
 | `phasor_fault_host`, `phasor_time`, `phasor_entropy` | replies staged, and the quota an adapter was given |
 | `phasor_cli` | bytes of result and of rendered text |

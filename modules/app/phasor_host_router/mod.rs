@@ -8,7 +8,7 @@
 //! It holds no address and no credential. Which adapter serves the binding is
 //! the graph's wiring, not this module's knowledge.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -16,13 +16,15 @@
     reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
 )]
 
-use core::ffi::c_void;
-
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
 
 #[path = "../../common/binding.rs"]
 mod binding;
@@ -34,11 +36,10 @@ mod numeric;
 mod softfloat;
 #[path = "../../common/value.rs"]
 mod value;
+#[path = "../../common/wire.rs"]
+mod wire;
 
 use binding::{CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
-
-const POLL_INPUT: u32 = 0x01;
-const POLL_OUTPUT: u32 = 0x02;
 
 /// Bindings this router admits. A call on any other index is refused here.
 const ADMITTED: u32 = 1;
@@ -206,109 +207,27 @@ fn correlate(state: &mut State, record: &CompletionRecord) {
     let _ = stage_completion(state, record);
 }
 
-/// Read whole frames off an input, one at a time.
-fn take_frame(
-    syscalls: &SyscallTable,
-    channel: i32,
-    buffer: *mut u8,
-    filled: &mut usize,
-    width: usize,
-) -> bool {
-    if channel < 0 {
-        return false;
-    }
-    let poll = unsafe { (syscalls.channel_poll)(channel, POLL_INPUT) };
-    if poll <= 0 || (poll as u32) & POLL_INPUT == 0 {
-        return false;
-    }
-    let remaining = width.saturating_sub(*filled);
-    if remaining == 0 {
-        return true;
-    }
-    let read = unsafe { (syscalls.channel_read)(channel, buffer.add(*filled), remaining) };
-    if read > 0 {
-        *filled += usize::try_from(read).unwrap_or(0).min(remaining);
-    }
-    *filled == width
+entry! {
+    State;
+    primary { call_in, completion_out }
+    inputs { reply_in = 1 }
+    outputs { request_out = 1 }
 }
 
-/// Push staged bytes out, and forget them once they are all gone.
-fn push(
-    syscalls: &SyscallTable,
-    channel: i32,
-    bytes: *const u8,
-    staged: &mut usize,
-    written: &mut usize,
-) {
-    if channel < 0 || *written >= *staged {
-        return;
-    }
-    let poll = unsafe { (syscalls.channel_poll)(channel, POLL_OUTPUT) };
-    if poll <= 0 || (poll as u32) & POLL_OUTPUT == 0 {
-        return;
-    }
-    let remaining = staged.saturating_sub(*written);
-    let count = unsafe { (syscalls.channel_write)(channel, bytes.add(*written), remaining) };
-    if count > 0 {
-        *written += usize::try_from(count).unwrap_or(0).min(remaining);
-    }
-    if *written >= *staged {
-        *written = 0;
-        *staged = 0;
-    }
-}
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
-}
-
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<State>() {
-        return -2;
-    }
-    unsafe {
-        let table = syscalls.cast::<SyscallTable>();
-        let state = state.cast::<State>();
-        core::ptr::write_bytes(state.cast::<u8>(), 0, core::mem::size_of::<State>());
-        core::ptr::addr_of_mut!((*state).syscalls).write(table);
-        core::ptr::addr_of_mut!((*state).call_in).write(in_chan);
-        core::ptr::addr_of_mut!((*state).completion_out).write(out_chan);
-        core::ptr::addr_of_mut!((*state).reply_in).write(dev_channel_port(&*table, 0, 1));
-        core::ptr::addr_of_mut!((*state).request_out).write(dev_channel_port(&*table, 1, 1));
-    }
-    0
-}
-
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.call_in < 0 || state.completion_out < 0 {
         return -2;
     }
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
     if state.phase == 1 {
         return 1;
@@ -318,10 +237,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.completions_staged + COMPLETION_FRAME <= state.completions.len()
         && state.requests_staged + CALL_FRAME <= state.requests.len()
     {
-        let buffer = state.call.as_mut_ptr();
-        let mut filled = state.call_filled;
-        let complete = take_frame(syscalls, state.call_in, buffer, &mut filled, CALL_FRAME);
-        state.call_filled = filled;
+        let complete = wire::take_frame(
+            syscalls,
+            state.call_in,
+            &mut state.call,
+            &mut state.call_filled,
+        );
         if complete {
             state.call_filled = 0;
             if let Some(record) = CallRecord::decode(&state.call) {
@@ -333,16 +254,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     if state.completions_staged + COMPLETION_FRAME <= state.completions.len() {
-        let buffer = state.reply.as_mut_ptr();
-        let mut filled = state.reply_filled;
-        let complete = take_frame(
+        let complete = wire::take_frame(
             syscalls,
             state.reply_in,
-            buffer,
-            &mut filled,
-            COMPLETION_FRAME,
+            &mut state.reply,
+            &mut state.reply_filled,
         );
-        state.reply_filled = filled;
         if complete {
             state.reply_filled = 0;
             if let Some(record) = CompletionRecord::decode(&state.reply) {
@@ -353,40 +270,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
     }
 
-    let requests = state.requests.as_ptr();
-    let mut staged = state.requests_staged;
-    let mut written = state.requests_written;
-    push(
+    wire::push_staged(
         syscalls,
         state.request_out,
-        requests,
-        &mut staged,
-        &mut written,
+        &state.requests,
+        &mut state.requests_staged,
+        &mut state.requests_written,
     );
-    state.requests_staged = staged;
-    state.requests_written = written;
-
-    let completions = state.completions.as_ptr();
-    let mut staged = state.completions_staged;
-    let mut written = state.completions_written;
-    push(
+    wire::push_staged(
         syscalls,
         state.completion_out,
-        completions,
-        &mut staged,
-        &mut written,
+        &state.completions,
+        &mut state.completions_staged,
+        &mut state.completions_written,
     );
-    state.completions_staged = staged;
-    state.completions_written = written;
 
     // The router is finished when the isolate has hung up and everything
     // staged has left. A call still outstanding at that point has nobody left
     // to answer to; holding the graph open for it would help no one.
-    if !state.hung_up {
-        let poll = unsafe { (syscalls.channel_poll)(state.call_in, POLL_HUP) };
-        if poll > 0 && (poll as u32) & POLL_HUP != 0 {
-            state.hung_up = true;
-        }
+    if !state.hung_up && wire::hung_up(syscalls, state.call_in) {
+        state.hung_up = true;
     }
     if state.hung_up
         && state.requests_staged == 0

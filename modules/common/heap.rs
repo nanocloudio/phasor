@@ -28,11 +28,9 @@ pub enum CellKind {
     Symbol = 2,
     BigInt = 3,
     Object = 4,
-    Shape = 5,
-    Environment = 6,
-    Function = 7,
-    PropertyTable = 8,
-    Elements = 9,
+    Environment = 5,
+    PropertyTable = 6,
+    Elements = 7,
 }
 
 impl CellKind {
@@ -43,11 +41,9 @@ impl CellKind {
             2 => Self::Symbol,
             3 => Self::BigInt,
             4 => Self::Object,
-            5 => Self::Shape,
-            6 => Self::Environment,
-            7 => Self::Function,
-            8 => Self::PropertyTable,
-            9 => Self::Elements,
+            5 => Self::Environment,
+            6 => Self::PropertyTable,
+            7 => Self::Elements,
             _ => return None,
         };
         Some(kind)

@@ -1,6 +1,6 @@
-//! On-graph conformance probe for the bounded seed evaluator.
+//! On-graph conformance probe for the bounded expression evaluator.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -8,16 +8,24 @@
     reason = "the Fluxor ABI source is mounted as one surface and this fixture consumes a subset"
 )]
 
-use core::ffi::c_void;
-
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
+
 #[path = "../../common/eval_core.rs"]
 mod eval_core;
+#[path = "../../common/probe.rs"]
+mod probe;
+#[path = "../../common/text.rs"]
+mod text;
+#[path = "../../common/wire.rs"]
+mod wire;
 use eval_core::{evaluate, EvalError};
 
 const CASE_COUNT: u16 = 8;
@@ -27,10 +35,8 @@ struct State {
     syscalls: *const SyscallTable,
     report_out: i32,
     exit_out: i32,
-    case: u16,
+    progress: probe::Progress,
     byte: u16,
-    failures: u16,
-    phase: u8,
 }
 
 fn evaluates_to(source: &[u8], fuel: u32, expected: &[u8]) -> bool {
@@ -66,117 +72,46 @@ fn run_case(case: u16) -> bool {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
+entry! {
+    State;
+    primary { report_out }
+    inputs {}
+    outputs { exit_out = 1 }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    _in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<State>() {
-        return -2;
-    }
-    unsafe {
-        let table = syscalls.cast::<SyscallTable>();
-        core::ptr::write(
-            state.cast::<State>(),
-            State {
-                syscalls: table,
-                report_out: out_chan,
-                exit_out: dev_channel_port(&*table, 1, 1),
-                case: 0,
-                byte: 0,
-                failures: 0,
-                phase: 0,
-            },
-        );
-    }
-    0
-}
-
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() {
         return -2;
     }
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
-
-    if state.phase == 2 {
-        return 1;
-    }
-    if state.case < CASE_COUNT - 1 {
-        if !run_case(state.case) {
-            state.failures = state.failures.saturating_add(1);
-        }
-        state.case = state.case.saturating_add(1);
-        return 0;
-    }
-    if state.byte <= u16::from(u8::MAX) {
+    // Every byte value is scanned once after the cases, so no input can
+    // make the scanner misbehave.
+    if state.progress.case >= CASE_COUNT && state.byte <= u16::from(u8::MAX) {
         let mut output = [0u8; 16];
         let input = [u8::try_from(state.byte).unwrap_or(u8::MAX)];
         let _ = evaluate(&input, 2, &mut output);
         state.byte = state.byte.saturating_add(1);
         return 0;
     }
-
-    if state.phase == 0 {
-        let report: &[u8] = if state.failures == 0 {
-            b"phasor-eval-probe: 8 passed\n"
-        } else {
-            b"phasor-eval-probe: failed\n"
-        };
-        // A graph that gives the probe no report port still runs it; the
-        // outcome then shows in the module's own completion status.
-        if state.report_out >= 0 {
-            let written = unsafe {
-                (syscalls.channel_write)(state.report_out, report.as_ptr(), report.len())
-            };
-            if written != i32::try_from(report.len()).unwrap_or(i32::MAX) {
-                return 0;
-            }
-        }
-        state.phase = 1;
-    }
-
-    if state.exit_out >= 0 {
-        let code = i32::from(state.failures != 0).to_le_bytes();
-        let written =
-            unsafe { (syscalls.channel_write)(state.exit_out, code.as_ptr(), code.len()) };
-        if written != i32::try_from(code.len()).unwrap_or(i32::MAX) {
-            return 0;
-        }
-    }
-    state.phase = 2;
-    // Completing is the pass signal for a graph with no port to report on; a
-    // failure is a module error, which the kernel reports either way.
-    if state.failures == 0 {
-        1
-    } else {
-        -3
-    }
+    probe::step(
+        &mut state.progress,
+        syscalls,
+        state.report_out,
+        state.exit_out,
+        b"phasor-eval-probe",
+        CASE_COUNT,
+        run_case,
+    )
 }
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");

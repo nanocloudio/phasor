@@ -41,11 +41,13 @@ impl Handle {
         Self { index, generation }
     }
 
-    const fn pack(self) -> u64 {
+    /// The handle as one 64-bit word: the generation above the index.
+    pub const fn pack(self) -> u64 {
         ((self.generation as u64) << 32) | self.index as u64
     }
 
-    const fn unpack(bits: u64) -> Self {
+    /// The handle a `pack` produced.
+    pub const fn unpack(bits: u64) -> Self {
         Self {
             index: (bits & 0xFFFF_FFFF) as u32,
             generation: (bits >> 32) as u32,
@@ -188,6 +190,107 @@ impl Value {
     /// Build a Number value from an integer without a conversion instruction.
     pub fn from_i32(value: i32) -> Self {
         Self::number(softfloat::from_i64(i64::from(value)))
+    }
+}
+
+/// A fixed-width field read, checked once, so no access fails at run time.
+pub fn field<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+    <[u8; N]>::try_from(bytes.get(at..at + N)?).ok()
+}
+
+impl Handle {
+    /// The index a cell field holds when it names no handle.
+    pub const NONE_INDEX: u32 = u32::MAX;
+
+    /// Write the handle as its index and generation, little-endian.
+    pub fn write_at(self, out: &mut [u8], at: usize) {
+        if let Some(field) = out.get_mut(at..at + 8) {
+            field[..4].copy_from_slice(&self.index.to_le_bytes());
+            field[4..].copy_from_slice(&self.generation.to_le_bytes());
+        }
+    }
+
+    /// Write the "no handle" sentinel.
+    pub fn write_none_at(out: &mut [u8], at: usize) {
+        if let Some(field) = out.get_mut(at..at + 8) {
+            field[..4].copy_from_slice(&Self::NONE_INDEX.to_le_bytes());
+            field[4..].copy_from_slice(&0u32.to_le_bytes());
+        }
+    }
+
+    /// Read a handle written by `write_at`; `None` for the sentinel or a
+    /// field that is not there.
+    pub fn read_at(bytes: &[u8], at: usize) -> Option<Self> {
+        let field: [u8; 8] = field(bytes, at)?;
+        let index = u32::from_le_bytes([field[0], field[1], field[2], field[3]]);
+        if index == Self::NONE_INDEX {
+            return None;
+        }
+        let generation = u32::from_le_bytes([field[4], field[5], field[6], field[7]]);
+        Some(Self::new(index, generation))
+    }
+}
+
+impl Value {
+    /// Bytes one encoded value takes: a tag and eight payload bytes.
+    pub const ENCODED: usize = 9;
+    /// Bytes the short form takes: a tag, a 32-bit index, a 16-bit
+    /// generation. Only an object reference survives it.
+    pub const ENCODED_SHORT: usize = 7;
+
+    /// Encode the value into `out` at `at`. A field that is not there is
+    /// left alone.
+    pub fn encode_at(self, out: &mut [u8], at: usize) {
+        if let Some(field) = out.get_mut(at..at + Self::ENCODED) {
+            field[0] = self.tag as u8;
+            field[1..].copy_from_slice(&self.payload.to_le_bytes());
+        }
+    }
+
+    /// Decode a value written by `encode_at`; `undefined` for a field that
+    /// is not there or a tag that is not one.
+    pub fn decode_at(bytes: &[u8], at: usize) -> Self {
+        let Some(field) = field::<9>(bytes, at) else {
+            return Self::UNDEFINED;
+        };
+        let payload = u64::from_le_bytes([
+            field[1], field[2], field[3], field[4], field[5], field[6], field[7], field[8],
+        ]);
+        let handle = Handle::unpack(payload);
+        match field[0] {
+            1 => Self::NULL,
+            2 => Self::boolean(payload != 0),
+            3 => Self::number(f64::from_bits(payload)),
+            4 => Self::string(handle),
+            5 => Self::symbol(handle),
+            6 => Self::big_int(handle),
+            7 => Self::object(handle),
+            _ => Self::UNDEFINED,
+        }
+    }
+
+    /// Encode the short form: a tag and a handle whose generation is
+    /// truncated to sixteen bits, which is all an accessor slot holds.
+    pub fn encode_short_at(self, out: &mut [u8], at: usize) {
+        if let Some(field) = out.get_mut(at..at + Self::ENCODED_SHORT) {
+            field[0] = self.tag as u8;
+            let handle = self.as_handle();
+            field[1..5].copy_from_slice(&handle.index.to_le_bytes());
+            field[5..7].copy_from_slice(&(handle.generation as u16).to_le_bytes());
+        }
+    }
+
+    /// Decode the short form: an object reference, or `undefined`.
+    pub fn decode_short_at(bytes: &[u8], at: usize) -> Self {
+        let Some(field) = field::<7>(bytes, at) else {
+            return Self::UNDEFINED;
+        };
+        if field[0] != Tag::Object as u8 {
+            return Self::UNDEFINED;
+        }
+        let index = u32::from_le_bytes([field[1], field[2], field[3], field[4]]);
+        let generation = u32::from(u16::from_le_bytes([field[5], field[6]]));
+        Self::object(Handle::new(index, generation))
     }
 }
 

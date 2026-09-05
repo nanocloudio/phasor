@@ -12,15 +12,13 @@
 //! its saved state, which is what lets a bounded step yield without losing a
 //! task in the middle of one.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
     unreachable_patterns,
     reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
 )]
-
-use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
@@ -29,8 +27,13 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[path = "../../common/arena.rs"]
-mod arena;
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
+
+#[path = "../../common/agent.rs"]
+#[macro_use]
+mod agent;
 #[path = "../../common/bigint.rs"]
 mod bigint;
 #[path = "../../common/binding.rs"]
@@ -45,8 +48,6 @@ mod diagnostic;
 mod digest;
 #[path = "../../common/dtoa.rs"]
 mod dtoa;
-#[path = "../../common/emit.rs"]
-mod emit;
 #[path = "../../common/env.rs"]
 mod env;
 #[path = "../../common/evalsite.rs"]
@@ -59,14 +60,10 @@ mod gc;
 mod heap;
 #[path = "../../common/job.rs"]
 mod job;
-#[path = "../../common/lex.rs"]
-mod lex;
 #[path = "../../common/numeric.rs"]
 mod numeric;
 #[path = "../../common/object.rs"]
 mod object;
-#[path = "../../common/parse.rs"]
-mod parse;
 #[path = "../../common/policy.rs"]
 mod policy;
 #[path = "../../common/promise.rs"]
@@ -77,8 +74,6 @@ mod realm;
 mod regexp;
 #[path = "../../common/softfloat.rs"]
 mod softfloat;
-#[path = "../../common/source.rs"]
-mod source;
 #[path = "../../common/string.rs"]
 mod string;
 #[path = "../../common/unicode_id.rs"]
@@ -89,6 +84,8 @@ mod value;
 mod verify;
 #[path = "../../common/vm.rs"]
 mod vm;
+#[path = "../../common/wire.rs"]
+mod wire;
 
 use binding::{
     Binding, Bindings, BindingsSave, CallRecord, Cause, CompletionRecord, Disposition, Pending,
@@ -97,16 +94,14 @@ use binding::{
 use bytecode::Unit;
 use closure::Closure;
 use diagnostic::{Diagnostic, Severity};
-use heap::{Heap, HeapSave, Slot};
+use heap::Slot;
 use job::{Job, Queue, QueueSave};
+use policy::Policy;
 use realm::Realm;
 use regexp::Choice;
 use string::{Atoms, AtomsSave};
 use value::{Handle, Value};
-use vm::{Completion, Frame, ModuleInstance, Progress, Saves, Snapshot, Vm};
-
-const POLL_INPUT: u32 = 0x01;
-const POLL_OUTPUT: u32 = 0x02;
+use vm::{Completion, Frame, ModuleInstance, Progress, Saves, Vm};
 
 const IMAGE_CAPACITY: usize = 64 * 1024;
 const RESULT_CAPACITY: usize = 128;
@@ -161,6 +156,53 @@ const MAX_MODULES: usize = 16;
 const MAX_IMPORTS: usize = 128;
 /// The trace every call this isolate makes belongs to.
 const TRACE: u64 = 0x5041_5348_4f52_0001;
+
+/// The limits this isolate runs a task under: its storage, as declared
+/// above, and the fuel the graph named. Clamped to the ceiling, so a graph
+/// can narrow the compiled-in maxima but never widen them.
+fn policy(state: &State) -> Policy {
+    Policy {
+        heap_bytes: ARENA_BYTES as u32,
+        heap_cells: SLOT_COUNT as u32,
+        fuel: u64::from(state.steps),
+        frames: FRAME_COUNT as u32,
+        registers: REGISTER_COUNT as u32,
+        jobs: JOB_COUNT as u32,
+        pending_calls: PENDING_COUNT as u32,
+        image_bytes: IMAGE_CAPACITY as u32,
+        deadline_ms: 0,
+        collection_slice: COLLECTION_SLICE,
+    }
+    .clamped()
+}
+
+/// The seams beyond the storage: the linked closure's instances and resolved
+/// imports, when the image was one.
+fn attachments<'a>(
+    linked: bool,
+    instances: &'a mut [ModuleInstance],
+    import_table: &'a [(u32, u32)],
+    module_count: u32,
+    import_count: u32,
+    admitted: &'a [Binding],
+) -> agent::Attachments<'a, 'static> {
+    agent::Attachments {
+        admitted,
+        modules: if linked {
+            Some(agent::Closure {
+                instances: instances
+                    .get_mut(..module_count as usize)
+                    .unwrap_or(&mut []),
+                imports: import_table.get(..import_count as usize).unwrap_or(&[]),
+            })
+        } else {
+            None
+        },
+        module_names: &[],
+        module_cycles: &[],
+        compiler: None,
+    }
+}
 
 /// What one step of the machine did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +320,8 @@ fn start(state: &mut State) -> bool {
         return false;
     };
     // The image is staged once and never written again while it runs.
+    // SAFETY: the image is staged and not written while the machine runs, so
+    // it may keep reading it while the rest of the state moves.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
     // What arrived is either one script or a linked closure of modules.
     let closure = Closure::parse(bytes).ok();
@@ -373,77 +417,71 @@ fn start(state: &mut State) -> bool {
     } else {
         state.instances[0] = ModuleInstance::EMPTY;
     }
-    let unit = units[0];
-
-    let steps = state.steps;
-    let mut heap = Heap::with_worklist(&mut state.arena, &mut state.slots, &mut state.worklist);
-    let mut atoms = Atoms::new(&mut state.entries, &mut state.handles);
-    let Ok(realm) = realm::create(&mut heap, &mut atoms) else {
-        return false;
-    };
-    let mut queue = Queue::new(&mut state.jobs);
-    let mut bindings = Bindings::new(&mut state.descriptors, &mut state.pending);
     // One binding is admitted here, by the digest of its name and schema. What
     // answers it, and where that is, the isolate never learns.
-    if bindings
-        .admit(Binding {
-            name: digest::digest(b"host"),
-            schema: digest::digest(b"number->number"),
-            in_flight_max: IN_FLIGHT_MAX,
-            in_flight: 0,
-        })
-        .is_err()
-    {
-        return false;
-    }
-    let mut machine = Vm::new(
-        &unit,
-        &mut heap,
-        &mut atoms,
-        &mut state.frames,
-        &mut state.registers,
-        realm,
-        u64::from(steps),
+    let admitted = [Binding {
+        name: digest::digest(b"host"),
+        schema: digest::digest(b"number->number"),
+        in_flight_max: IN_FLIGHT_MAX,
+        in_flight: 0,
+    }];
+    let policy = policy(state);
+    let metering = agent::Metering {
+        policy: &policy,
+        collection_headroom: COLLECTION_HEADROOM,
+        trace: TRACE,
+    };
+    let linked = state.linked;
+    let module_count = state.module_count;
+    let import_count = state.import_count;
+    let attach = attachments(
+        linked,
+        &mut state.instances,
+        &state.import_table,
+        module_count,
+        import_count,
+        &admitted,
     );
-    machine.attach_regexp(&mut state.choices, &mut state.undo, &mut state.subject);
-    machine.attach_jobs(&mut queue);
-    machine.attach_bindings(&mut bindings, &mut state.outbox);
-    machine.attach_collector(&mut state.roots, COLLECTION_SLICE, COLLECTION_HEADROOM);
-    machine.set_trace(TRACE);
-    if machine.define_binding(b"host", 0).is_err() {
-        return false;
-    }
-    if state.linked {
-        let count = state.module_count;
-        let imports = state
-            .import_table
-            .get(..state.import_count as usize)
-            .unwrap_or(&[]);
-        let instances = state.instances.get_mut(..count as usize).unwrap_or(&mut []);
-        machine.attach_modules(
-            units.get(..count as usize).unwrap_or(&[]),
-            instances,
-            imports,
-        );
-        // Every module's environment is made before any of them runs, which is
-        // what lets one read another's exports once it has.
-        let mut index = 0u32;
-        while index < count {
-            let Ok(environment) = machine.create_module_environment(index) else {
+    let storage = agent_storage!(state);
+    let started = agent::fresh(
+        units.get(..count).unwrap_or(&[]),
+        storage,
+        attach,
+        metering,
+        |machine| {
+            if machine.define_binding(b"host", 0).is_err() {
                 return false;
-            };
-            machine.set_module_environment(index, environment);
-            index += 1;
-        }
-        state.current_module = 0;
-        if machine.start_module(0).is_err() {
-            return false;
-        }
-        state.module_started = true;
-    } else if machine.start().is_err() {
+            }
+            if linked {
+                // Every module's environment is made before any of them
+                // runs, which is what lets one read another's exports once
+                // it has.
+                let mut index = 0u32;
+                while index < module_count {
+                    let Ok(environment) = machine.create_module_environment(index) else {
+                        return false;
+                    };
+                    machine.set_module_environment(index, environment);
+                    index += 1;
+                }
+                state.current_module = 0;
+                if machine.start_module(0).is_err() {
+                    return false;
+                }
+                state.module_started = true;
+                true
+            } else {
+                machine.start().is_ok()
+            }
+        },
+    );
+    let Ok((ok, realm, saves)) = started else {
+        return false;
+    };
+    if !ok {
         return false;
     }
-    state.saves = machine.save();
+    state.saves = saves;
     state.realm = realm;
     true
 }
@@ -455,6 +493,8 @@ fn advance(state: &mut State) -> Advance {
     let Some(bytes) = state.image.get(..image_length) else {
         return Advance::Failed;
     };
+    // SAFETY: the image is staged and not written while the machine runs, so
+    // it may keep reading it while the rest of the state moves.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
     // The image was verified when it was admitted; parsing it again only
     // rebuilds the view of bytes that have not changed since.
@@ -480,288 +520,283 @@ fn advance(state: &mut State) -> Advance {
         };
         units[0] = unit;
     }
-    let unit = units[0];
-
     let steps = state.steps;
-    let mut heap = Heap::adopt(
-        &mut state.arena,
-        &mut state.slots,
-        &mut state.worklist,
-        &state.saves.heap,
+    let policy = policy(state);
+    let metering = agent::Metering {
+        policy: &policy,
+        collection_headroom: COLLECTION_HEADROOM,
+        trace: TRACE,
+    };
+    let linked = state.linked;
+    let module_count = state.module_count;
+    let import_count = state.import_count;
+    let attach = attachments(
+        linked,
+        &mut state.instances,
+        &state.import_table,
+        module_count,
+        import_count,
+        &[],
     );
-    let mut atoms = Atoms::adopt(&mut state.entries, &mut state.handles, &state.saves.atoms);
-    let mut queue = Queue::new(&mut state.jobs);
-    let mut bindings = Bindings::adopt(
-        &mut state.descriptors,
-        &mut state.pending,
-        &state.saves.bindings,
-    );
-    let mut machine = Vm::new(
-        &unit,
-        &mut heap,
-        &mut atoms,
-        &mut state.frames,
-        &mut state.registers,
-        state.realm,
-        u64::from(steps),
-    );
-    machine.attach_regexp(&mut state.choices, &mut state.undo, &mut state.subject);
-    machine.attach_jobs(&mut queue);
-    machine.attach_bindings(&mut bindings, &mut state.outbox);
-    machine.attach_collector(&mut state.roots, COLLECTION_SLICE, COLLECTION_HEADROOM);
-    if state.linked {
-        let count = state.module_count;
-        let imports = state
-            .import_table
-            .get(..state.import_count as usize)
-            .unwrap_or(&[]);
-        let instances = state.instances.get_mut(..count as usize).unwrap_or(&mut []);
-        machine.attach_modules(
-            units.get(..count as usize).unwrap_or(&[]),
-            instances,
-            imports,
-        );
-    }
-    machine.restore_all(&state.saves);
-    machine.retain(state.result_value);
-    // What the control port asked for reaches the machine here, every step:
-    // a cancel is sticky, and a deadline passes when a reported time reaches
-    // it. The machine observes both only at safe points.
-    if state.cancel_requested {
-        machine.control().cancel();
-    }
-    if state.deadline != 0 {
-        machine.control().set_deadline(state.deadline);
-    }
-    if state.now != 0 {
-        machine.control().observe(state.now);
-    }
+    let storage = agent_storage!(state);
+    let realm = state.realm;
+    let saves = state.saves;
+    let count = if linked { module_count as usize } else { 1 };
+    let stepped = agent::adopt(
+        units.get(..count).unwrap_or(&[]),
+        storage,
+        attach,
+        metering,
+        realm,
+        &saves,
+        |machine| {
+            machine.retain(state.result_value);
+            // What the control port asked for reaches the machine here, every step:
+            // a cancel is sticky, and a deadline passes when a reported time reaches
+            // it. The machine observes both only at safe points.
+            if state.cancel_requested {
+                machine.control().cancel();
+            }
+            if state.deadline != 0 {
+                machine.control().set_deadline(state.deadline);
+            }
+            if state.now != 0 {
+                machine.control().observe(state.now);
+            }
 
-    let mut outcome = Advance::Running;
-    let mut progressed = false;
+            let mut outcome = Advance::Running;
+            let mut progressed = false;
 
-    // An answer that arrived settles its promise before anything else runs, so
-    // the reaction it schedules is next in line rather than a step behind.
-    if state.wire.ready {
-        state.wire.ready = false;
-        state.wire.filled = 0;
-        if let Some(record) = CompletionRecord::decode(&state.wire.completion) {
-            let _ = machine.apply_completion(&record);
-            state.completions_applied = state.completions_applied.saturating_add(1);
-            progressed = true;
-        }
-    }
-
-    if !state.body_done {
-        match machine.resume(SLICE) {
-            Progress::Running => {
-                progressed = true;
-                // This isolate carries no compiler, so an eval pause is
-                // answered with the syntax error the call would throw: a
-                // paused machine nothing will resume must not hold the graph.
-                if machine.pending_eval().is_some() {
-                    match machine.fail_eval() {
-                        None => {}
-                        Some(Completion::Throw(_)) => {
-                            state.body_done = true;
-                            state.diagnostic = Diagnostic::at(
-                                diagnostic::termination::UNCAUGHT_THROW,
-                                Severity::Error,
-                                0,
-                            )
-                            .encode();
-                            state.has_diagnostic = true;
-                            outcome = Advance::Failed;
-                        }
-                        Some(Completion::Terminated(reason)) => {
-                            state.body_done = true;
-                            state.diagnostic =
-                                Diagnostic::at(reason.code(), Severity::Error, 0).encode();
-                            state.has_diagnostic = true;
-                            outcome = Advance::Failed;
-                        }
-                        Some(Completion::Value(_)) => {}
-                    }
+            // An answer that arrived settles its promise before anything else runs, so
+            // the reaction it schedules is next in line rather than a step behind.
+            if state.wire.ready {
+                state.wire.ready = false;
+                state.wire.filled = 0;
+                if let Some(record) = CompletionRecord::decode(&state.wire.completion) {
+                    let _ = machine.apply_completion(&record);
+                    state.completions_applied = state.completions_applied.saturating_add(1);
+                    progressed = true;
                 }
             }
-            Progress::Finished(completion) => {
-                progressed = true;
-                match completion {
-                    Completion::Value(value) => {
-                        if state.linked {
-                            // One module finished; the next one runs, and when
-                            // the last has, the closure's value is what its
-                            // entry module exports as `default`.
-                            let next = state.current_module + 1;
-                            if next < state.module_count {
-                                state.current_module = next;
-                                if machine.start_module(next).is_err() {
+
+            if !state.body_done {
+                match machine.resume(SLICE) {
+                    Progress::Running => {
+                        progressed = true;
+                        // This isolate carries no compiler, so an eval pause is
+                        // answered with the syntax error the call would throw: a
+                        // paused machine nothing will resume must not hold the graph.
+                        if machine.pending_eval().is_some() {
+                            match machine.fail_eval() {
+                                None => {}
+                                Some(Completion::Throw(_)) => {
+                                    state.body_done = true;
+                                    state.diagnostic = Diagnostic::at(
+                                        diagnostic::termination::UNCAUGHT_THROW,
+                                        Severity::Error,
+                                        0,
+                                    )
+                                    .encode();
+                                    state.has_diagnostic = true;
                                     outcome = Advance::Failed;
-                                } else {
-                                    state.module_started = true;
                                 }
-                            } else {
-                                state.body_done = true;
-                                let entry = state.module_count.saturating_sub(1);
-                                let mut name = [0u16; 7];
-                                for (index, byte) in b"default".iter().enumerate() {
-                                    name[index] = u16::from(*byte);
+                                Some(Completion::Terminated(reason)) => {
+                                    state.body_done = true;
+                                    state.diagnostic =
+                                        Diagnostic::at(reason.code(), Severity::Error, 0).encode();
+                                    state.has_diagnostic = true;
+                                    outcome = Advance::Failed;
                                 }
-                                let value = machine
-                                    .module_export(entry, &name)
-                                    .unwrap_or(Value::UNDEFINED);
-                                state.result_value = value;
-                                machine.retain(value);
+                                Some(Completion::Value(_)) => {}
                             }
-                        } else {
-                            state.body_done = true;
-                            state.result_value = value;
-                            machine.retain(value);
                         }
                     }
-                    Completion::Terminated(reason) => {
-                        // A task that stopped says why, in numbers, on a port
-                        // of its own. Stopping is an outcome, not a fault.
-                        state.body_done = true;
-                        state.diagnostic =
-                            Diagnostic::at(reason.code(), Severity::Error, 0).encode();
-                        state.has_diagnostic = true;
-                        outcome = Advance::Failed;
-                    }
-                    Completion::Throw(reason) => {
-                        state.body_done = true;
-                        state.diagnostic = Diagnostic::at(
-                            diagnostic::termination::UNCAUGHT_THROW,
-                            Severity::Error,
-                            0,
-                        )
-                        .encode();
-                        state.has_diagnostic = true;
-                        // What was thrown reaches the edge in words, the way a
-                        // rejection does: a person debugging a program needs
-                        // the message, not just the fact.
-                        if let Some(length) = render_throw(&mut machine, reason, &mut state.result)
-                        {
-                            state.result_length = length;
+                    Progress::Finished(completion) => {
+                        progressed = true;
+                        match completion {
+                            Completion::Value(value) => {
+                                if state.linked {
+                                    // One module finished; the next one runs, and when
+                                    // the last has, the closure's value is what its
+                                    // entry module exports as `default`.
+                                    let next = state.current_module + 1;
+                                    if next < state.module_count {
+                                        state.current_module = next;
+                                        if machine.start_module(next).is_err() {
+                                            outcome = Advance::Failed;
+                                        } else {
+                                            state.module_started = true;
+                                        }
+                                    } else {
+                                        state.body_done = true;
+                                        let entry = state.module_count.saturating_sub(1);
+                                        let mut name = [0u16; 7];
+                                        for (index, byte) in b"default".iter().enumerate() {
+                                            name[index] = u16::from(*byte);
+                                        }
+                                        let value = machine
+                                            .module_export(entry, &name)
+                                            .unwrap_or(Value::UNDEFINED);
+                                        state.result_value = value;
+                                        machine.retain(value);
+                                    }
+                                } else {
+                                    state.body_done = true;
+                                    state.result_value = value;
+                                    machine.retain(value);
+                                }
+                            }
+                            Completion::Terminated(reason) => {
+                                // A task that stopped says why, in numbers, on a port
+                                // of its own. Stopping is an outcome, not a fault.
+                                state.body_done = true;
+                                state.diagnostic =
+                                    Diagnostic::at(reason.code(), Severity::Error, 0).encode();
+                                state.has_diagnostic = true;
+                                outcome = Advance::Failed;
+                            }
+                            Completion::Throw(reason) => {
+                                state.body_done = true;
+                                state.diagnostic = Diagnostic::at(
+                                    diagnostic::termination::UNCAUGHT_THROW,
+                                    Severity::Error,
+                                    0,
+                                )
+                                .encode();
+                                state.has_diagnostic = true;
+                                // What was thrown reaches the edge in words, the way a
+                                // rejection does: a person debugging a program needs
+                                // the message, not just the fact.
+                                if let Some(length) =
+                                    render_throw(machine, reason, &mut state.result)
+                                {
+                                    state.result_length = length;
+                                }
+                                outcome = Advance::Failed;
+                            }
                         }
-                        outcome = Advance::Failed;
                     }
                 }
             }
-        }
-    }
 
-    if outcome == Advance::Running {
-        match machine.run_jobs(JOB_SLICE) {
-            Ok(ran) => progressed |= ran > 0,
-            Err(_) => outcome = Advance::Failed,
-        }
-    }
-
-    // A graph that wired no call port granted no way out. The calls are
-    // answered here as unavailable rather than staged for a port that does not
-    // exist, so the program is told rather than left waiting.
-    if outcome == Advance::Running && state.call_out < 0 && !machine.calls().is_empty() {
-        let mut answers = [(0u64, 0u64); PENDING_COUNT];
-        let mut count = 0usize;
-        for record in machine.calls() {
-            if let Some(slot) = answers.get_mut(count) {
-                *slot = (record.request, record.trace);
-                count += 1;
+            if outcome == Advance::Running {
+                match machine.run_jobs(JOB_SLICE) {
+                    Ok(ran) => progressed |= ran > 0,
+                    Err(_) => outcome = Advance::Failed,
+                }
             }
-        }
-        machine.take_calls();
-        for &(request, trace) in answers.get(..count).unwrap_or(&[]) {
-            let _ = machine.apply_completion(&CompletionRecord {
-                request,
-                disposition: Disposition::Rejected,
-                cause: Cause::Unavailable,
-                trace,
-                value: None,
-            });
-        }
-        progressed = true;
-    }
 
-    // Whatever calls the program made leave as frames; the machine forgets them
-    // once they are staged, so a record is carried exactly once.
-    if outcome == Advance::Running && state.call_out >= 0 {
-        let staged = state.wire.staged;
-        let mut at = staged;
-        for record in machine.calls() {
-            let frame = record.encode();
-            let Some(slot) = state.wire.calls.get_mut(at..at + CALL_FRAME) else {
-                break;
-            };
-            slot.copy_from_slice(&frame);
-            at += CALL_FRAME;
-        }
-        if at != staged {
-            state.wire.staged = at;
-            machine.take_calls();
-            let staged_now = u32::try_from((at - staged) / CALL_FRAME).unwrap_or(0);
-            state.calls_made = state.calls_made.saturating_add(staged_now);
-            progressed = true;
-        }
-    }
-
-    // A provider that never answers must not hold the task open. After the
-    // wait, every outstanding call is timed out here, which the program sees as
-    // an ordinary rejection saying why.
-    if outcome == Advance::Running && !progressed && bindings_in_flight(&machine) > 0 {
-        state.wire.waited = state.wire.waited.saturating_add(1);
-        if state.wire.waited > state.call_wait {
-            let mut requests = [0u64; PENDING_COUNT];
-            let count = machine.outstanding(&mut requests);
-            for &request in requests.get(..count).unwrap_or(&[]) {
-                let _ = machine.apply_completion(&CompletionRecord {
-                    request,
-                    disposition: Disposition::Rejected,
-                    cause: Cause::Timeout,
-                    trace: TRACE,
-                    value: None,
-                });
-            }
-            state.wire.waited = 0;
-        }
-    } else if progressed {
-        state.wire.waited = 0;
-    }
-
-    // The task is finished when its body has run, the value it produced is not
-    // still waiting on anything, and no reaction is left to run.
-    if outcome == Advance::Running && state.body_done && queue_idle(&machine) {
-        match settled_value(&machine, state.result_value) {
-            Settled::Waiting => {}
-            Settled::Value(value) => {
-                outcome = match render(&mut machine, value, &mut state.result) {
-                    Some(length) => {
-                        state.result_length = length;
-                        Advance::Done
+            // A graph that wired no call port granted no way out. The calls are
+            // answered here as unavailable rather than staged for a port that does not
+            // exist, so the program is told rather than left waiting.
+            if outcome == Advance::Running && state.call_out < 0 && !machine.calls().is_empty() {
+                let mut answers = [(0u64, 0u64); PENDING_COUNT];
+                let mut count = 0usize;
+                for record in machine.calls() {
+                    if let Some(slot) = answers.get_mut(count) {
+                        *slot = (record.request, record.trace);
+                        count += 1;
                     }
-                    None => Advance::Failed,
-                };
+                }
+                machine.take_calls();
+                for &(request, trace) in answers.get(..count).unwrap_or(&[]) {
+                    let _ = machine.apply_completion(&CompletionRecord {
+                        request,
+                        disposition: Disposition::Rejected,
+                        cause: Cause::Unavailable,
+                        trace,
+                        value: None,
+                    });
+                }
+                progressed = true;
             }
-            Settled::Rejected(reason) => {
-                state.diagnostic =
-                    Diagnostic::at(diagnostic::termination::REJECTED, Severity::Error, 0).encode();
-                state.has_diagnostic = true;
-                // A refusal reaches the edge as text saying why, not as
-                // silence: the cause the completion carried is the answer.
-                outcome = match render_rejection(&mut machine, reason, &mut state.result) {
-                    Some(length) => {
-                        state.result_length = length;
-                        Advance::Rejected
-                    }
-                    None => Advance::Failed,
-                };
-            }
-        }
-    }
 
-    state.fuel_spent = u64::from(steps).saturating_sub(machine.fuel());
-    state.collections = machine.collections();
-    state.saves = machine.save();
+            // Whatever calls the program made leave as frames; the machine forgets them
+            // once they are staged, so a record is carried exactly once.
+            if outcome == Advance::Running && state.call_out >= 0 {
+                let staged = state.wire.staged;
+                let mut at = staged;
+                for record in machine.calls() {
+                    let frame = record.encode();
+                    let Some(slot) = state.wire.calls.get_mut(at..at + CALL_FRAME) else {
+                        break;
+                    };
+                    slot.copy_from_slice(&frame);
+                    at += CALL_FRAME;
+                }
+                if at != staged {
+                    state.wire.staged = at;
+                    machine.take_calls();
+                    let staged_now = u32::try_from((at - staged) / CALL_FRAME).unwrap_or(0);
+                    state.calls_made = state.calls_made.saturating_add(staged_now);
+                    progressed = true;
+                }
+            }
+
+            // A provider that never answers must not hold the task open. After the
+            // wait, every outstanding call is timed out here, which the program sees as
+            // an ordinary rejection saying why.
+            if outcome == Advance::Running && !progressed && bindings_in_flight(machine) > 0 {
+                state.wire.waited = state.wire.waited.saturating_add(1);
+                if state.wire.waited > state.call_wait {
+                    let mut requests = [0u64; PENDING_COUNT];
+                    let count = machine.outstanding(&mut requests);
+                    for &request in requests.get(..count).unwrap_or(&[]) {
+                        let _ = machine.apply_completion(&CompletionRecord {
+                            request,
+                            disposition: Disposition::Rejected,
+                            cause: Cause::Timeout,
+                            trace: TRACE,
+                            value: None,
+                        });
+                    }
+                    state.wire.waited = 0;
+                }
+            } else if progressed {
+                state.wire.waited = 0;
+            }
+
+            // The task is finished when its body has run, the value it produced is not
+            // still waiting on anything, and no reaction is left to run.
+            if outcome == Advance::Running && state.body_done && queue_idle(machine) {
+                match settled_value(machine, state.result_value) {
+                    Settled::Waiting => {}
+                    Settled::Value(value) => {
+                        outcome = match render(machine, value, &mut state.result) {
+                            Some(length) => {
+                                state.result_length = length;
+                                Advance::Done
+                            }
+                            None => Advance::Failed,
+                        };
+                    }
+                    Settled::Rejected(reason) => {
+                        state.diagnostic =
+                            Diagnostic::at(diagnostic::termination::REJECTED, Severity::Error, 0)
+                                .encode();
+                        state.has_diagnostic = true;
+                        // A refusal reaches the edge as text saying why, not as
+                        // silence: the cause the completion carried is the answer.
+                        outcome = match render_rejection(machine, reason, &mut state.result) {
+                            Some(length) => {
+                                state.result_length = length;
+                                Advance::Rejected
+                            }
+                            None => Advance::Failed,
+                        };
+                    }
+                }
+            }
+
+            state.fuel_spent = u64::from(steps).saturating_sub(machine.fuel());
+            state.collections = machine.collections();
+            outcome
+        },
+    );
+    let Ok((outcome, saves)) = stepped else {
+        return Advance::Failed;
+    };
+    state.saves = saves;
     outcome
 }
 
@@ -873,53 +908,12 @@ fn render_rejection(
     Some(at + length)
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
-}
-
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "the ABI fixes this signature: the loader passes the parameter block as a raw pointer and length, and the module reads it once under the contract that it is valid for that length"
-)]
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    params: *const u8,
-    params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<State>() {
-        return -2;
-    }
-    unsafe {
-        let table = syscalls.cast::<SyscallTable>();
-        let state = state.cast::<State>();
-        core::ptr::write_bytes(state.cast::<u8>(), 0, core::mem::size_of::<State>());
-        core::ptr::addr_of_mut!((*state).syscalls).write(table);
-        core::ptr::addr_of_mut!((*state).image_in).write(in_chan);
-        core::ptr::addr_of_mut!((*state).result_out).write(out_chan);
-        core::ptr::addr_of_mut!((*state).completion_in).write(dev_channel_port(&*table, 0, 1));
-        core::ptr::addr_of_mut!((*state).call_out).write(dev_channel_port(&*table, 1, 1));
-        core::ptr::addr_of_mut!((*state).diagnostic_out).write(dev_channel_port(&*table, 1, 2));
-        core::ptr::addr_of_mut!((*state).exit_out).write(dev_channel_port(&*table, 1, 3));
-        core::ptr::addr_of_mut!((*state).control_in).write(dev_channel_port(&*table, 0, 2));
-        apply_params(&mut *state, params, params_len);
-    }
-    0
+entry! {
+    State;
+    primary { image_in, result_out }
+    inputs { completion_in = 1, control_in = 2 }
+    outputs { call_out = 1, diagnostic_out = 2, exit_out = 3 }
+    params apply_params
 }
 
 define_params! {
@@ -937,11 +931,7 @@ define_params! {
 /// # Safety
 /// `params` must be valid for reads of `params_len` bytes, or null.
 unsafe fn apply_params(state: &mut State, params: *const u8, params_len: usize) {
-    let tlv = !params.is_null()
-        && params_len >= 4
-        && *params == TLV_MAGIC
-        && *params.add(1) == TLV_VERSION;
-    if tlv {
+    if wire::params_are_tlv(params, params_len, TLV_MAGIC, TLV_VERSION) {
         parse_tlv(state, params, params_len);
     } else {
         set_defaults(state);
@@ -954,6 +944,8 @@ unsafe fn apply_params(state: &mut State, params: *const u8, params_len: usize) 
 /// nothing. What leaves is numbers about the run — outcomes, fuel, collection
 /// and call counts — never source, values, or payloads.
 fn emit_telemetry(state: &mut State, syscalls: &SyscallTable) {
+    // SAFETY: every call goes through the loader's syscall table, live for the
+    // module's lifetime, with arguments that are plain numbers.
     unsafe {
         if !dev_telemetry_enabled(syscalls) {
             return;
@@ -988,24 +980,17 @@ fn drain_control(state: &mut State, syscalls: &SyscallTable) {
         return;
     }
     loop {
-        let poll = unsafe { (syscalls.channel_poll)(state.control_in, POLL_INPUT) };
-        if poll <= 0 || (poll as u32) & POLL_INPUT == 0 {
-            return;
-        }
-        let offset = state.control_filled;
-        let remaining = CONTROL_FRAME - offset;
-        let read = unsafe {
-            (syscalls.channel_read)(
-                state.control_in,
-                state.control_frame.as_mut_ptr().add(offset),
-                remaining,
-            )
-        };
-        if read <= 0 {
-            return;
-        }
-        state.control_filled += usize::try_from(read).unwrap_or(0).min(remaining);
-        if state.control_filled < CONTROL_FRAME {
+        let before = state.control_filled;
+        let whole = wire::take_frame(
+            syscalls,
+            state.control_in,
+            &mut state.control_frame,
+            &mut state.control_filled,
+        );
+        if !whole {
+            if state.control_filled == before {
+                return;
+            }
             continue;
         }
         state.control_filled = 0;
@@ -1032,104 +1017,56 @@ fn drain_control(state: &mut State, syscalls: &SyscallTable) {
 /// Stage the whole image before admitting it: a partial image is not an image,
 /// and its digest would not be the one that was compiled.
 fn stage_image(state: &mut State, syscalls: &SyscallTable) -> bool {
-    let poll = unsafe { (syscalls.channel_poll)(state.image_in, POLL_INPUT | POLL_HUP) };
-    if poll <= 0 {
-        return false;
-    }
-    if (poll as u32) & POLL_INPUT != 0 {
-        let offset = state.image_length;
-        let remaining = IMAGE_CAPACITY.saturating_sub(offset);
-        if remaining == 0 {
-            state.overflowed = true;
-            let mut discard = [0u8; 64];
-            let _ = unsafe {
-                (syscalls.channel_read)(state.image_in, discard.as_mut_ptr(), discard.len())
-            };
-            return false;
-        }
-        let read = unsafe {
-            (syscalls.channel_read)(
-                state.image_in,
-                state.image.as_mut_ptr().add(offset),
-                remaining,
-            )
-        };
-        if read > 0 {
-            state.image_length += usize::try_from(read).unwrap_or(0).min(remaining);
-        }
-        return false;
-    }
-    (poll as u32) & POLL_HUP != 0
+    wire::stage_stream(
+        syscalls,
+        state.image_in,
+        &mut state.image,
+        &mut state.image_length,
+        &mut state.overflowed,
+    ) == wire::Staged::Complete
 }
 
 /// Push staged call frames out, whole frames first: a partial record is not a
 /// record, but the port is a byte stream and may take it in pieces.
 fn push_calls(state: &mut State, syscalls: &SyscallTable) {
-    if state.call_out < 0 || state.wire.written >= state.wire.staged {
-        return;
-    }
-    let poll = unsafe { (syscalls.channel_poll)(state.call_out, POLL_OUTPUT) };
-    if poll <= 0 || (poll as u32) & POLL_OUTPUT == 0 {
-        return;
-    }
-    let offset = state.wire.written;
-    let remaining = state.wire.staged.saturating_sub(offset);
-    let written = unsafe {
-        (syscalls.channel_write)(
-            state.call_out,
-            state.wire.calls.as_ptr().add(offset),
-            remaining,
-        )
-    };
-    if written > 0 {
-        state.wire.written += usize::try_from(written).unwrap_or(0).min(remaining);
-    }
-    if state.wire.written == state.wire.staged {
-        state.wire.written = 0;
-        state.wire.staged = 0;
-    }
+    wire::push_staged(
+        syscalls,
+        state.call_out,
+        &state.wire.calls,
+        &mut state.wire.staged,
+        &mut state.wire.written,
+    );
 }
 
 /// Take one completion frame off the port, in whatever pieces it arrives.
 fn pull_completion(state: &mut State, syscalls: &SyscallTable) {
-    if state.completion_in < 0 || state.wire.ready {
+    if state.wire.ready {
         return;
     }
-    let poll = unsafe { (syscalls.channel_poll)(state.completion_in, POLL_INPUT) };
-    if poll <= 0 || (poll as u32) & POLL_INPUT == 0 {
-        return;
-    }
-    let offset = state.wire.filled;
-    let remaining = COMPLETION_FRAME.saturating_sub(offset);
-    if remaining == 0 {
-        state.wire.ready = true;
-        return;
-    }
-    let read = unsafe {
-        (syscalls.channel_read)(
-            state.completion_in,
-            state.wire.completion.as_mut_ptr().add(offset),
-            remaining,
-        )
-    };
-    if read > 0 {
-        state.wire.filled += usize::try_from(read).unwrap_or(0).min(remaining);
-    }
-    if state.wire.filled == COMPLETION_FRAME {
+    if wire::take_frame(
+        syscalls,
+        state.completion_in,
+        &mut state.wire.completion,
+        &mut state.wire.filled,
+    ) {
         state.wire.ready = true;
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.image_in < 0 || state.result_out < 0 {
         return -2;
     }
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
 
     if state.phase == 3 {
@@ -1175,57 +1112,28 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     if state.phase == 2 {
-        if state.result_length > 0 {
-            let poll = unsafe { (syscalls.channel_poll)(state.result_out, POLL_OUTPUT) };
-            if poll <= 0 || (poll as u32) & POLL_OUTPUT == 0 {
-                return 0;
-            }
-            let offset = state.result_written;
-            let remaining = state.result_length.saturating_sub(offset);
-            if remaining > 0 {
-                let written = unsafe {
-                    (syscalls.channel_write)(
-                        state.result_out,
-                        state.result.as_ptr().add(offset),
-                        remaining,
-                    )
-                };
-                if written > 0 {
-                    state.result_written += usize::try_from(written).unwrap_or(0).min(remaining);
-                }
-                return 0;
-            }
+        let result = state.result.get(..state.result_length).unwrap_or(&[]);
+        if !wire::push_progress(
+            syscalls,
+            state.result_out,
+            result,
+            &mut state.result_written,
+        ) {
+            return 0;
         }
-        if state.has_diagnostic && state.diagnostic_out >= 0 {
-            let poll = unsafe { (syscalls.channel_poll)(state.diagnostic_out, POLL_OUTPUT) };
-            if poll > 0 && (poll as u32) & POLL_OUTPUT != 0 {
-                let offset = state.diagnostic_written;
-                let remaining = diagnostic::FRAME.saturating_sub(offset);
-                if remaining > 0 {
-                    let written = unsafe {
-                        (syscalls.channel_write)(
-                            state.diagnostic_out,
-                            state.diagnostic.as_ptr().add(offset),
-                            remaining,
-                        )
-                    };
-                    if written > 0 {
-                        state.diagnostic_written +=
-                            usize::try_from(written).unwrap_or(0).min(remaining);
-                    }
-                }
-            }
-            if state.diagnostic_written < diagnostic::FRAME {
-                return 0;
-            }
+        if state.has_diagnostic
+            && state.diagnostic_out >= 0
+            && !wire::push_progress(
+                syscalls,
+                state.diagnostic_out,
+                &state.diagnostic,
+                &mut state.diagnostic_written,
+            )
+        {
+            return 0;
         }
-        if state.exit_out >= 0 {
-            let code = i32::from(state.failed || state.rejected).to_le_bytes();
-            let written =
-                unsafe { (syscalls.channel_write)(state.exit_out, code.as_ptr(), code.len()) };
-            if written != i32::try_from(code.len()).unwrap_or(i32::MAX) {
-                return 0;
-            }
+        if !wire::push_exit(syscalls, state.exit_out, state.failed || state.rejected) {
+            return 0;
         }
         emit_telemetry(state, syscalls);
         state.phase = 3;

@@ -1,6 +1,6 @@
 # Environments, Functions, and the Interpreter
 
-Source: `modules/common/env.rs`, `modules/common/vm.rs`,
+Source: `modules/common/env.rs`, `modules/common/vm.rs`, `modules/common/vm/`,
 `modules/common/realm.rs`, `modules/common/object.rs`.
 
 This document defines how bindings are stored, what a function is, how the
@@ -116,8 +116,8 @@ A realm is a global object and the intrinsic prototypes. It holds `undefined`,
 `NaN`, and `Infinity` as non-writable, non-configurable properties, and
 `globalThis`, and the intrinsics `library.md` lists.
 
-The error constructors are there too: `Error`, `TypeError`, `RangeError`,
-`ReferenceError`, and `SyntaxError`, each with its own prototype carrying its
+The error constructors are there too: `Error` and each of its kinds, from
+`TypeError` to `AggregateError`, each with its own prototype carrying its
 name, and `Error.prototype.toString`. They may be called or constructed.
 
 `JSON` is a parser and a serialiser, pure functions of their arguments.

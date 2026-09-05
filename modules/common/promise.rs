@@ -15,11 +15,25 @@ pub const PENDING: u8 = 0;
 pub const FULFILLED: u8 = 1;
 pub const REJECTED: u8 = 2;
 
-/// Bytes before the reaction records.
-const HEADER: usize = 8;
-/// Bytes in one reaction record: a kind byte and three values, each a tag byte
-/// and eight payload bytes.
-const RECORD: usize = 32;
+/// The shape of a reaction list: a count and a capacity, then records of a
+/// kind byte and three encoded values. The collector traces through these
+/// names.
+pub mod layout {
+    pub const COUNT: usize = 0;
+    pub const CAPACITY: usize = 4;
+    pub const HEADER: usize = 8;
+    /// A kind byte and three encoded values, padded.
+    pub const RECORD: usize = 32;
+    pub mod record {
+        pub const KIND: usize = 0;
+        pub const ON_FULFILLED: usize = 1;
+        pub const ON_REJECTED: usize = 10;
+        pub const DERIVED: usize = 19;
+    }
+}
+
+const HEADER: usize = layout::HEADER;
+const RECORD: usize = layout::RECORD;
 /// Reactions a new list holds.
 const INITIAL_CAPACITY: u32 = 4;
 
@@ -256,9 +270,9 @@ fn read_reaction(
         return Ok((Value::UNDEFINED, Value::UNDEFINED, Value::UNDEFINED));
     };
     Ok((
-        read_value(record, 1),
-        read_value(record, 10),
-        read_value(record, 19),
+        Value::decode_at(record, layout::record::ON_FULFILLED),
+        Value::decode_at(record, layout::record::ON_REJECTED),
+        Value::decode_at(record, layout::record::DERIVED),
     ))
 }
 
@@ -275,48 +289,9 @@ fn write_reaction(
     let Some(record) = cell.get_mut(at..at + RECORD) else {
         return Ok(());
     };
-    record[0] = 0;
-    write_value(record, 1, on_fulfilled);
-    write_value(record, 10, on_rejected);
-    write_value(record, 19, derived);
+    record[layout::record::KIND] = 0;
+    on_fulfilled.encode_at(record, layout::record::ON_FULFILLED);
+    on_rejected.encode_at(record, layout::record::ON_REJECTED);
+    derived.encode_at(record, layout::record::DERIVED);
     Ok(())
-}
-
-/// A reaction record holds three values, each a tag byte and eight payload
-/// bytes, at fixed places.
-fn read_value(bytes: &[u8], at: usize) -> Value {
-    let Some(fields) = bytes.get(at..at + 9) else {
-        return Value::UNDEFINED;
-    };
-    let payload = u64::from_le_bytes([
-        fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7], fields[8],
-    ]);
-    let handle = Handle::new((payload & 0xFFFF_FFFF) as u32, (payload >> 32) as u32);
-    match fields[0] {
-        1 => Value::NULL,
-        2 => Value::boolean(payload != 0),
-        3 => Value::number(f64::from_bits(payload)),
-        4 => Value::string(handle),
-        5 => Value::symbol(handle),
-        6 => Value::big_int(handle),
-        7 => Value::object(handle),
-        _ => Value::UNDEFINED,
-    }
-}
-
-fn write_value(bytes: &mut [u8], at: usize, value: Value) {
-    let Some(fields) = bytes.get_mut(at..at + 9) else {
-        return;
-    };
-    fields[0] = value.tag() as u8;
-    let payload = match value.tag() {
-        crate::value::Tag::Number => value.as_number().to_bits(),
-        crate::value::Tag::Boolean => u64::from(value.as_boolean()),
-        crate::value::Tag::Undefined | crate::value::Tag::Null => 0,
-        _ => {
-            let handle = value.as_handle();
-            (u64::from(handle.generation) << 32) | u64::from(handle.index)
-        }
-    };
-    fields[1..9].copy_from_slice(&payload.to_le_bytes());
 }

@@ -1,11 +1,12 @@
-//! Allocation-free seed evaluator shared by Phasor shipping and fixture fmods.
+//! Allocation-free bounded expression evaluator shared by the `phasor_eval` fmod and its probe.
 //!
-//! This is intentionally not described as an ECMAScript implementation. It
+//! This is not an ECMAScript implementation and does not claim to be one. It
 //! accepts a narrow set of decimal integer additive expressions whose syntax is
-//! valid JavaScript, spends explicit fuel for every consumed source byte, and
-//! establishes the interface later parser and bytecode cores will preserve.
+//! valid JavaScript and spends explicit fuel for every consumed source byte,
+//! which is the shape every core here shares: bounded input, bounded work, a
+//! typed failure.
 
-/// Stable failure classes exposed by the seed evaluator.
+/// Stable failure classes exposed by the evaluator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvalError {
     Empty,

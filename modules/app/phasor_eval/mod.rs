@@ -1,4 +1,4 @@
-//! Bounded Phasor seed evaluator as a Fluxor transformer module.
+//! The bounded expression evaluator as a Fluxor transformer module.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -8,13 +8,15 @@
     reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
 )]
 
-use core::ffi::c_void;
-
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
 
 #[path = "../../common/eval_core.rs"]
 mod eval_core;
@@ -27,7 +29,7 @@ const POLL_INPUT: u32 = 0x01;
 const POLL_OUTPUT: u32 = 0x02;
 
 #[repr(C)]
-struct ModuleState {
+struct State {
     syscalls: *const SyscallTable,
     source_in: i32,
     result_out: i32,
@@ -47,30 +49,6 @@ struct ModuleState {
     bp_steps: u32,
 }
 
-impl ModuleState {
-    const fn new(syscalls: *const SyscallTable, source_in: i32, result_out: i32) -> Self {
-        Self {
-            syscalls,
-            source_in,
-            result_out,
-            exit_out: -1,
-            phase: 0,
-            pending_len: 0,
-            pending_offset: 0,
-            source_len: 0,
-            source_overflow: false,
-            result: [0; RESULT_CAPACITY],
-            source: [0; SOURCE_CAPACITY],
-            bytes_in: 0,
-            bytes_out: 0,
-            evaluations: 0,
-            errors: 0,
-            budget_exhausted: 0,
-            bp_steps: 0,
-        }
-    }
-}
-
 fn encode_error(error: EvalError, output: &mut [u8]) -> usize {
     let token = error.token();
     let prefix = b"error:";
@@ -84,7 +62,12 @@ fn encode_error(error: EvalError, output: &mut [u8]) -> usize {
     required
 }
 
-unsafe fn flush_pending(state: &mut ModuleState, syscalls: &SyscallTable) -> bool {
+/// Push what is pending of the result, answering whether it all went.
+///
+/// # Safety
+/// `state.pending_offset..+pending_len` must lie within `state.result`, and
+/// `syscalls` must be the loader's table.
+unsafe fn flush_pending(state: &mut State, syscalls: &SyscallTable) -> bool {
     if state.pending_len == 0 {
         return true;
     }
@@ -115,46 +98,11 @@ unsafe fn flush_pending(state: &mut ModuleState, syscalls: &SyscallTable) -> boo
     }
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<ModuleState>()).unwrap_or(u32::MAX)
-}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<ModuleState>() {
-        return -2;
-    }
-
-    // SAFETY: the Fluxor ABI supplies an aligned, writable state arena of at
-    // least `state_size` bytes and owns it for this module's lifetime.
-    unsafe {
-        core::ptr::write(
-            state.cast::<ModuleState>(),
-            ModuleState::new(syscalls.cast::<SyscallTable>(), in_chan, out_chan),
-        );
-        let initialized = &mut *state.cast::<ModuleState>();
-        initialized.exit_out = dev_channel_port(&*initialized.syscalls, 1, 1);
-    }
-    0
+entry! {
+    State;
+    primary { source_in, result_out }
+    inputs {}
+    outputs { exit_out = 1 }
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -164,14 +112,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         return -1;
     }
 
-    // SAFETY: `module_new` initialized the arena as `ModuleState`; Fluxor owns
+    // SAFETY: `module_new` initialized the arena as `State`; Fluxor owns
     // the allocation and does not invoke this module concurrently.
-    let state = unsafe { &mut *state.cast::<ModuleState>() };
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
+    let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.source_in < 0 || state.result_out < 0 {
         return -2;
     }
     // SAFETY: the syscall table is supplied by Fluxor and remains live for the
     // module instance's lifetime.
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
 
     if state.phase == 2 {

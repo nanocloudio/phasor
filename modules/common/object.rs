@@ -68,15 +68,67 @@ impl Descriptor {
     }
 }
 
-/// Bytes in one property record.
-const RECORD: usize = 32;
-/// Bytes in an object cell before its fields.
-///
-/// The layout is the prototype, the extensibility flag, the property table
-/// handle, and the internal slots a callable object needs.
-const OBJECT_SIZE: usize = 56;
-/// Bytes in a property table before its records.
-const TABLE_HEADER: usize = 8;
+/// Where each field of an object cell sits, and the shape of a property
+/// table. The collector traces through these names, so a layout change is
+/// one edit.
+pub mod layout {
+    /// The prototype: an encoded value, an object or null.
+    pub const PROTOTYPE: usize = 0;
+    /// Non-zero while the object is extensible.
+    pub const EXTENSIBLE: usize = 9;
+    /// The exotic behaviour, from `exotic`.
+    pub const EXOTIC: usize = 10;
+    /// The property table handle; `Handle::NONE_INDEX` while there is none.
+    pub const TABLE: usize = 12;
+    /// The internal kind: plain, function, native, promise, and the rest.
+    pub const INTERNAL: usize = 20;
+    /// One byte the kind interprets: function flags, a generator's state, a
+    /// promise's state, an iterator's kind, a regular expression's flags.
+    pub const FLAGS: usize = 21;
+    /// A `u32` the kind interprets: a function's code index or a native's id.
+    pub const CODE: usize = 24;
+    /// An encoded value the kind interprets: a function's environment, a
+    /// wrapper's primitive, an iterator's target, a generator's coroutine, a
+    /// promise's settled value, a native's bound value.
+    pub const SLOT: usize = 28;
+    /// A promise's reaction-list handle. Overlaps `EXTRA`, which no promise
+    /// uses.
+    pub const REACTIONS: usize = 40;
+    /// A `u32` the kind interprets: a function's module, an iterator's index,
+    /// a mapped arguments object's mask.
+    pub const EXTRA: usize = 44;
+    /// A method's home object handle; `Handle::NONE_INDEX` while there is none.
+    pub const HOME: usize = 48;
+    /// Bytes in an object cell.
+    pub const SIZE: usize = 56;
+
+    /// Bytes in a property table before its records: the count and the
+    /// capacity, each a `u32`.
+    pub const TABLE_HEADER: usize = 8;
+    pub const TABLE_COUNT: usize = 0;
+    pub const TABLE_CAPACITY: usize = 4;
+    /// Bytes in one property record.
+    pub const RECORD: usize = 32;
+
+    /// Where each field of a property record sits.
+    pub mod record {
+        /// The key kind: 0 an index, 1 a name, 2 a symbol.
+        pub const KIND: usize = 0;
+        /// Non-zero for an accessor.
+        pub const ACCESSOR: usize = 1;
+        pub const ATTRIBUTES: usize = 2;
+        /// The key payload: an index, or a packed handle.
+        pub const KEY: usize = 8;
+        /// The value, or the getter: an encoded value.
+        pub const FIRST: usize = 16;
+        /// The setter, in the short form.
+        pub const SECOND: usize = 25;
+    }
+}
+
+const OBJECT_SIZE: usize = layout::SIZE;
+const RECORD: usize = layout::RECORD;
+const TABLE_HEADER: usize = layout::TABLE_HEADER;
 /// Records a new table holds.
 const INITIAL_CAPACITY: u32 = 4;
 /// The longest prototype chain a lookup follows before reporting a cycle.
@@ -105,14 +157,12 @@ impl From<HeapError> for ObjectError {
 pub fn create(heap: &mut Heap<'_>, prototype: Value) -> Result<Handle, ObjectError> {
     let handle = heap.allocate(CellKind::Object, u32::try_from(OBJECT_SIZE).unwrap_or(0))?;
     let cell = heap.cell_mut(handle)?;
-    write_value(&mut cell[0..9], prototype);
-    cell[9] = 1; // extensible
-    cell[12..16].copy_from_slice(&u32::MAX.to_le_bytes()); // no table yet
-    cell[16..20].copy_from_slice(&0u32.to_le_bytes());
-    cell[20] = INTERNAL_PLAIN;
+    prototype.encode_at(cell, layout::PROTOTYPE);
+    cell[layout::EXTENSIBLE] = 1;
+    Handle::write_none_at(cell, layout::TABLE);
+    cell[layout::INTERNAL] = INTERNAL_PLAIN;
     // No home object: a method's `super` base, absent everywhere else.
-    cell[48..52].copy_from_slice(&u32::MAX.to_le_bytes());
-    cell[52..56].copy_from_slice(&0u32.to_le_bytes());
+    Handle::write_none_at(cell, layout::HOME);
     Ok(handle)
 }
 
@@ -124,20 +174,14 @@ pub fn set_home_object(
     home: Handle,
 ) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(function)?;
-    cell[48..52].copy_from_slice(&home.index.to_le_bytes());
-    cell[52..56].copy_from_slice(&home.generation.to_le_bytes());
+    home.write_at(cell, layout::HOME);
     Ok(())
 }
 
 /// The object a method was defined on, if `super` may be used in it.
 pub fn home_object(heap: &Heap<'_>, function: Handle) -> Result<Option<Handle>, ObjectError> {
     let cell = object_cell(heap, function)?;
-    let index = u32::from_le_bytes([cell[48], cell[49], cell[50], cell[51]]);
-    if index == u32::MAX {
-        return Ok(None);
-    }
-    let generation = u32::from_le_bytes([cell[52], cell[53], cell[54], cell[55]]);
-    Ok(Some(Handle::new(index, generation)))
+    Ok(Handle::read_at(cell, layout::HOME))
 }
 
 /// The internal-slot kinds an object may carry.
@@ -161,13 +205,13 @@ pub mod exotic {
 /// The exotic behaviour an object carries, if any.
 pub fn exotic_kind(heap: &Heap<'_>, object: Handle) -> Result<u8, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[10])
+    Ok(cell[layout::EXOTIC])
 }
 
 /// Give an object an exotic behaviour.
 pub fn set_exotic_kind(heap: &mut Heap<'_>, object: Handle, kind: u8) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    cell[10] = kind;
+    cell[layout::EXOTIC] = kind;
     Ok(())
 }
 
@@ -231,21 +275,21 @@ pub fn create_function_in(
 ) -> Result<Handle, ObjectError> {
     let handle = create(heap, prototype)?;
     let cell = heap.cell_mut(handle)?;
-    cell[20] = INTERNAL_FUNCTION;
-    cell[21] = flags;
-    cell[24..28].copy_from_slice(&code.to_le_bytes());
-    write_value(&mut cell[28..37], environment);
-    cell[44..48].copy_from_slice(&module.to_le_bytes());
+    cell[layout::INTERNAL] = INTERNAL_FUNCTION;
+    cell[layout::FLAGS] = flags;
+    write_u32(cell, layout::CODE, code);
+    environment.encode_at(cell, layout::SLOT);
+    write_u32(cell, layout::EXTRA, module);
     Ok(handle)
 }
 
 /// The module a function belongs to.
 pub fn function_module(heap: &Heap<'_>, object: Handle) -> Result<u32, ObjectError> {
     let cell = object_cell(heap, object)?;
-    if cell[20] != INTERNAL_FUNCTION {
+    if cell[layout::INTERNAL] != INTERNAL_FUNCTION {
         return Ok(0);
     }
-    Ok(u32::from_le_bytes([cell[44], cell[45], cell[46], cell[47]]))
+    Ok(read_u32(cell, layout::EXTRA))
 }
 
 /// Create an object wrapping a primitive value.
@@ -256,18 +300,18 @@ pub fn create_wrapper(
 ) -> Result<Handle, ObjectError> {
     let handle = create(heap, prototype)?;
     let cell = heap.cell_mut(handle)?;
-    cell[20] = INTERNAL_WRAPPER;
-    write_value(&mut cell[28..37], value);
+    cell[layout::INTERNAL] = INTERNAL_WRAPPER;
+    value.encode_at(cell, layout::SLOT);
     Ok(handle)
 }
 
 /// The primitive a wrapper holds, if it is one.
 pub fn wrapper_value(heap: &Heap<'_>, object: Handle) -> Result<Option<Value>, ObjectError> {
     let cell = object_cell(heap, object)?;
-    if cell[20] != INTERNAL_WRAPPER {
+    if cell[layout::INTERNAL] != INTERNAL_WRAPPER {
         return Ok(None);
     }
-    Ok(Some(read_value(&cell[28..37])))
+    Ok(Some(Value::decode_at(cell, layout::SLOT)))
 }
 
 /// Create an iterator over `target`, starting at its first entry.
@@ -281,10 +325,10 @@ pub fn create_iterator(
 ) -> Result<Handle, ObjectError> {
     let handle = create(heap, prototype)?;
     let cell = heap.cell_mut(handle)?;
-    cell[20] = INTERNAL_ITERATOR;
-    cell[21] = kind;
-    write_value(&mut cell[28..37], target);
-    cell[44..48].copy_from_slice(&0u32.to_le_bytes());
+    cell[layout::INTERNAL] = INTERNAL_ITERATOR;
+    cell[layout::FLAGS] = kind;
+    target.encode_at(cell, layout::SLOT);
+    write_u32(cell, layout::EXTRA, 0);
     Ok(handle)
 }
 
@@ -294,11 +338,15 @@ pub fn iterator_state(
     object: Handle,
 ) -> Result<Option<(Value, u32, u8)>, ObjectError> {
     let cell = object_cell(heap, object)?;
-    if cell[20] != INTERNAL_ITERATOR {
+    if cell[layout::INTERNAL] != INTERNAL_ITERATOR {
         return Ok(None);
     }
-    let index = u32::from_le_bytes([cell[44], cell[45], cell[46], cell[47]]);
-    Ok(Some((read_value(&cell[28..37]), index, cell[21])))
+    let index = read_u32(cell, layout::EXTRA);
+    Ok(Some((
+        Value::decode_at(cell, layout::SLOT),
+        index,
+        cell[layout::FLAGS],
+    )))
 }
 
 /// Record where an iterator has reached.
@@ -308,10 +356,10 @@ pub fn set_iterator_index(
     index: u32,
 ) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    if cell[20] != INTERNAL_ITERATOR {
+    if cell[layout::INTERNAL] != INTERNAL_ITERATOR {
         return Ok(());
     }
-    cell[44..48].copy_from_slice(&index.to_le_bytes());
+    write_u32(cell, layout::EXTRA, index);
     Ok(())
 }
 
@@ -325,19 +373,22 @@ pub fn create_regexp(
 ) -> Result<Handle, ObjectError> {
     let handle = create(heap, prototype)?;
     let cell = heap.cell_mut(handle)?;
-    cell[20] = INTERNAL_REGEXP;
-    cell[21] = flags;
-    write_value(&mut cell[28..37], program);
+    cell[layout::INTERNAL] = INTERNAL_REGEXP;
+    cell[layout::FLAGS] = flags;
+    program.encode_at(cell, layout::SLOT);
     Ok(handle)
 }
 
 /// The program and flags a regular expression carries, if it is one.
 pub fn regexp_program(heap: &Heap<'_>, object: Handle) -> Result<Option<(Value, u8)>, ObjectError> {
     let cell = object_cell(heap, object)?;
-    if cell[20] != INTERNAL_REGEXP {
+    if cell[layout::INTERNAL] != INTERNAL_REGEXP {
         return Ok(None);
     }
-    Ok(Some((read_value(&cell[28..37]), cell[21])))
+    Ok(Some((
+        Value::decode_at(cell, layout::SLOT),
+        cell[layout::FLAGS],
+    )))
 }
 
 /// Create a function the engine implements itself rather than one made of
@@ -350,10 +401,10 @@ pub fn create_native(
 ) -> Result<Handle, ObjectError> {
     let handle = create(heap, prototype)?;
     let cell = heap.cell_mut(handle)?;
-    cell[20] = INTERNAL_NATIVE;
-    cell[21] = flags;
-    cell[24..28].copy_from_slice(&native.to_le_bytes());
-    write_value(&mut cell[28..37], Value::UNDEFINED);
+    cell[layout::INTERNAL] = INTERNAL_NATIVE;
+    cell[layout::FLAGS] = flags;
+    write_u32(cell, layout::CODE, native);
+    Value::UNDEFINED.encode_at(cell, layout::SLOT);
     Ok(handle)
 }
 
@@ -375,9 +426,9 @@ pub fn create_generator(
 ) -> Result<Handle, ObjectError> {
     let handle = create(heap, prototype)?;
     let cell = heap.cell_mut(handle)?;
-    cell[20] = INTERNAL_GENERATOR;
-    cell[21] = generator_state::SUSPENDED;
-    write_value(&mut cell[28..37], coroutine);
+    cell[layout::INTERNAL] = INTERNAL_GENERATOR;
+    cell[layout::FLAGS] = generator_state::SUSPENDED;
+    coroutine.encode_at(cell, layout::SLOT);
     Ok(handle)
 }
 
@@ -395,48 +446,51 @@ pub fn map_arguments(
         (1u32 << mapped) - 1
     };
     let cell = heap.cell_mut(object)?;
-    cell[20] = INTERNAL_ARGUMENTS;
-    write_value(&mut cell[28..37], environment);
-    cell[44..48].copy_from_slice(&mask.to_le_bytes());
+    cell[layout::INTERNAL] = INTERNAL_ARGUMENTS;
+    environment.encode_at(cell, layout::SLOT);
+    write_u32(cell, layout::EXTRA, mask);
     Ok(())
 }
 
 /// A mapped arguments object's environment and mapped-index mask.
 pub fn arguments_map(heap: &Heap<'_>, object: Handle) -> Result<Option<(Value, u32)>, ObjectError> {
     let cell = object_cell(heap, object)?;
-    if cell[20] != INTERNAL_ARGUMENTS {
+    if cell[layout::INTERNAL] != INTERNAL_ARGUMENTS {
         return Ok(None);
     }
-    let mask = u32::from_le_bytes([cell[44], cell[45], cell[46], cell[47]]);
-    Ok(Some((read_value(&cell[28..37]), mask)))
+    let mask = read_u32(cell, layout::EXTRA);
+    Ok(Some((Value::decode_at(cell, layout::SLOT), mask)))
 }
 
 /// Remove one index from an arguments object's map, which `delete` and a
 /// redefinition that breaks the aliasing both do.
 pub fn unmap_argument(heap: &mut Heap<'_>, object: Handle, index: u32) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    if cell[20] != INTERNAL_ARGUMENTS || index >= 32 {
+    if cell[layout::INTERNAL] != INTERNAL_ARGUMENTS || index >= 32 {
         return Ok(());
     }
-    let mut mask = u32::from_le_bytes([cell[44], cell[45], cell[46], cell[47]]);
+    let mut mask = read_u32(cell, layout::EXTRA);
     mask &= !(1u32 << index);
-    cell[44..48].copy_from_slice(&mask.to_le_bytes());
+    write_u32(cell, layout::EXTRA, mask);
     Ok(())
 }
 
 /// Whether the object is a generator.
 pub fn is_generator(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[20] == INTERNAL_GENERATOR)
+    Ok(cell[layout::INTERNAL] == INTERNAL_GENERATOR)
 }
 
 /// A generator's state and suspended frame.
 pub fn generator(heap: &Heap<'_>, object: Handle) -> Result<Option<(u8, Value)>, ObjectError> {
     let cell = object_cell(heap, object)?;
-    if cell[20] != INTERNAL_GENERATOR {
+    if cell[layout::INTERNAL] != INTERNAL_GENERATOR {
         return Ok(None);
     }
-    Ok(Some((cell[21], read_value(&cell[28..37]))))
+    Ok(Some((
+        cell[layout::FLAGS],
+        Value::decode_at(cell, layout::SLOT),
+    )))
 }
 
 /// Move a generator to `state`, holding `coroutine` as its frame.
@@ -447,11 +501,11 @@ pub fn set_generator(
     coroutine: Value,
 ) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    if cell[20] != INTERNAL_GENERATOR {
+    if cell[layout::INTERNAL] != INTERNAL_GENERATOR {
         return Ok(());
     }
-    cell[21] = state;
-    write_value(&mut cell[28..37], coroutine);
+    cell[layout::FLAGS] = state;
+    coroutine.encode_at(cell, layout::SLOT);
     Ok(())
 }
 
@@ -460,25 +514,26 @@ pub fn set_generator(
 /// Whether the object can be called.
 pub fn is_callable(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[20] == INTERNAL_FUNCTION || cell[20] == INTERNAL_NATIVE)
+    Ok(cell[layout::INTERNAL] == INTERNAL_FUNCTION || cell[layout::INTERNAL] == INTERNAL_NATIVE)
 }
 
 /// Whether the object is a function the engine implements itself.
 pub fn is_native(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[20] == INTERNAL_NATIVE)
+    Ok(cell[layout::INTERNAL] == INTERNAL_NATIVE)
 }
 
 /// Whether the object can be used with `new`.
 pub fn is_constructor(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[20] != INTERNAL_PLAIN && cell[21] & function_flag::CONSTRUCTOR != 0)
+    Ok(cell[layout::INTERNAL] != INTERNAL_PLAIN
+        && cell[layout::FLAGS] & function_flag::CONSTRUCTOR != 0)
 }
 
 /// The function's flags.
 pub fn function_flags(heap: &Heap<'_>, object: Handle) -> Result<u8, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[21])
+    Ok(cell[layout::FLAGS])
 }
 
 /// Add flags to a function, which shaping a class constructor does.
@@ -488,14 +543,14 @@ pub fn add_function_flags(
     flags: u8,
 ) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    cell[21] |= flags;
+    cell[layout::FLAGS] |= flags;
     Ok(())
 }
 
 /// The index of the function's code in its unit.
 pub fn function_code(heap: &Heap<'_>, object: Handle) -> Result<u32, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(u32::from_le_bytes([cell[24], cell[25], cell[26], cell[27]]))
+    Ok(read_u32(cell, layout::CODE))
 }
 
 /// The environment the function closed over.
@@ -505,7 +560,7 @@ pub fn function_code(heap: &Heap<'_>, object: Handle) -> Result<u32, ObjectError
 /// function settles.
 pub fn function_environment(heap: &Heap<'_>, object: Handle) -> Result<Value, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(read_value(&cell[28..37]))
+    Ok(Value::decode_at(cell, layout::SLOT))
 }
 
 /// Give a native function the value it is bound to.
@@ -515,7 +570,7 @@ pub fn set_bound_value(
     value: Value,
 ) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    write_value(&mut cell[28..37], value);
+    value.encode_at(cell, layout::SLOT);
     Ok(())
 }
 
@@ -523,30 +578,29 @@ pub fn set_bound_value(
 /// list of reactions waiting on it.
 pub fn make_promise(heap: &mut Heap<'_>, object: Handle) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    cell[20] = INTERNAL_PROMISE;
-    cell[21] = 0;
-    write_value(&mut cell[28..37], Value::UNDEFINED);
-    cell[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
-    cell[44..48].copy_from_slice(&0u32.to_le_bytes());
+    cell[layout::INTERNAL] = INTERNAL_PROMISE;
+    cell[layout::FLAGS] = 0;
+    Value::UNDEFINED.encode_at(cell, layout::SLOT);
+    Handle::write_none_at(cell, layout::REACTIONS);
     Ok(())
 }
 
 /// Whether the object is a promise.
 pub fn is_promise(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[20] == INTERNAL_PROMISE)
+    Ok(cell[layout::INTERNAL] == INTERNAL_PROMISE)
 }
 
 /// A promise's state: zero pending, one fulfilled, two rejected.
 pub fn promise_state(heap: &Heap<'_>, object: Handle) -> Result<u8, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[21])
+    Ok(cell[layout::FLAGS])
 }
 
 /// A promise's settled value, which is undefined while it is pending.
 pub fn promise_value(heap: &Heap<'_>, object: Handle) -> Result<Value, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(read_value(&cell[28..37]))
+    Ok(Value::decode_at(cell, layout::SLOT))
 }
 
 /// Settle a promise. A promise settles once: a later attempt is ignored, which
@@ -561,20 +615,15 @@ pub fn settle_promise(
         return Ok(false);
     }
     let cell = heap.cell_mut(object)?;
-    cell[21] = state;
-    write_value(&mut cell[28..37], value);
+    cell[layout::FLAGS] = state;
+    value.encode_at(cell, layout::SLOT);
     Ok(true)
 }
 
 /// The cell holding the reactions waiting on a promise, if it has one.
 pub fn promise_reactions(heap: &Heap<'_>, object: Handle) -> Result<Option<Handle>, ObjectError> {
     let cell = object_cell(heap, object)?;
-    let index = u32::from_le_bytes([cell[40], cell[41], cell[42], cell[43]]);
-    if index == u32::MAX {
-        return Ok(None);
-    }
-    let generation = u32::from_le_bytes([cell[44], cell[45], cell[46], cell[47]]);
-    Ok(Some(Handle::new(index, generation)))
+    Ok(Handle::read_at(cell, layout::REACTIONS))
 }
 
 /// Give a promise its reaction list.
@@ -584,15 +633,14 @@ pub fn set_promise_reactions(
     reactions: Handle,
 ) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    cell[40..44].copy_from_slice(&reactions.index.to_le_bytes());
-    cell[44..48].copy_from_slice(&reactions.generation.to_le_bytes());
+    reactions.write_at(cell, layout::REACTIONS);
     Ok(())
 }
 
 /// The object's prototype, which is an object value or null.
 pub fn prototype(heap: &Heap<'_>, object: Handle) -> Result<Value, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(read_value(&cell[0..9]))
+    Ok(Value::decode_at(cell, layout::PROTOTYPE))
 }
 
 /// Set the prototype. A non-extensible object keeps the one it has, which the
@@ -625,18 +673,18 @@ pub fn set_prototype(
         }
     }
     let cell = heap.cell_mut(object)?;
-    write_value(&mut cell[0..9], value);
+    value.encode_at(cell, layout::PROTOTYPE);
     Ok(true)
 }
 
 pub fn is_extensible(heap: &Heap<'_>, object: Handle) -> Result<bool, ObjectError> {
     let cell = object_cell(heap, object)?;
-    Ok(cell[9] != 0)
+    Ok(cell[layout::EXTENSIBLE] != 0)
 }
 
 pub fn prevent_extensions(heap: &mut Heap<'_>, object: Handle) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    cell[9] = 0;
+    cell[layout::EXTENSIBLE] = 0;
     Ok(())
 }
 
@@ -829,7 +877,7 @@ pub fn delete(heap: &mut Heap<'_>, object: Handle, key: Key) -> Result<bool, Obj
         }
         cursor += 1;
     }
-    cell[0..4].copy_from_slice(&(count - 1).to_le_bytes());
+    write_u32(cell, layout::TABLE_COUNT, count - 1);
     Ok(true)
 }
 
@@ -918,29 +966,23 @@ fn object_cell<'h>(heap: &'h Heap<'_>, object: Handle) -> Result<&'h [u8], Objec
 
 fn table_of(heap: &Heap<'_>, object: Handle) -> Result<Option<Handle>, ObjectError> {
     let cell = object_cell(heap, object)?;
-    let index = u32::from_le_bytes([cell[12], cell[13], cell[14], cell[15]]);
-    if index == u32::MAX {
-        return Ok(None);
-    }
-    let generation = u32::from_le_bytes([cell[16], cell[17], cell[18], cell[19]]);
-    Ok(Some(Handle::new(index, generation)))
+    Ok(Handle::read_at(cell, layout::TABLE))
 }
 
 fn set_table(heap: &mut Heap<'_>, object: Handle, table: Handle) -> Result<(), ObjectError> {
     let cell = heap.cell_mut(object)?;
-    cell[12..16].copy_from_slice(&table.index.to_le_bytes());
-    cell[16..20].copy_from_slice(&table.generation.to_le_bytes());
+    table.write_at(cell, layout::TABLE);
     Ok(())
 }
 
 fn table_count(heap: &Heap<'_>, table: Handle) -> Result<u32, ObjectError> {
     let cell = heap.cell(table)?;
-    Ok(u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]))
+    Ok(read_u32(cell, layout::TABLE_COUNT))
 }
 
 fn table_capacity(heap: &Heap<'_>, table: Handle) -> Result<u32, ObjectError> {
     let cell = heap.cell(table)?;
-    Ok(u32::from_le_bytes([cell[4], cell[5], cell[6], cell[7]]))
+    Ok(read_u32(cell, layout::TABLE_CAPACITY))
 }
 
 const fn record_at(index: u32) -> usize {
@@ -991,7 +1033,7 @@ fn append(
     let count = table_count(heap, table)?;
     let cell = heap.cell_mut(table)?;
     write_record(cell, count, key, descriptor)?;
-    cell[0..4].copy_from_slice(&(count + 1).to_le_bytes());
+    write_u32(cell, layout::TABLE_COUNT, count + 1);
     Ok(())
 }
 
@@ -1027,8 +1069,8 @@ fn allocate_table(heap: &mut Heap<'_>, capacity: u32) -> Result<Handle, ObjectEr
         .map_err(|_| ObjectError::Heap(HeapError::ArenaFull))?;
     let table = heap.allocate(CellKind::PropertyTable, size)?;
     let cell = heap.cell_mut(table)?;
-    cell[0..4].copy_from_slice(&0u32.to_le_bytes());
-    cell[4..8].copy_from_slice(&capacity.to_le_bytes());
+    write_u32(cell, layout::TABLE_COUNT, 0);
+    write_u32(cell, layout::TABLE_CAPACITY, capacity);
     Ok(table)
 }
 
@@ -1056,7 +1098,7 @@ fn grow(
         index += 1;
     }
     let cell = heap.cell_mut(larger)?;
-    cell[0..4].copy_from_slice(&count.to_le_bytes());
+    write_u32(cell, layout::TABLE_COUNT, count);
     set_table(heap, object, larger)?;
     // The old table is unreachable now; collection will reclaim it.
     Ok(larger)
@@ -1067,20 +1109,11 @@ fn read_key(cell: &[u8], index: u32) -> Result<Key, ObjectError> {
     let record = cell
         .get(at..at + RECORD)
         .ok_or(ObjectError::Heap(HeapError::StaleHandle))?;
-    let payload = u64::from_le_bytes([
-        record[8], record[9], record[10], record[11], record[12], record[13], record[14],
-        record[15],
-    ]);
-    Ok(match record[0] {
+    let payload = read_u64(record, layout::record::KEY);
+    Ok(match record[layout::record::KIND] {
         0 => Key::Index((payload & 0xFFFF_FFFF) as u32),
-        1 => Key::Name(Handle::new(
-            (payload & 0xFFFF_FFFF) as u32,
-            (payload >> 32) as u32,
-        )),
-        _ => Key::Symbol(Handle::new(
-            (payload & 0xFFFF_FFFF) as u32,
-            (payload >> 32) as u32,
-        )),
+        1 => Key::Name(Handle::unpack(payload)),
+        _ => Key::Symbol(Handle::unpack(payload)),
     })
 }
 
@@ -1089,26 +1122,26 @@ fn read_record(cell: &[u8], index: u32) -> Result<Descriptor, ObjectError> {
     let record = cell
         .get(at..at + RECORD)
         .ok_or(ObjectError::Heap(HeapError::StaleHandle))?;
-    let kind = if record[1] == 0 {
+    let kind = if record[layout::record::ACCESSOR] == 0 {
         DescriptorKind::Data
     } else {
         DescriptorKind::Accessor
     };
-    let first = read_value(&record[16..25]);
+    let first = Value::decode_at(record, layout::record::FIRST);
     // The second value shares the record with the first: a data property uses
     // one slot, an accessor uses both.
-    let second = read_value_short(&record[25..32]);
+    let second = Value::decode_short_at(record, layout::record::SECOND);
     Ok(match kind {
         DescriptorKind::Data => Descriptor {
             kind,
-            attributes: record[2],
+            attributes: record[layout::record::ATTRIBUTES],
             value: first,
             getter: Value::UNDEFINED,
             setter: Value::UNDEFINED,
         },
         DescriptorKind::Accessor => Descriptor {
             kind,
-            attributes: record[2],
+            attributes: record[layout::record::ATTRIBUTES],
             value: Value::UNDEFINED,
             getter: first,
             setter: second,
@@ -1128,90 +1161,48 @@ fn write_record(
         .ok_or(ObjectError::Heap(HeapError::ArenaFull))?;
     let (kind_byte, payload) = match key {
         Key::Index(value) => (0u8, u64::from(value)),
-        Key::Name(handle) => (
-            1u8,
-            (u64::from(handle.generation) << 32) | u64::from(handle.index),
-        ),
-        Key::Symbol(handle) => (
-            2u8,
-            (u64::from(handle.generation) << 32) | u64::from(handle.index),
-        ),
+        Key::Name(handle) => (1u8, handle.pack()),
+        Key::Symbol(handle) => (2u8, handle.pack()),
     };
-    record[0] = kind_byte;
-    record[1] = u8::from(matches!(descriptor.kind, DescriptorKind::Accessor));
-    record[2] = descriptor.attributes;
+    record[layout::record::KIND] = kind_byte;
+    record[layout::record::ACCESSOR] =
+        u8::from(matches!(descriptor.kind, DescriptorKind::Accessor));
+    record[layout::record::ATTRIBUTES] = descriptor.attributes;
     record[3] = 0;
-    record[8..16].copy_from_slice(&payload.to_le_bytes());
+    write_u64(record, layout::record::KEY, payload);
     match descriptor.kind {
         DescriptorKind::Data => {
-            write_value(&mut record[16..25], descriptor.value);
-            write_value_short(&mut record[25..32], Value::UNDEFINED);
+            descriptor.value.encode_at(record, layout::record::FIRST);
+            Value::UNDEFINED.encode_short_at(record, layout::record::SECOND);
         }
         DescriptorKind::Accessor => {
-            write_value(&mut record[16..25], descriptor.getter);
-            write_value_short(&mut record[25..32], descriptor.setter);
+            descriptor.getter.encode_at(record, layout::record::FIRST);
+            descriptor
+                .setter
+                .encode_short_at(record, layout::record::SECOND);
         }
     }
     Ok(())
 }
 
-/// Encode a value as a tag byte and eight payload bytes.
-fn write_value(out: &mut [u8], value: Value) {
-    out[0] = value.tag() as u8;
-    let payload = payload_of(&value);
-    out[1..9].copy_from_slice(&payload.to_le_bytes());
+/// Little-endian integer fields, each checked once.
+fn read_u32(bytes: &[u8], at: usize) -> u32 {
+    crate::value::field::<4>(bytes, at).map_or(0, u32::from_le_bytes)
 }
 
-fn read_value(bytes: &[u8]) -> Value {
-    let payload = u64::from_le_bytes([
-        bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
-    ]);
-    value_from(bytes[0], payload)
-}
-
-/// Encode a reference value in seven bytes: a tag and a handle.
-///
-/// Only a reference or a simple value can be stored here, which is all an
-/// accessor slot ever holds.
-fn write_value_short(out: &mut [u8], value: Value) {
-    out[0] = value.tag() as u8;
-    let handle = value.as_handle();
-    out[1..5].copy_from_slice(&handle.index.to_le_bytes());
-    out[5..7].copy_from_slice(&(handle.generation as u16).to_le_bytes());
-}
-
-fn read_value_short(bytes: &[u8]) -> Value {
-    let index = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-    let generation = u32::from(u16::from_le_bytes([bytes[5], bytes[6]]));
-    match bytes[0] {
-        7 => Value::object(Handle::new(index, generation)),
-        _ => Value::UNDEFINED,
+fn write_u32(bytes: &mut [u8], at: usize, value: u32) {
+    if let Some(field) = bytes.get_mut(at..at + 4) {
+        field.copy_from_slice(&value.to_le_bytes());
     }
 }
 
-fn payload_of(value: &Value) -> u64 {
-    match value.tag() {
-        Tag::Number => value.as_number().to_bits(),
-        Tag::Boolean => u64::from(value.as_boolean()),
-        Tag::Undefined | Tag::Null => 0,
-        _ => {
-            let handle = value.as_handle();
-            (u64::from(handle.generation) << 32) | u64::from(handle.index)
-        }
-    }
+fn read_u64(bytes: &[u8], at: usize) -> u64 {
+    crate::value::field::<8>(bytes, at).map_or(0, u64::from_le_bytes)
 }
 
-fn value_from(tag: u8, payload: u64) -> Value {
-    let handle = Handle::new((payload & 0xFFFF_FFFF) as u32, (payload >> 32) as u32);
-    match tag {
-        1 => Value::NULL,
-        2 => Value::boolean(payload != 0),
-        3 => Value::number(f64::from_bits(payload)),
-        4 => Value::string(handle),
-        5 => Value::symbol(handle),
-        6 => Value::big_int(handle),
-        7 => Value::object(handle),
-        _ => Value::UNDEFINED,
+fn write_u64(bytes: &mut [u8], at: usize, value: u64) {
+    if let Some(field) = bytes.get_mut(at..at + 8) {
+        field.copy_from_slice(&value.to_le_bytes());
     }
 }
 

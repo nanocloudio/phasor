@@ -5,7 +5,7 @@
 //! check unless the verifier admitted it, because the lowering publishes
 //! nothing else.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -13,13 +13,15 @@
     reason = "the Fluxor ABI source is mounted as one surface and this fixture consumes a subset"
 )]
 
-use core::ffi::c_void;
-
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+
+#[macro_use]
+#[path = "../../common/entry.rs"]
+mod entry;
 
 #[path = "../../common/arena.rs"]
 mod arena;
@@ -38,21 +40,31 @@ mod feature;
 #[path = "../../common/lex.rs"]
 mod lex;
 #[path = "../../common/lower.rs"]
+#[macro_use]
 mod lower;
+#[path = "../../common/frontend.rs"]
+#[macro_use]
+mod frontend;
 #[path = "../../common/numeric.rs"]
 mod numeric;
 #[path = "../../common/parse.rs"]
 mod parse;
+#[path = "../../common/probe.rs"]
+mod probe;
 #[path = "../../common/softfloat.rs"]
 mod softfloat;
 #[path = "../../common/source.rs"]
 mod source;
+#[path = "../../common/text.rs"]
+mod text;
 #[path = "../../common/unicode_id.rs"]
 mod unicode_id;
 #[path = "../../common/value.rs"]
 mod value;
 #[path = "../../common/verify.rs"]
 mod verify;
+#[path = "../../common/wire.rs"]
+mod wire;
 
 use arena::{Arena, Node, NodeKind};
 use bytecode::{
@@ -110,7 +122,7 @@ struct Storage {
     safe_points: [u32; POINT_CAPACITY],
     patches: [Patch; PATCH_CAPACITY],
     labels: [u32; LABEL_CAPACITY],
-    state: [i32; STATE_CAPACITY],
+    verifier_state: [i32; STATE_CAPACITY],
     unit_code: [u8; UNIT_CODE_CAPACITY],
     unit_safe_points: [u32; UNIT_POINT_CAPACITY],
     functions: [Function; FUNCTION_CAPACITY],
@@ -132,46 +144,14 @@ struct Outcome {
 
 /// Compile one source all the way to a verified image.
 fn compile(storage: &mut Storage, source: &[u8]) -> Outcome {
-    let table = LineTable::new(&mut storage.starts);
-    let Ok(lexer) = Lexer::new(source, Limits::CEILING, table, FUEL) else {
-        return Outcome {
-            length: 0,
-            diagnostic: code::SOURCE_TOO_LARGE,
-        };
-    };
-    let syntax = Arena::new(&mut storage.nodes, &mut storage.lists, &mut storage.numbers);
-    let mut parser = Parser::new(lexer, syntax, &mut storage.scratch, Limits::CEILING);
-    let root = match parser.parse_unit() {
-        Ok(root) => root,
-        Err(diagnostic) => {
-            return Outcome {
-                length: 0,
-                diagnostic: diagnostic.code(),
-            }
-        }
-    };
-
-    let mut lowering = LowerStorage {
-        code: &mut storage.code,
-        image: &mut storage.image,
-        constants: &mut storage.constants,
-        constant_data: &mut storage.constant_data,
-        safe_points: &mut storage.safe_points,
-        patches: &mut storage.patches,
-        labels: &mut storage.labels,
-        verifier_state: &mut storage.state,
-        unit_code: &mut storage.unit_code,
-        unit_safe_points: &mut storage.unit_safe_points,
-        functions: &mut storage.functions,
-        exceptions: &mut storage.exceptions,
-        scopes: &mut storage.scopes,
-        bindings: &mut storage.lexical,
-        pending: &mut storage.pending,
-        imports: &mut storage.imports,
-        exports: &mut storage.exports,
-        eval_sites: &mut storage.eval_sites,
-    };
-    match lower_expression(source, parser.arena(), root, &mut lowering) {
+    let mut front = frontend_storage!(storage);
+    match frontend::compile(
+        source,
+        frontend::Goal::Script,
+        Limits::CEILING,
+        FUEL,
+        &mut front,
+    ) {
         Ok(compiled) => Outcome {
             length: compiled.length,
             diagnostic: 0,
@@ -374,146 +354,40 @@ struct State {
     report_out: i32,
     exit_out: i32,
     storage: Storage,
-    case: u16,
-    failures: u16,
-    /// The first case that failed, which is what a report names.
-    first_failure: u16,
-    phase: u8,
+    progress: probe::Progress,
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    u32::try_from(core::mem::size_of::<State>()).unwrap_or(u32::MAX)
+entry! {
+    State;
+    primary { report_out }
+    inputs {}
+    outputs { exit_out = 1 }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    _in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    if state.is_null() || syscalls.is_null() {
-        return -1;
-    }
-    if state_size < core::mem::size_of::<State>() {
-        return -2;
-    }
-    unsafe {
-        let table = syscalls.cast::<SyscallTable>();
-        let state = state.cast::<State>();
-        core::ptr::addr_of_mut!((*state).syscalls).write(table);
-        core::ptr::addr_of_mut!((*state).report_out).write(out_chan);
-        core::ptr::addr_of_mut!((*state).exit_out).write(dev_channel_port(&*table, 1, 1));
-        core::ptr::addr_of_mut!((*state).case).write(0);
-        core::ptr::addr_of_mut!((*state).failures).write(0);
-        core::ptr::addr_of_mut!((*state).first_failure).write(u16::MAX);
-        core::ptr::addr_of_mut!((*state).phase).write(0);
-        let storage = core::ptr::addr_of_mut!((*state).storage);
-        core::ptr::write_bytes(storage.cast::<u8>(), 0, core::mem::size_of::<Storage>());
-    }
-    0
-}
-
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` is the block `module_new` laid out, non-null as
+    // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() {
         return -2;
     }
+    // SAFETY: the table pointer was stored by `module_new` and checked
+    // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
-
-    if state.phase == 2 {
-        return 1;
-    }
-    if state.case < CASE_COUNT {
-        let case = state.case;
-        if !run_case(&mut state.storage, case) {
-            state.failures = state.failures.saturating_add(1);
-            if state.first_failure == u16::MAX {
-                state.first_failure = case;
-            }
-        }
-        state.case = state.case.saturating_add(1);
-        return 0;
-    }
-
-    if state.phase == 0 {
-        // A failure names the first case that failed, so a report is enough
-        // to find it without instrumenting the module again.
-        let mut buffer = [0u8; 64];
-        let report: &[u8] = if state.failures == 0 {
-            b"phasor-compile-probe: 26 passed\n"
-        } else {
-            let prefix = b"phasor-compile-probe: failed at ";
-            let mut length = 0usize;
-            while length < prefix.len() {
-                buffer[length] = prefix[length];
-                length += 1;
-            }
-            let mut digits = [0u8; 5];
-            let mut count = 0usize;
-            let mut value = state.first_failure;
-            loop {
-                digits[count] = b'0' + u8::try_from(value % 10).unwrap_or(0);
-                count += 1;
-                value /= 10;
-                if value == 0 {
-                    break;
-                }
-            }
-            while count > 0 {
-                count -= 1;
-                buffer[length] = digits[count];
-                length += 1;
-            }
-            buffer[length] = b'\n';
-            length += 1;
-            buffer.get(..length).unwrap_or(&[])
-        };
-        // A graph that gives the probe no report port still runs it; the
-        // outcome then shows in the module's own completion status.
-        if state.report_out >= 0 {
-            let written = unsafe {
-                (syscalls.channel_write)(state.report_out, report.as_ptr(), report.len())
-            };
-            if written != i32::try_from(report.len()).unwrap_or(i32::MAX) {
-                return 0;
-            }
-        }
-        state.phase = 1;
-    }
-
-    if state.exit_out >= 0 {
-        let code = i32::from(state.failures != 0).to_le_bytes();
-        let written =
-            unsafe { (syscalls.channel_write)(state.exit_out, code.as_ptr(), code.len()) };
-        if written != i32::try_from(code.len()).unwrap_or(i32::MAX) {
-            return 0;
-        }
-    }
-    state.phase = 2;
-    // Completing is the pass signal for a graph with no port to report on; a
-    // failure is a module error, which the kernel reports either way.
-    if state.failures == 0 {
-        1
-    } else {
-        -3
-    }
+    probe::step(
+        &mut state.progress,
+        syscalls,
+        state.report_out,
+        state.exit_out,
+        b"phasor-compile-probe",
+        CASE_COUNT,
+        |case| run_case(&mut state.storage, case),
+    )
 }
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");

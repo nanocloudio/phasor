@@ -94,10 +94,14 @@ given before it runs.
 
 `phasor_link` takes a stream of compiled modules — each one its specifier and
 its image — and produces one container: every module of the closure, in an order
-where a module comes after everything it imports. It checks that every image is
-admissible, that every specifier names a module the stream carried, and that
-every imported name is one that module exports. A closure whose imports do not
-resolve is not produced at all.
+where a module comes after everything it imports. It registers each module
+under the digest of its specifier, resolves every import against that
+registry, and orders through the same walk as above, started from every
+module in stream order (`link_all`), so the entry — the module nothing
+imports, which a stream carries last — is ordered last. It checks that every
+image is admissible, that every specifier names a module the stream carried,
+and that every imported name is one that module exports. A closure whose
+imports do not resolve is not produced at all.
 
 The container carries the format digest, the feature digest, and a digest of
 everything after its header, so a closure that changed on the way is refused

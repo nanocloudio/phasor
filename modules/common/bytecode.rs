@@ -235,8 +235,8 @@ pub enum Opcode {
     ConstructWithArray = 0xB8,
     /// `super(...)` with a spread: the gathered arguments in the register.
     CallSuperWithArray = 0xB9,
-    /// `import()`: a promise rejected with a TypeError — this build carries
-    /// no module loader, and the rejection is how the expression says so.
+    /// `import.source()`: a promise rejected with a SyntaxError, because a
+    /// source-phase import has no host record to answer it.
     ImportReject = 0xBA,
     /// The iterator `for await` walks: the async protocol's, or the sync
     /// protocol's whose results the loop awaits.

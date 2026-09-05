@@ -11,6 +11,61 @@ use crate::object::{self, attribute, Descriptor, ObjectError};
 use crate::string::{Atoms, Key};
 use crate::value::{Handle, Value};
 
+// One realm across these files: each child builds one family of intrinsics
+// at the point `create` calls it, so the order of every definition — and
+// so every own-key order — is the order written here.
+#[path = "realm/arrays.rs"]
+mod arrays;
+#[path = "realm/buffers.rs"]
+mod buffers;
+#[path = "realm/collections.rs"]
+mod collections;
+#[path = "realm/date.rs"]
+mod date;
+#[path = "realm/errors.rs"]
+mod errors;
+#[path = "realm/functions.rs"]
+mod functions;
+#[path = "realm/iterators.rs"]
+mod iterators;
+#[path = "realm/json.rs"]
+mod json;
+#[path = "realm/math.rs"]
+mod math;
+#[path = "realm/numbers.rs"]
+mod numbers;
+#[path = "realm/objects.rs"]
+mod objects;
+#[path = "realm/promises.rs"]
+mod promises;
+#[path = "realm/proxy.rs"]
+mod proxy;
+#[path = "realm/reflect.rs"]
+mod reflect;
+#[path = "realm/strings.rs"]
+mod strings;
+#[path = "realm/symbols.rs"]
+mod symbols;
+#[path = "realm/weak.rs"]
+mod weak;
+use arrays::*;
+use buffers::*;
+use collections::*;
+use date::*;
+use errors::*;
+use functions::*;
+use iterators::*;
+use json::*;
+use math::*;
+use numbers::*;
+use objects::*;
+use promises::*;
+use proxy::*;
+use reflect::*;
+use strings::*;
+use symbols::*;
+use weak::*;
+
 /// The functions the engine implements itself.
 pub mod native {
     /// `Object.prototype.toString`.
@@ -757,626 +812,92 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
         )?;
     }
 
-    // `Error.prototype` and one prototype per error kind, each carrying its
-    // name and an empty message, which is what the specification puts there.
-    let error_prototype = object::create(heap, Value::object(object_prototype))?;
-    let empty = crate::string::create_ascii(heap, b"")?;
-    define(
+    let (error_prototype, error_prototypes, global) = build_errors(
         heap,
         atoms,
-        error_prototype,
-        b"message",
-        Value::string(empty),
+        function_prototype,
         method_attributes,
+        object_prototype,
     )?;
-    let to_string = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::ERROR_TO_STRING,
-        0,
-    )?;
-    let key = key_of(heap, atoms, b"toString")?;
-    object::define_own_property(
-        heap,
-        error_prototype,
-        key,
-        Descriptor::data(Value::object(to_string), method_attributes),
-    )?;
-
-    let kinds = [
-        ErrorKind::Error,
-        ErrorKind::Type,
-        ErrorKind::Range,
-        ErrorKind::Reference,
-        ErrorKind::Syntax,
-        ErrorKind::Eval,
-        ErrorKind::Uri,
-        ErrorKind::Suppressed,
-        ErrorKind::Aggregate,
-    ];
-    let mut error_prototypes = [error_prototype; 9];
-    let global = object::create(heap, Value::object(object_prototype))?;
-    // The global object's shape is known here: the intrinsics, the value
-    // properties, and the error constructors.
-    object::reserve(heap, global, 25)?;
-    for (index, kind) in kinds.iter().enumerate() {
-        let prototype = if matches!(kind, ErrorKind::Error) {
-            error_prototype
-        } else {
-            object::create(heap, Value::object(error_prototype))?
-        };
-        let name = crate::string::create_ascii(heap, kind.name())?;
-        define(
-            heap,
-            atoms,
-            prototype,
-            b"name",
-            Value::string(name),
-            method_attributes,
-        )?;
-        error_prototypes[index] = prototype;
-
-        // The constructor, which the program reaches by name.
-        let constructor = object::create_native(
-            heap,
-            Value::object(function_prototype),
-            kind.native(),
-            object::function_flag::CONSTRUCTOR,
-        )?;
-        let key = key_of(heap, atoms, b"prototype")?;
-        object::define_own_property(
-            heap,
-            constructor,
-            key,
-            Descriptor::data(Value::object(prototype), 0),
-        )?;
-        let key = key_of(heap, atoms, b"constructor")?;
-        object::define_own_property(
-            heap,
-            prototype,
-            key,
-            Descriptor::data(Value::object(constructor), method_attributes),
-        )?;
-        define(
-            heap,
-            atoms,
-            global,
-            kind.name(),
-            Value::object(constructor),
-            method_attributes,
-        )?;
-        // The constructor's own `name`, which is what says which error a
-        // failed expectation was.
-        define(
-            heap,
-            atoms,
-            constructor,
-            b"name",
-            Value::string(name),
-            attribute::CONFIGURABLE,
-        )?;
-    }
-
-    // `undefined`, `NaN`, and `Infinity` are not writable, not enumerable, and
-    // not configurable.
-    define(heap, atoms, global, b"undefined", Value::UNDEFINED, 0)?;
-    define(heap, atoms, global, b"NaN", Value::number(f64::NAN), 0)?;
-    define(
+    let (promise_prototype, promise_constructor) = build_promises(
         heap,
         atoms,
+        function_prototype,
         global,
-        b"Infinity",
-        Value::number(f64::INFINITY),
-        0,
-    )?;
-    // `globalThis` is writable and configurable but not enumerable.
-    define(
-        heap,
-        atoms,
-        global,
-        b"globalThis",
-        Value::object(global),
-        attribute::WRITABLE | attribute::CONFIGURABLE,
-    )?;
-
-    // Promises: a prototype carrying `then`, and a constructor carrying
-    // `resolve` and `reject`.
-    let promise_prototype = object::create(heap, Value::object(object_prototype))?;
-    let then = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::PROMISE_THEN,
-        0,
-    )?;
-    let key = key_of(heap, atoms, b"then")?;
-    object::define_own_property(
-        heap,
-        promise_prototype,
-        key,
-        Descriptor::data(Value::object(then), method_attributes),
-    )?;
-    for (name, id) in [
-        (&b"catch"[..], native::PROMISE_CATCH),
-        (&b"finally"[..], native::PROMISE_FINALLY),
-    ] {
-        method(heap, atoms, promise_prototype, name, id, function_prototype)?;
-    }
-
-    let promise_constructor = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::PROMISE,
-        object::function_flag::CONSTRUCTOR,
-    )?;
-    let key = key_of(heap, atoms, b"prototype")?;
-    object::define_own_property(
-        heap,
-        promise_constructor,
-        key,
-        Descriptor::data(Value::object(promise_prototype), 0),
-    )?;
-    let key = key_of(heap, atoms, b"constructor")?;
-    object::define_own_property(
-        heap,
-        promise_prototype,
-        key,
-        Descriptor::data(Value::object(promise_constructor), method_attributes),
-    )?;
-    for (name, id) in [
-        (&b"resolve"[..], native::PROMISE_RESOLVE),
-        (&b"reject"[..], native::PROMISE_REJECT),
-        (&b"withResolvers"[..], native::PROMISE_WITH_RESOLVERS),
-        (&b"all"[..], native::PROMISE_ALL),
-        (&b"race"[..], native::PROMISE_RACE),
-        (&b"allSettled"[..], native::PROMISE_ALL_SETTLED),
-        (&b"any"[..], native::PROMISE_ANY),
-    ] {
-        let function = object::create_native(heap, Value::object(function_prototype), id, 0)?;
-        let key = key_of(heap, atoms, name)?;
-        object::define_own_property(
-            heap,
-            promise_constructor,
-            key,
-            Descriptor::data(Value::object(function), method_attributes),
-        )?;
-    }
-    define(
-        heap,
-        atoms,
-        global,
-        b"Promise",
-        Value::object(promise_constructor),
         method_attributes,
+        object_prototype,
     )?;
-
-    // Symbols. A well-known symbol is an ordinary symbol the realm keeps a
-    // handle to, so a program can only reach it through the name it is given.
-    let symbol_prototype = object::create(heap, Value::object(object_prototype))?;
-    let iterator_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.iterator")?;
-    let async_iterator_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.asyncIterator")?;
-    let dispose_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.dispose")?;
-    let async_dispose_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.asyncDispose")?;
-    let to_primitive_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.toPrimitive")?;
-    let to_string_tag_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.toStringTag")?;
-    let species_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.species")?;
-    let unscopables_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.unscopables")?;
-    let hint_default = crate::string::create_ascii(heap, b"default")?;
-    let hint_number = crate::string::create_ascii(heap, b"number")?;
-    let hint_string = crate::string::create_ascii(heap, b"string")?;
-    let has_instance_symbol = crate::string::create_symbol_ascii(heap, b"Symbol.hasInstance")?;
-    let symbol_constructor = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::SYMBOL,
-        object::function_flag::CONSTRUCTOR,
-    )?;
-    method(
+    let symbols = build_symbols(
         heap,
         atoms,
+        function_prototype,
+        global,
+        method_attributes,
+        object_prototype,
+    )?;
+    // The bundle travels whole to the builders that need several of these;
+    // the rest of this function names them one by one.
+    let Symbols {
         symbol_prototype,
-        b"toString",
-        native::SYMBOL_TO_STRING,
+        iterator: iterator_symbol,
+        async_iterator: async_iterator_symbol,
+        dispose: dispose_symbol,
+        async_dispose: async_dispose_symbol,
+        to_primitive: to_primitive_symbol,
+        to_string_tag: to_string_tag_symbol,
+        species: species_symbol,
+        unscopables: unscopables_symbol,
+        hint_default,
+        hint_number,
+        hint_string,
+        has_instance: has_instance_symbol,
+    } = symbols;
+    let Prototypes {
+        string: string_prototype,
+        number: number_prototype,
+        boolean: boolean_prototype,
+        iterator: iterator_prototype,
+        generator_function: generator_function_prototype,
+        generator_object: generator_object_prototype,
+        async_generator_function: async_generator_function_prototype,
+        async_generator_object: async_generator_object_prototype,
+        async_function: async_function_prototype,
+        big_int: big_int_prototype,
+        regexp: regexp_prototype,
+    } = build_functions(
+        heap,
+        atoms,
         function_prototype,
-    )?;
-    method(
-        heap,
-        atoms,
-        symbol_prototype,
-        b"valueOf",
-        native::SYMBOL_VALUE_OF,
-        function_prototype,
-    )?;
-    accessor(
-        heap,
-        atoms,
-        symbol_prototype,
-        b"description",
-        native::SYMBOL_DESCRIPTION,
-        function_prototype,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"prototype",
-        Value::object(symbol_prototype),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"iterator",
-        Value::symbol(iterator_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"asyncIterator",
-        Value::symbol(async_iterator_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"dispose",
-        Value::symbol(dispose_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"asyncDispose",
-        Value::symbol(async_dispose_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"toPrimitive",
-        Value::symbol(to_primitive_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"toStringTag",
-        Value::symbol(to_string_tag_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"species",
-        Value::symbol(species_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"unscopables",
-        Value::symbol(unscopables_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_constructor,
-        b"hasInstance",
-        Value::symbol(has_instance_symbol),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        symbol_prototype,
-        b"constructor",
-        Value::object(symbol_constructor),
-        method_attributes,
-    )?;
-    define(
-        heap,
-        atoms,
         global,
-        b"Symbol",
-        Value::object(symbol_constructor),
         method_attributes,
+        object_prototype,
+        symbols,
     )?;
-
-    // The prototypes a method called on a primitive reaches.
-    let string_prototype = object::create(heap, Value::object(object_prototype))?;
-    let number_prototype = object::create(heap, Value::object(object_prototype))?;
-    let boolean_prototype = object::create(heap, Value::object(object_prototype))?;
-    let iterator_prototype = object::create(heap, Value::object(object_prototype))?;
-    // Generator functions answer to a prototype of their own, whose
-    // `prototype` property names what generator instances default to.
-    let generator_function_prototype = object::create(heap, Value::object(function_prototype))?;
-    let generator_object_prototype = object::create(heap, Value::object(iterator_prototype))?;
-    define(
+    build_iterators(
         heap,
         atoms,
-        generator_function_prototype,
-        b"prototype",
-        Value::object(generator_object_prototype),
-        attribute::CONFIGURABLE,
-    )?;
-    define(
-        heap,
-        atoms,
-        generator_object_prototype,
-        b"constructor",
-        Value::object(generator_function_prototype),
-        attribute::CONFIGURABLE,
-    )?;
-    let async_generator_function_prototype =
-        object::create(heap, Value::object(function_prototype))?;
-    // Async iterators share a prototype of their own beneath the async
-    // generator prototype, iterable by itself as the sync one is.
-    let async_iterator_prototype = object::create(heap, Value::object(object_prototype))?;
-    let async_self_iterator = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::ITERATOR_SELF,
-        0,
-    )?;
-    object::define_own_property(
-        heap,
-        async_iterator_prototype,
-        Key::Symbol(async_iterator_symbol),
-        Descriptor::data(
-            Value::object(async_self_iterator),
-            attribute::WRITABLE | attribute::CONFIGURABLE,
-        ),
-    )?;
-    let async_generator_object_prototype =
-        object::create(heap, Value::object(async_iterator_prototype))?;
-    define(
-        heap,
-        atoms,
-        async_generator_function_prototype,
-        b"prototype",
-        Value::object(async_generator_object_prototype),
-        attribute::CONFIGURABLE,
-    )?;
-    define(
-        heap,
-        atoms,
-        async_generator_object_prototype,
-        b"constructor",
-        Value::object(async_generator_function_prototype),
-        attribute::CONFIGURABLE,
-    )?;
-    intrinsic_constructor(
-        heap,
-        atoms,
-        b"GeneratorFunction",
-        native::GENERATOR_FUNCTION,
-        generator_function_prototype,
         function_prototype,
-    )?;
-    intrinsic_constructor(
-        heap,
-        atoms,
-        b"AsyncGeneratorFunction",
-        native::ASYNC_GENERATOR_FUNCTION,
-        async_generator_function_prototype,
-        function_prototype,
-    )?;
-    // Async functions are instances of a prototype of their own beneath
-    // `Function.prototype`, reached only through one of them.
-    let async_function_prototype = object::create(heap, Value::object(function_prototype))?;
-    let async_function_tag = crate::string::create_ascii(heap, b"AsyncFunction")?;
-    object::define_own_property(
-        heap,
-        async_function_prototype,
-        Key::Symbol(to_string_tag_symbol),
-        Descriptor::data(Value::string(async_function_tag), attribute::CONFIGURABLE),
-    )?;
-    intrinsic_constructor(
-        heap,
-        atoms,
-        b"AsyncFunction",
-        native::ASYNC_FUNCTION,
-        async_function_prototype,
-        function_prototype,
-    )?;
-    let big_int_prototype = object::create(heap, Value::object(object_prototype))?;
-    let regexp_prototype = object::create(heap, Value::object(object_prototype))?;
-    object::reserve(heap, regexp_prototype, 6)?;
-    constructor(
-        heap,
-        atoms,
-        global,
-        b"RegExp",
-        native::REG_EXP,
-        regexp_prototype,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"exec"[..], native::REG_EXP_EXEC),
-        (&b"test"[..], native::REG_EXP_TEST),
-        (&b"toString"[..], native::REG_EXP_TO_STRING),
-    ] {
-        method(heap, atoms, regexp_prototype, name, id, function_prototype)?;
-    }
-
-    // `BigInt` is callable but not constructible: there is no wrapper to make
-    // with `new`, only the conversion.
-    let big_int_constructor =
-        object::create_native(heap, Value::object(function_prototype), native::BIG_INT, 0)?;
-    define(
-        heap,
-        atoms,
-        big_int_constructor,
-        b"prototype",
-        Value::object(big_int_prototype),
-        0,
-    )?;
-    define(
-        heap,
-        atoms,
-        big_int_prototype,
-        b"constructor",
-        Value::object(big_int_constructor),
-        method_attributes,
-    )?;
-    for (name, id) in [
-        (&b"toString"[..], native::BIG_INT_TO_STRING),
-        (&b"valueOf"[..], native::BIG_INT_VALUE_OF),
-    ] {
-        method(heap, atoms, big_int_prototype, name, id, function_prototype)?;
-    }
-    define(
-        heap,
-        atoms,
-        global,
-        b"BigInt",
-        Value::object(big_int_constructor),
-        method_attributes,
-    )?;
-
-    // Every iterator the engine makes is iterable by itself, which is what a
-    // `for` loop over an iterator needs.
-    method(
-        heap,
-        atoms,
         iterator_prototype,
-        b"next",
-        native::ITERATOR_NEXT,
-        function_prototype,
-    )?;
-    let self_iterator = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::ITERATOR_SELF,
-        0,
-    )?;
-    object::define_own_property(
-        heap,
-        iterator_prototype,
-        Key::Symbol(iterator_symbol),
-        Descriptor::data(Value::object(self_iterator), method_attributes),
-    )?;
-
-    // `Map` and `Set`: the keyed collections, deterministic in insertion
-    // order and free of any ambient authority.
-    let map_prototype = object::create(heap, Value::object(object_prototype))?;
-    let set_prototype = object::create(heap, Value::object(object_prototype))?;
-    constructor(
-        heap,
-        atoms,
-        global,
-        b"Map",
-        native::MAP,
-        map_prototype,
-        function_prototype,
-    )?;
-    constructor(
-        heap,
-        atoms,
-        global,
-        b"Set",
-        native::SET,
-        set_prototype,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"get"[..], native::MAP_GET),
-        (&b"set"[..], native::MAP_SET),
-        (&b"has"[..], native::MAP_HAS),
-        (&b"delete"[..], native::MAP_DELETE),
-        (&b"clear"[..], native::MAP_CLEAR),
-        (&b"forEach"[..], native::MAP_FOR_EACH),
-        (&b"entries"[..], native::MAP_ENTRIES),
-        (&b"keys"[..], native::MAP_KEYS),
-        (&b"values"[..], native::MAP_VALUES),
-    ] {
-        method(heap, atoms, map_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"add"[..], native::SET_ADD),
-        (&b"has"[..], native::SET_HAS),
-        (&b"delete"[..], native::SET_DELETE),
-        (&b"clear"[..], native::SET_CLEAR),
-        (&b"forEach"[..], native::SET_FOR_EACH),
-        (&b"entries"[..], native::SET_ENTRIES),
-        (&b"values"[..], native::SET_VALUES),
-        (&b"keys"[..], native::SET_VALUES),
-    ] {
-        method(heap, atoms, set_prototype, name, id, function_prototype)?;
-    }
-    for (prototype, getter_id) in [
-        (map_prototype, native::MAP_SIZE),
-        (set_prototype, native::SET_SIZE),
-    ] {
-        let getter = object::create_native(heap, Value::object(function_prototype), getter_id, 0)?;
-        let key = key_of(heap, atoms, b"size")?;
-        object::define_own_property(
-            heap,
-            prototype,
-            key,
-            Descriptor::accessor(
-                Value::object(getter),
-                Value::UNDEFINED,
-                attribute::CONFIGURABLE,
-            ),
-        )?;
-    }
-    for (prototype, iter_id) in [
-        (map_prototype, native::MAP_ENTRIES),
-        (set_prototype, native::SET_VALUES),
-    ] {
-        let function = object::create_native(heap, Value::object(function_prototype), iter_id, 0)?;
-        object::define_own_property(
-            heap,
-            prototype,
-            Key::Symbol(iterator_symbol),
-            Descriptor::data(Value::object(function), method_attributes),
-        )?;
-    }
-
-    // `Reflect`: the object operations as callables over ordinary objects.
-    let reflect = object::create(heap, Value::object(object_prototype))?;
-    for (name, id) in [
-        (&b"get"[..], native::REFLECT_GET),
-        (&b"set"[..], native::REFLECT_SET),
-        (&b"has"[..], native::REFLECT_HAS),
-        (&b"deleteProperty"[..], native::REFLECT_DELETE),
-        (&b"ownKeys"[..], native::REFLECT_OWN_KEYS),
-        (&b"getPrototypeOf"[..], native::REFLECT_GET_PROTOTYPE),
-        (&b"setPrototypeOf"[..], native::REFLECT_SET_PROTOTYPE),
-        (&b"isExtensible"[..], native::REFLECT_IS_EXTENSIBLE),
-        (
-            &b"preventExtensions"[..],
-            native::REFLECT_PREVENT_EXTENSIONS,
-        ),
-        (&b"defineProperty"[..], native::REFLECT_DEFINE_PROPERTY),
-        (
-            &b"getOwnPropertyDescriptor"[..],
-            native::REFLECT_GET_OWN_DESCRIPTOR,
-        ),
-        (&b"apply"[..], native::REFLECT_APPLY),
-        (&b"construct"[..], native::REFLECT_CONSTRUCT),
-    ] {
-        method(heap, atoms, reflect, name, id, function_prototype)?;
-    }
-    define(
-        heap,
-        atoms,
-        global,
-        b"Reflect",
-        Value::object(reflect),
+        iterator_symbol,
         method_attributes,
     )?;
-
+    let (map_prototype, set_prototype) = build_collections(
+        heap,
+        atoms,
+        function_prototype,
+        global,
+        iterator_symbol,
+        method_attributes,
+        object_prototype,
+    )?;
+    build_reflect(
+        heap,
+        atoms,
+        function_prototype,
+        global,
+        method_attributes,
+        object_prototype,
+    )?;
     build_object_intrinsics(heap, atoms, global, object_prototype, function_prototype)?;
     build_array_intrinsics(
         heap,
@@ -1414,484 +935,46 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
     )?;
     build_math(heap, atoms, global, object_prototype, function_prototype)?;
     build_function_intrinsics(heap, atoms, function_prototype)?;
-
-    // `WeakRef`: a reference the collector could clear, except that this
-    // engine never observes a collection, so `deref` always answers the
-    // target — which the specification allows.
-    let weak_ref_prototype = object::create(heap, Value::object(object_prototype))?;
-    constructor(
+    let (weak_ref_prototype, weak_map_prototype, weak_set_prototype) = build_weak(
         heap,
         atoms,
-        global,
-        b"WeakRef",
-        native::WEAK_REF,
-        weak_ref_prototype,
         function_prototype,
-    )?;
-    method(
-        heap,
-        atoms,
-        weak_ref_prototype,
-        b"deref",
-        native::WEAK_REF_DEREF,
-        function_prototype,
-    )?;
-    let weak_tag = crate::string::create_ascii(heap, b"WeakRef")?;
-    object::define_own_property(
-        heap,
-        weak_ref_prototype,
-        Key::Symbol(to_string_tag_symbol),
-        Descriptor::data(Value::string(weak_tag), attribute::CONFIGURABLE),
-    )?;
-
-    // `WeakMap` and `WeakSet`: the same storage as `Map` and `Set` under a
-    // brand of their own, keyed by objects and symbols only, with nothing
-    // that walks or counts the members.
-    let weak_map_prototype = object::create(heap, Value::object(object_prototype))?;
-    let weak_set_prototype = object::create(heap, Value::object(object_prototype))?;
-    constructor(
-        heap,
-        atoms,
         global,
-        b"WeakMap",
-        native::WEAK_MAP,
-        weak_map_prototype,
+        object_prototype,
+        to_string_tag_symbol,
+    )?;
+    let date_prototype = build_date(
+        heap,
+        atoms,
         function_prototype,
-    )?;
-    constructor(
-        heap,
-        atoms,
         global,
-        b"WeakSet",
-        native::WEAK_SET,
-        weak_set_prototype,
-        function_prototype,
+        object_prototype,
+        to_primitive_symbol,
+        to_string_tag_symbol,
     )?;
-    for (name, id) in [
-        (&b"get"[..], native::WEAK_MAP_GET),
-        (&b"set"[..], native::WEAK_MAP_SET),
-        (&b"has"[..], native::WEAK_MAP_HAS),
-        (&b"delete"[..], native::WEAK_MAP_DELETE),
-    ] {
-        method(
-            heap,
-            atoms,
-            weak_map_prototype,
-            name,
-            id,
-            function_prototype,
-        )?;
-    }
-    for (name, id) in [
-        (&b"add"[..], native::WEAK_SET_ADD),
-        (&b"has"[..], native::WEAK_SET_HAS),
-        (&b"delete"[..], native::WEAK_SET_DELETE),
-    ] {
-        method(
-            heap,
-            atoms,
-            weak_set_prototype,
-            name,
-            id,
-            function_prototype,
-        )?;
-    }
-    for (prototype, name) in [
-        (weak_map_prototype, &b"WeakMap"[..]),
-        (weak_set_prototype, &b"WeakSet"[..]),
-    ] {
-        let tag = crate::string::create_ascii(heap, name)?;
-        object::define_own_property(
-            heap,
-            prototype,
-            Key::Symbol(to_string_tag_symbol),
-            Descriptor::data(Value::string(tag), attribute::CONFIGURABLE),
-        )?;
-    }
-
-    // `Date`: time values in UTC. Without a clock capability "now" is the
-    // epoch, so a program that asks for the time gets the same answer every
-    // run rather than an authority it was not given.
-    let date_prototype = object::create(heap, Value::object(object_prototype))?;
-    object::reserve(heap, date_prototype, 52)?;
-    let date_constructor = constructor(
-        heap,
-        atoms,
-        global,
-        b"Date",
-        native::DATE,
-        date_prototype,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"now"[..], native::DATE_NOW),
-        (&b"UTC"[..], native::DATE_UTC),
-        (&b"parse"[..], native::DATE_PARSE),
-    ] {
-        method(heap, atoms, date_constructor, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"getTime"[..], native::DATE_GET_TIME),
-        (&b"valueOf"[..], native::DATE_GET_TIME),
-        (&b"getFullYear"[..], native::DATE_GET_FULL_YEAR),
-        (&b"getUTCFullYear"[..], native::DATE_GET_FULL_YEAR),
-        (&b"getMonth"[..], native::DATE_GET_MONTH),
-        (&b"getUTCMonth"[..], native::DATE_GET_MONTH),
-        (&b"getDate"[..], native::DATE_GET_DATE),
-        (&b"getUTCDate"[..], native::DATE_GET_DATE),
-        (&b"getDay"[..], native::DATE_GET_DAY),
-        (&b"getUTCDay"[..], native::DATE_GET_DAY),
-        (&b"getHours"[..], native::DATE_GET_HOURS),
-        (&b"getUTCHours"[..], native::DATE_GET_HOURS),
-        (&b"getMinutes"[..], native::DATE_GET_MINUTES),
-        (&b"getUTCMinutes"[..], native::DATE_GET_MINUTES),
-        (&b"getSeconds"[..], native::DATE_GET_SECONDS),
-        (&b"getUTCSeconds"[..], native::DATE_GET_SECONDS),
-        (&b"getMilliseconds"[..], native::DATE_GET_MILLISECONDS),
-        (&b"getUTCMilliseconds"[..], native::DATE_GET_MILLISECONDS),
-        (&b"getTimezoneOffset"[..], native::DATE_GET_TIMEZONE_OFFSET),
-        (&b"toString"[..], native::DATE_TO_STRING),
-        (&b"toISOString"[..], native::DATE_TO_ISO_STRING),
-        (&b"toUTCString"[..], native::DATE_TO_UTC_STRING),
-        (&b"toDateString"[..], native::DATE_TO_DATE_STRING),
-        (&b"toTimeString"[..], native::DATE_TO_TIME_STRING),
-        (&b"toJSON"[..], native::DATE_TO_JSON),
-        (&b"setTime"[..], native::DATE_SET_TIME),
-        (&b"toLocaleString"[..], native::DATE_TO_STRING),
-        (&b"toLocaleDateString"[..], native::DATE_TO_DATE_STRING),
-        (&b"toLocaleTimeString"[..], native::DATE_TO_TIME_STRING),
-        (&b"setFullYear"[..], native::DATE_SET_FULL_YEAR),
-        (&b"setUTCFullYear"[..], native::DATE_SET_FULL_YEAR),
-        (&b"setMonth"[..], native::DATE_SET_MONTH),
-        (&b"setUTCMonth"[..], native::DATE_SET_MONTH),
-        (&b"setDate"[..], native::DATE_SET_DATE),
-        (&b"setUTCDate"[..], native::DATE_SET_DATE),
-        (&b"setHours"[..], native::DATE_SET_HOURS),
-        (&b"setUTCHours"[..], native::DATE_SET_HOURS),
-        (&b"setMinutes"[..], native::DATE_SET_MINUTES),
-        (&b"setUTCMinutes"[..], native::DATE_SET_MINUTES),
-        (&b"setSeconds"[..], native::DATE_SET_SECONDS),
-        (&b"setUTCSeconds"[..], native::DATE_SET_SECONDS),
-        (&b"setMilliseconds"[..], native::DATE_SET_MILLISECONDS),
-        (&b"setUTCMilliseconds"[..], native::DATE_SET_MILLISECONDS),
-    ] {
-        method(heap, atoms, date_prototype, name, id, function_prototype)?;
-    }
-    let to_primitive = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::DATE_TO_PRIMITIVE,
-        0,
-    )?;
-    object::define_own_property(
-        heap,
-        date_prototype,
-        Key::Symbol(to_primitive_symbol),
-        Descriptor::data(Value::object(to_primitive), attribute::CONFIGURABLE),
-    )?;
-    let date_tag = crate::string::create_ascii(heap, b"Date")?;
-    object::define_own_property(
-        heap,
-        date_prototype,
-        Key::Symbol(to_string_tag_symbol),
-        Descriptor::data(Value::string(date_tag), attribute::CONFIGURABLE),
-    )?;
-
-    // `Proxy`: a constructor with no `prototype` of its own, whose instances
-    // put a handler between every operation and its target.
-    let proxy_constructor = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::PROXY,
-        object::function_flag::CONSTRUCTOR,
-    )?;
-    let proxy_name = crate::string::create_ascii(heap, b"Proxy")?;
-    define(
-        heap,
-        atoms,
-        proxy_constructor,
-        b"name",
-        Value::string(proxy_name),
-        attribute::CONFIGURABLE,
-    )?;
-    define(
-        heap,
-        atoms,
-        global,
-        b"Proxy",
-        Value::object(proxy_constructor),
-        attribute::WRITABLE | attribute::CONFIGURABLE,
-    )?;
-    method(
-        heap,
-        atoms,
-        proxy_constructor,
-        b"revocable",
-        native::PROXY_REVOCABLE,
-        function_prototype,
-    )?;
-
-    // `ArrayBuffer`, `Uint8Array`, and `DataView`: bytes as numbers in an
-    // array the buffer owns, read and written by index through the view.
-    let array_buffer_prototype = object::create(heap, Value::object(object_prototype))?;
-    let array_buffer_constructor = constructor(
-        heap,
-        atoms,
-        global,
-        b"ArrayBuffer",
-        native::ARRAY_BUFFER,
+    build_proxy(heap, atoms, function_prototype, global)?;
+    let (
         array_buffer_prototype,
-        function_prototype,
-    )?;
-    method(
-        heap,
-        atoms,
-        array_buffer_prototype,
-        b"slice",
-        native::ARRAY_BUFFER_SLICE,
-        function_prototype,
-    )?;
-    method(
-        heap,
-        atoms,
-        array_buffer_prototype,
-        b"resize",
-        native::ARRAY_BUFFER_RESIZE,
-        function_prototype,
-    )?;
-    method(
-        heap,
-        atoms,
-        array_buffer_prototype,
-        b"transferToImmutable",
-        native::ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"byteLength"[..], native::ARRAY_BUFFER_BYTE_LENGTH),
-        (&b"maxByteLength"[..], native::ARRAY_BUFFER_MAX_BYTE_LENGTH),
-        (&b"resizable"[..], native::ARRAY_BUFFER_RESIZABLE),
-        (&b"immutable"[..], native::ARRAY_BUFFER_IMMUTABLE),
-    ] {
-        accessor(
-            heap,
-            atoms,
-            array_buffer_prototype,
-            name,
-            id,
-            function_prototype,
-        )?;
-    }
-    // `SharedArrayBuffer`: the same bytes under a name of its own; nothing
-    // here shares them, since the engine has no threads.
-    let shared_array_buffer_prototype = object::create(heap, Value::object(object_prototype))?;
-    constructor(
-        heap,
-        atoms,
-        global,
-        b"SharedArrayBuffer",
-        native::SHARED_ARRAY_BUFFER,
         shared_array_buffer_prototype,
-        function_prototype,
-    )?;
-    method(
-        heap,
-        atoms,
-        shared_array_buffer_prototype,
-        b"slice",
-        native::ARRAY_BUFFER_SLICE,
-        function_prototype,
-    )?;
-    accessor(
-        heap,
-        atoms,
-        shared_array_buffer_prototype,
-        b"byteLength",
-        native::ARRAY_BUFFER_BYTE_LENGTH,
-        function_prototype,
-    )?;
-    let species_getter = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::SPECIES_GETTER,
-        0,
-    )?;
-    object::define_own_property(
-        heap,
-        array_buffer_constructor,
-        Key::Symbol(species_symbol),
-        Descriptor::accessor(
-            Value::object(species_getter),
-            Value::UNDEFINED,
-            attribute::CONFIGURABLE,
-        ),
-    )?;
-    // The typed arrays: `%TypedArray%` — reached only through a kind's
-    // `constructor` chain — and one constructor per element kind beneath it,
-    // each carrying its kind and element size.
-    let typed_array_prototype = object::create(heap, Value::object(object_prototype))?;
-    let typed_array_base = intrinsic_constructor(
-        heap,
-        atoms,
-        b"TypedArray",
-        native::TYPED_ARRAY_BASE,
         typed_array_prototype,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"of"[..], native::TYPED_ARRAY_OF),
-        (&b"from"[..], native::TYPED_ARRAY_FROM),
-    ] {
-        method(heap, atoms, typed_array_base, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"length"[..], native::TYPED_ARRAY_LENGTH),
-        (&b"byteLength"[..], native::TYPED_ARRAY_BYTE_LENGTH),
-        (&b"byteOffset"[..], native::TYPED_ARRAY_BYTE_OFFSET),
-        (&b"buffer"[..], native::TYPED_ARRAY_BUFFER),
-    ] {
-        accessor(
-            heap,
-            atoms,
-            typed_array_prototype,
-            name,
-            id,
-            function_prototype,
-        )?;
-    }
-    for (name, id) in [
-        (&b"values"[..], native::TYPED_ARRAY_VALUES),
-        (&b"keys"[..], native::TYPED_ARRAY_KEYS),
-        (&b"entries"[..], native::TYPED_ARRAY_ENTRIES),
-        (&b"subarray"[..], native::TYPED_ARRAY_SUBARRAY),
-        (&b"set"[..], native::TYPED_ARRAY_SET),
-        (&b"fill"[..], native::TYPED_ARRAY_FILL),
-    ] {
-        method(
-            heap,
-            atoms,
-            typed_array_prototype,
-            name,
-            id,
-            function_prototype,
-        )?;
-    }
-    {
-        let values_key = key_of(heap, atoms, b"values")?;
-        let values = object::get_own_property(heap, typed_array_prototype, values_key)?
-            .map_or(Value::UNDEFINED, |found| found.value);
-        object::define_own_property(
-            heap,
-            typed_array_prototype,
-            Key::Symbol(iterator_symbol),
-            Descriptor::data(values, attribute::WRITABLE | attribute::CONFIGURABLE),
-        )?;
-        let tag_getter = object::create_native(
-            heap,
-            Value::object(function_prototype),
-            native::TYPED_ARRAY_TAG,
-            0,
-        )?;
-        object::define_own_property(
-            heap,
-            typed_array_prototype,
-            Key::Symbol(to_string_tag_symbol),
-            Descriptor::accessor(
-                Value::object(tag_getter),
-                Value::UNDEFINED,
-                attribute::CONFIGURABLE,
-            ),
-        )?;
-    }
-    let mut typed_array_prototypes = [typed_array_prototype; TYPED_ARRAY_KINDS];
-    let mut kind = 0u8;
-    while usize::from(kind) < TYPED_ARRAY_KINDS {
-        let prototype = object::create(heap, Value::object(typed_array_prototype))?;
-        let (name, name_length) = typed_array_name(kind);
-        let made = constructor(
-            heap,
-            atoms,
-            global,
-            name.get(..name_length).unwrap_or(&[]),
-            native::TYPED_ARRAY,
-            prototype,
-            function_prototype,
-        )?;
-        object::set_prototype(heap, made, Value::object(typed_array_base))?;
-        let size = Value::number(f64::from(typed_array_element_size(kind)));
-        for target in [made, prototype] {
-            define(heap, atoms, target, b"BYTES_PER_ELEMENT", size, 0)?;
-        }
-        define(
-            heap,
-            atoms,
-            made,
-            b"\0kind",
-            Value::number(f64::from(kind)),
-            attribute::WRITABLE,
-        )?;
-        typed_array_prototypes[usize::from(kind)] = prototype;
-        kind += 1;
-    }
-    let data_view_prototype = object::create(heap, Value::object(object_prototype))?;
-    constructor(
-        heap,
-        atoms,
-        global,
-        b"DataView",
-        native::DATA_VIEW,
+        typed_array_prototypes,
         data_view_prototype,
-        function_prototype,
-    )?;
-    for (prototype, tag) in [
-        (array_buffer_prototype, &b"ArrayBuffer"[..]),
-        (shared_array_buffer_prototype, &b"SharedArrayBuffer"[..]),
-        (data_view_prototype, &b"DataView"[..]),
-    ] {
-        let text = crate::string::create_ascii(heap, tag)?;
-        object::define_own_property(
-            heap,
-            prototype,
-            Key::Symbol(to_string_tag_symbol),
-            Descriptor::data(Value::string(text), attribute::CONFIGURABLE),
-        )?;
-    }
-
-    // `JSON`: a parser and a serialiser, pure functions of their arguments.
-    let json = object::create(heap, Value::object(object_prototype))?;
-    object::reserve(heap, json, 4)?;
-    method(
+    ) = build_buffers(
         heap,
         atoms,
-        json,
-        b"parse",
-        native::JSON_PARSE,
         function_prototype,
-    )?;
-    method(
-        heap,
-        atoms,
-        json,
-        b"stringify",
-        native::JSON_STRINGIFY,
-        function_prototype,
-    )?;
-    let json_tag = crate::string::create_ascii(heap, b"JSON")?;
-    object::define_own_property(
-        heap,
-        json,
-        Key::Symbol(to_string_tag_symbol),
-        Descriptor::data(Value::string(json_tag), attribute::CONFIGURABLE),
-    )?;
-    define(
-        heap,
-        atoms,
         global,
-        b"JSON",
-        Value::object(json),
-        attribute::WRITABLE | attribute::CONFIGURABLE,
+        object_prototype,
+        symbols,
     )?;
-
+    build_json(
+        heap,
+        atoms,
+        function_prototype,
+        global,
+        object_prototype,
+        to_string_tag_symbol,
+    )?;
     let environment = env::create_object_environment(heap, Value::UNDEFINED, global)
         .map_err(|_| ObjectError::Heap(crate::heap::HeapError::ArenaFull))?;
     let lexical = env::create(
@@ -1956,377 +1039,6 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
         hint_number,
         hint_string,
     })
-}
-
-/// `Object`, its statics, and the methods every object inherits.
-fn build_object_intrinsics(
-    heap: &mut Heap<'_>,
-    atoms: &mut Atoms<'_>,
-    global: Handle,
-    object_prototype: Handle,
-    function_prototype: Handle,
-) -> Result<(), ObjectError> {
-    object::reserve(heap, object_prototype, 8)?;
-    let handle = constructor(
-        heap,
-        atoms,
-        global,
-        b"Object",
-        native::OBJECT,
-        object_prototype,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"keys"[..], native::OBJECT_KEYS),
-        (&b"values"[..], native::OBJECT_VALUES),
-        (&b"entries"[..], native::OBJECT_ENTRIES),
-        (&b"assign"[..], native::OBJECT_ASSIGN),
-    ] {
-        method(heap, atoms, handle, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"freeze"[..], native::OBJECT_FREEZE),
-        (&b"isFrozen"[..], native::OBJECT_IS_FROZEN),
-        (&b"preventExtensions"[..], native::OBJECT_PREVENT_EXTENSIONS),
-        (&b"isExtensible"[..], native::OBJECT_IS_EXTENSIBLE),
-        (&b"seal"[..], native::OBJECT_SEAL),
-        (&b"isSealed"[..], native::OBJECT_IS_SEALED),
-        (&b"getPrototypeOf"[..], native::OBJECT_GET_PROTOTYPE_OF),
-        (&b"setPrototypeOf"[..], native::OBJECT_SET_PROTOTYPE_OF),
-    ] {
-        method(heap, atoms, handle, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"defineProperty"[..], native::OBJECT_DEFINE_PROPERTY),
-        (&b"defineProperties"[..], native::OBJECT_DEFINE_PROPERTIES),
-        (
-            &b"getOwnPropertyNames"[..],
-            native::OBJECT_GET_OWN_PROPERTY_NAMES,
-        ),
-        (&b"create"[..], native::OBJECT_CREATE),
-        (&b"is"[..], native::OBJECT_IS),
-        (
-            &b"getOwnPropertyDescriptor"[..],
-            native::OBJECT_GET_OWN_PROPERTY_DESCRIPTOR,
-        ),
-        (
-            &b"getOwnPropertySymbols"[..],
-            native::OBJECT_GET_OWN_PROPERTY_SYMBOLS,
-        ),
-    ] {
-        method(heap, atoms, handle, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"hasOwnProperty"[..], native::OBJECT_HAS_OWN_PROPERTY),
-        (&b"isPrototypeOf"[..], native::OBJECT_IS_PROTOTYPE_OF),
-        (&b"__defineGetter__"[..], native::OBJECT_DEFINE_GETTER),
-        (&b"__defineSetter__"[..], native::OBJECT_DEFINE_SETTER),
-        (&b"__lookupGetter__"[..], native::OBJECT_LOOKUP_GETTER),
-        (&b"__lookupSetter__"[..], native::OBJECT_LOOKUP_SETTER),
-        (
-            &b"propertyIsEnumerable"[..],
-            native::OBJECT_PROPERTY_IS_ENUMERABLE,
-        ),
-    ] {
-        method(heap, atoms, object_prototype, name, id, function_prototype)?;
-    }
-    Ok(())
-}
-
-/// `Array`, its statics, and the methods an array inherits.
-fn build_array_intrinsics(
-    heap: &mut Heap<'_>,
-    atoms: &mut Atoms<'_>,
-    global: Handle,
-    array_prototype: Handle,
-    function_prototype: Handle,
-    iterator_symbol: Handle,
-) -> Result<(), ObjectError> {
-    object::reserve(heap, array_prototype, 28)?;
-    let handle = constructor(
-        heap,
-        atoms,
-        global,
-        b"Array",
-        native::ARRAY,
-        array_prototype,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"isArray"[..], native::ARRAY_IS_ARRAY),
-        (&b"of"[..], native::ARRAY_OF),
-        (&b"from"[..], native::ARRAY_FROM),
-    ] {
-        method(heap, atoms, handle, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"push"[..], native::ARRAY_PUSH),
-        (&b"pop"[..], native::ARRAY_POP),
-        (&b"shift"[..], native::ARRAY_SHIFT),
-        (&b"unshift"[..], native::ARRAY_UNSHIFT),
-    ] {
-        method(heap, atoms, array_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"slice"[..], native::ARRAY_SLICE),
-        (&b"indexOf"[..], native::ARRAY_INDEX_OF),
-        (&b"includes"[..], native::ARRAY_INCLUDES),
-        (&b"concat"[..], native::ARRAY_CONCAT),
-    ] {
-        method(heap, atoms, array_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"map"[..], native::ARRAY_MAP),
-        (&b"filter"[..], native::ARRAY_FILTER),
-        (&b"reduce"[..], native::ARRAY_REDUCE),
-        (&b"forEach"[..], native::ARRAY_FOR_EACH),
-    ] {
-        method(heap, atoms, array_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"some"[..], native::ARRAY_SOME),
-        (&b"every"[..], native::ARRAY_EVERY),
-        (&b"find"[..], native::ARRAY_FIND),
-        (&b"findIndex"[..], native::ARRAY_FIND_INDEX),
-    ] {
-        method(heap, atoms, array_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"reverse"[..], native::ARRAY_REVERSE),
-        (&b"fill"[..], native::ARRAY_FILL),
-        (&b"sort"[..], native::ARRAY_SORT),
-    ] {
-        method(heap, atoms, array_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"values"[..], native::ARRAY_VALUES),
-        (&b"keys"[..], native::ARRAY_KEYS),
-        (&b"entries"[..], native::ARRAY_ENTRIES),
-    ] {
-        method(heap, atoms, array_prototype, name, id, function_prototype)?;
-    }
-    // An array is iterated by its values: `Symbol.iterator` names the very
-    // function `values` does.
-    let values_key = key_of(heap, atoms, b"values")?;
-    let values = object::get_own_property(heap, array_prototype, values_key)?
-        .map_or(Value::UNDEFINED, |found| found.value);
-    object::define_own_property(
-        heap,
-        array_prototype,
-        Key::Symbol(iterator_symbol),
-        Descriptor::data(values, attribute::WRITABLE | attribute::CONFIGURABLE),
-    )?;
-    Ok(())
-}
-
-/// `String` and the methods a string reaches.
-fn build_string_intrinsics(
-    heap: &mut Heap<'_>,
-    atoms: &mut Atoms<'_>,
-    global: Handle,
-    string_prototype: Handle,
-    function_prototype: Handle,
-    iterator_symbol: Handle,
-) -> Result<(), ObjectError> {
-    object::reserve(heap, string_prototype, 28)?;
-    let handle = constructor(
-        heap,
-        atoms,
-        global,
-        b"String",
-        native::STRING,
-        string_prototype,
-        function_prototype,
-    )?;
-    method(
-        heap,
-        atoms,
-        handle,
-        b"fromCharCode",
-        native::STRING_FROM_CHAR_CODE,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"charAt"[..], native::STRING_CHAR_AT),
-        (&b"charCodeAt"[..], native::STRING_CHAR_CODE_AT),
-        (&b"codePointAt"[..], native::STRING_CODE_POINT_AT),
-        (&b"at"[..], native::STRING_AT),
-    ] {
-        method(heap, atoms, string_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"indexOf"[..], native::STRING_INDEX_OF),
-        (&b"lastIndexOf"[..], native::STRING_LAST_INDEX_OF),
-        (&b"includes"[..], native::STRING_INCLUDES),
-        (&b"startsWith"[..], native::STRING_STARTS_WITH),
-    ] {
-        method(heap, atoms, string_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"endsWith"[..], native::STRING_ENDS_WITH),
-        (&b"slice"[..], native::STRING_SLICE),
-        (&b"substring"[..], native::STRING_SUBSTRING),
-        (&b"split"[..], native::STRING_SPLIT),
-    ] {
-        method(heap, atoms, string_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"toUpperCase"[..], native::STRING_TO_UPPER_CASE),
-        (&b"toLowerCase"[..], native::STRING_TO_LOWER_CASE),
-        (&b"trim"[..], native::STRING_TRIM),
-        (&b"repeat"[..], native::STRING_REPEAT),
-    ] {
-        method(heap, atoms, string_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"padStart"[..], native::STRING_PAD_START),
-        (&b"padEnd"[..], native::STRING_PAD_END),
-        (&b"concat"[..], native::STRING_CONCAT),
-        (&b"replace"[..], native::STRING_REPLACE),
-    ] {
-        method(heap, atoms, string_prototype, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"toString"[..], native::STRING_TO_STRING),
-        (&b"valueOf"[..], native::STRING_TO_STRING),
-        (&b"match"[..], native::STRING_MATCH),
-        (&b"search"[..], native::STRING_SEARCH),
-    ] {
-        method(heap, atoms, string_prototype, name, id, function_prototype)?;
-    }
-    // A string is iterated by its code points, not by its code units.
-    let values = object::create_native(
-        heap,
-        Value::object(function_prototype),
-        native::STRING_VALUES,
-        0,
-    )?;
-    object::define_own_property(
-        heap,
-        string_prototype,
-        Key::Symbol(iterator_symbol),
-        Descriptor::data(
-            Value::object(values),
-            attribute::WRITABLE | attribute::CONFIGURABLE,
-        ),
-    )?;
-    Ok(())
-}
-
-/// `Number`, `Boolean`, and the conversions that live on the global object.
-fn build_number_intrinsics(
-    heap: &mut Heap<'_>,
-    atoms: &mut Atoms<'_>,
-    global: Handle,
-    number_prototype: Handle,
-    boolean_prototype: Handle,
-    function_prototype: Handle,
-) -> Result<(), ObjectError> {
-    object::reserve(heap, number_prototype, 6)?;
-    let handle = constructor(
-        heap,
-        atoms,
-        global,
-        b"Number",
-        native::NUMBER,
-        number_prototype,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"isInteger"[..], native::NUMBER_IS_INTEGER),
-        (&b"isFinite"[..], native::NUMBER_IS_FINITE),
-        (&b"isNaN"[..], native::NUMBER_IS_NAN),
-        (&b"isSafeInteger"[..], native::NUMBER_IS_SAFE_INTEGER),
-    ] {
-        method(heap, atoms, handle, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"parseInt"[..], native::PARSE_INT),
-        (&b"parseFloat"[..], native::PARSE_FLOAT),
-    ] {
-        method(heap, atoms, handle, name, id, function_prototype)?;
-    }
-    for (name, value) in [
-        (&b"MAX_SAFE_INTEGER"[..], 9_007_199_254_740_991.0f64),
-        (&b"MIN_SAFE_INTEGER"[..], -9_007_199_254_740_991.0f64),
-        (&b"EPSILON"[..], f64::EPSILON),
-        (&b"POSITIVE_INFINITY"[..], f64::INFINITY),
-    ] {
-        define(heap, atoms, handle, name, Value::number(value), 0)?;
-    }
-    for (name, value) in [
-        (&b"NEGATIVE_INFINITY"[..], f64::NEG_INFINITY),
-        (&b"NaN"[..], f64::NAN),
-        (&b"MAX_VALUE"[..], f64::MAX),
-        (&b"MIN_VALUE"[..], 5e-324),
-    ] {
-        define(heap, atoms, handle, name, Value::number(value), 0)?;
-    }
-    for (name, id) in [
-        (&b"toString"[..], native::NUMBER_TO_STRING),
-        (&b"toFixed"[..], native::NUMBER_TO_FIXED),
-        (&b"toExponential"[..], native::NUMBER_TO_EXPONENTIAL),
-        (&b"toPrecision"[..], native::NUMBER_TO_PRECISION),
-        (&b"valueOf"[..], native::NUMBER_VALUE_OF),
-    ] {
-        method(heap, atoms, number_prototype, name, id, function_prototype)?;
-    }
-
-    constructor(
-        heap,
-        atoms,
-        global,
-        b"Boolean",
-        native::BOOLEAN,
-        boolean_prototype,
-        function_prototype,
-    )?;
-    // `Function` exists so a function's constructor, `Function.prototype`,
-    // and `f instanceof Function` all answer; only building one from source
-    // is refused, because the compiler lives outside the machine.
-    constructor(
-        heap,
-        atoms,
-        global,
-        b"Function",
-        native::FUNCTION,
-        function_prototype,
-        function_prototype,
-    )?;
-    for (name, id) in [
-        (&b"toString"[..], native::BOOLEAN_TO_STRING),
-        (&b"valueOf"[..], native::BOOLEAN_VALUE_OF),
-    ] {
-        method(heap, atoms, boolean_prototype, name, id, function_prototype)?;
-    }
-
-    // `eval` is a function like any other; only the machine knows that a call
-    // to it pauses for the compiler.
-    {
-        let function =
-            object::create_native(heap, Value::object(function_prototype), native::EVAL, 0)?;
-        define(
-            heap,
-            atoms,
-            global,
-            b"eval",
-            Value::object(function),
-            attribute::WRITABLE | attribute::CONFIGURABLE,
-        )?;
-    }
-    for (name, id) in [
-        (&b"parseInt"[..], native::PARSE_INT),
-        (&b"parseFloat"[..], native::PARSE_FLOAT),
-        (&b"isNaN"[..], native::IS_NAN),
-        (&b"isFinite"[..], native::IS_FINITE),
-        (&b"encodeURI"[..], native::ENCODE_URI),
-        (&b"encodeURIComponent"[..], native::ENCODE_URI_COMPONENT),
-        (&b"decodeURI"[..], native::DECODE_URI),
-        (&b"decodeURIComponent"[..], native::DECODE_URI_COMPONENT),
-    ] {
-        method(heap, atoms, global, name, id, function_prototype)?;
-    }
-    Ok(())
 }
 
 /// Give a host's realm a `print` function, which records its argument in the
@@ -2420,125 +1132,6 @@ pub fn install_print(
     )
 }
 
-/// `Math`, which holds no state and no authority: every function of it is a
-/// pure function of its arguments. There is no `random`, because randomness is
-/// a capability rather than something an engine may help itself to.
-fn build_math(
-    heap: &mut Heap<'_>,
-    atoms: &mut Atoms<'_>,
-    global: Handle,
-    object_prototype: Handle,
-    function_prototype: Handle,
-) -> Result<(), ObjectError> {
-    let math = object::create(heap, Value::object(object_prototype))?;
-    object::reserve(heap, math, 24)?;
-    for (name, id) in [
-        (&b"abs"[..], native::MATH_ABS),
-        (&b"floor"[..], native::MATH_FLOOR),
-        (&b"ceil"[..], native::MATH_CEIL),
-        (&b"round"[..], native::MATH_ROUND),
-    ] {
-        method(heap, atoms, math, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"trunc"[..], native::MATH_TRUNC),
-        (&b"sqrt"[..], native::MATH_SQRT),
-        (&b"pow"[..], native::MATH_POW),
-        (&b"sign"[..], native::MATH_SIGN),
-    ] {
-        method(heap, atoms, math, name, id, function_prototype)?;
-    }
-    for (name, id) in [
-        (&b"min"[..], native::MATH_MIN),
-        (&b"max"[..], native::MATH_MAX),
-        (&b"hypot"[..], native::MATH_HYPOT),
-        (&b"sin"[..], native::MATH_SIN),
-        (&b"cos"[..], native::MATH_COS),
-        (&b"tan"[..], native::MATH_TAN),
-        (&b"asin"[..], native::MATH_ASIN),
-        (&b"acos"[..], native::MATH_ACOS),
-        (&b"atan"[..], native::MATH_ATAN),
-        (&b"atan2"[..], native::MATH_ATAN2),
-        (&b"exp"[..], native::MATH_EXP),
-        (&b"log"[..], native::MATH_LOG),
-        (&b"log2"[..], native::MATH_LOG2),
-        (&b"log10"[..], native::MATH_LOG10),
-        (&b"cbrt"[..], native::MATH_CBRT),
-    ] {
-        method(heap, atoms, math, name, id, function_prototype)?;
-    }
-    for (name, value) in [
-        (&b"PI"[..], core::f64::consts::PI),
-        (&b"E"[..], core::f64::consts::E),
-        (&b"LN2"[..], core::f64::consts::LN_2),
-        (&b"LN10"[..], core::f64::consts::LN_10),
-        (&b"LOG2E"[..], core::f64::consts::LOG2_E),
-        (&b"LOG10E"[..], core::f64::consts::LOG10_E),
-        (&b"SQRT2"[..], core::f64::consts::SQRT_2),
-        (&b"SQRT1_2"[..], core::f64::consts::FRAC_1_SQRT_2),
-    ] {
-        define(heap, atoms, math, name, Value::number(value), 0)?;
-    }
-    define(
-        heap,
-        atoms,
-        global,
-        b"Math",
-        Value::object(math),
-        attribute::WRITABLE | attribute::CONFIGURABLE,
-    )?;
-    Ok(())
-}
-
-/// What every function carries: the ways of calling it with a receiver of the
-/// caller's choosing.
-fn build_function_intrinsics(
-    heap: &mut Heap<'_>,
-    atoms: &mut Atoms<'_>,
-    function_prototype: Handle,
-) -> Result<(), ObjectError> {
-    object::reserve(heap, function_prototype, 4)?;
-    // `caller` and `arguments` on the function prototype are poisoned: every
-    // function inherits accessors that refuse, which is what keeps a call's
-    // caller from being observable.
-    {
-        let thrower = object::create_native(
-            heap,
-            Value::object(function_prototype),
-            native::THROW_TYPE_ERROR,
-            0,
-        )?;
-        for name in [&b"caller"[..], &b"arguments"[..]] {
-            let key = key_of(heap, atoms, name)?;
-            object::define_own_property(
-                heap,
-                function_prototype,
-                key,
-                Descriptor::accessor(
-                    Value::object(thrower),
-                    Value::object(thrower),
-                    attribute::CONFIGURABLE,
-                ),
-            )?;
-        }
-    }
-    for (name, id) in [
-        (&b"call"[..], native::FUNCTION_PROTOTYPE_CALL),
-        (&b"apply"[..], native::FUNCTION_PROTOTYPE_APPLY),
-        (&b"bind"[..], native::FUNCTION_PROTOTYPE_BIND),
-    ] {
-        method(
-            heap,
-            atoms,
-            function_prototype,
-            name,
-            id,
-            function_prototype,
-        )?;
-    }
-    Ok(())
-}
-
 /// Put a native method on an object under an ASCII name.
 fn method(
     heap: &mut Heap<'_>,
@@ -2559,6 +1152,37 @@ fn method(
             attribute::WRITABLE | attribute::CONFIGURABLE,
         ),
     )?;
+    Ok(())
+}
+
+/// One property an intrinsic carries, as a row of an `install` table.
+#[derive(Clone, Copy)]
+pub enum Entry<'a> {
+    /// A native method under an ASCII name: writable and configurable.
+    Method(&'a [u8], u32),
+    /// A native getter under an ASCII name: configurable, no setter.
+    Getter(&'a [u8], u32),
+}
+
+/// Put every row of `entries` on `target`, in order.
+///
+/// The table is a by-value local array at every call site, `let entries =
+/// [...]`, never `&[...]` and never a `static` or `const` item: a borrowed
+/// literal of constant rows is promoted to read-only data whose byte-string
+/// pointers need relocations, and a loaded module image gets none.
+pub fn install(
+    heap: &mut Heap<'_>,
+    atoms: &mut Atoms<'_>,
+    target: Handle,
+    function_prototype: Handle,
+    entries: &[Entry<'_>],
+) -> Result<(), ObjectError> {
+    for entry in entries {
+        match *entry {
+            Entry::Method(name, id) => method(heap, atoms, target, name, id, function_prototype)?,
+            Entry::Getter(name, id) => accessor(heap, atoms, target, name, id, function_prototype)?,
+        }
+    }
     Ok(())
 }
 

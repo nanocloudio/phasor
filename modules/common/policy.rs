@@ -204,9 +204,10 @@ const fn min_u64(left: u64, right: u64) -> u64 {
     }
 }
 
-/// Why an isolate would not accept an image or a task.
+/// Why an isolate would not accept an image or a task. (`module::Rejection`
+/// is the linker's vocabulary; this is the isolate's.)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Rejection {
+pub enum Refusal {
     /// The storage handed to the isolate is smaller than the policy requires.
     InsufficientStorage,
     /// The image is larger than the policy admits.

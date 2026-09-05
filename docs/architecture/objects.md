@@ -3,9 +3,11 @@
 Source: `modules/common/object.rs`.
 
 This document defines how an object stores its properties, how a descriptor is
-validated, and how the prototype chain is walked. There are no exotic objects,
-shapes, or inline caches: every object here is an ordinary one with a
-flat property table.
+validated, and how the prototype chain is walked. There are no hidden classes,
+shapes, or inline caches: every object is an ordinary one with a flat property
+table, and the exotic behaviours the language requires — a proxy, a buffer, a
+typed array, a data view, a module namespace — are one kind byte on the same
+cell, read by the operations that must consult it.
 
 ## 1. Layout
 
