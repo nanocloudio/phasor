@@ -1,0 +1,71 @@
+version          = "0.0.1"
+type             = "Cli"
+hardware_targets = ["bcm2712"]
+timer_class      = "agnostic"
+
+# One NUL-separated argv record from the cli stack: the mode, the grants, and
+# the fuel one input may burn.
+[[ports]]
+name         = "args"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 8192
+
+# Standard input: a whole script ended by the writer's hang-up, or, in the
+# REPL, bytes as a terminal delivers them.
+[[ports]]
+name         = "stdin"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+# Completion frames from the clock adapter, answering the calls this shell
+# put on `clock_call`.
+[[ports]]
+name         = "clock_reply"
+index        = 2
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 512
+
+# Completion frames from the entropy adapter.
+[[ports]]
+name         = "entropy_reply"
+index        = 3
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 512
+
+# Values, printed lines, prompts, and failures in words.
+[[ports]]
+name         = "stdout"
+direction    = "output"
+content_type = "TextPlain"
+buffer_size  = 65536
+
+[[ports]]
+name         = "exit"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+# Call frames for the clock binding, when it was granted.
+[[ports]]
+name         = "clock_call"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 1024
+
+# Call frames for the entropy binding, when it was granted.
+[[ports]]
+name         = "entropy_call"
+index        = 3
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 1024
+
+[observability]
+exempt = "run-to-completion applet whose evidence is the text it writes and its exit status"

@@ -201,6 +201,7 @@ fn attachments<'a>(
         module_names: &[],
         module_cycles: &[],
         compiler: None,
+        print: None,
     }
 }
 

@@ -1,0 +1,16 @@
+# Workload source manifest for the `phasor` CLI applet.
+# `fluxor install packaging/cli/workload.toml` registers it so
+# `fluxor exec phasor -- <args>` — and a busybox symlink `phasor` — dispatch
+# to the phasor_shell PIC fmod over the graph beside this file.
+[workload]
+name = "phasor"
+version = "0.0.1"
+role = "cli"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[resources]
+state_bytes = 67108864
+buffer_bytes = 131072

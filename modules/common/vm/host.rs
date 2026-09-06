@@ -158,6 +158,108 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         self.print_status
     }
 
+    /// Put a `print` function on the realm's global object, as a conformance
+    /// host or a shell does: the host grants output, and what is printed goes
+    /// to the sink it attached.
+    pub fn install_print(&mut self) -> Result<(), Completion> {
+        crate::realm::install_print(self.heap, self.atoms, &self.realm)
+            .map_err(|_| Completion::HEAP_EXHAUSTED)
+    }
+
+    /// Attach the buffer a host-installed `print` writes into, as UTF-8 with
+    /// a line feed after each call. `length` is how much of it is filled, and
+    /// persists in the host's storage between steps. A call that does not fit
+    /// is dropped whole: the buffer is the host's quota on output.
+    pub fn attach_print(&mut self, sink: &'a mut [u8], length: &'a mut usize) {
+        self.print_sink = Some((sink, length));
+    }
+
+    /// What `print` has written and the host has not taken.
+    pub fn printed(&self) -> &[u8] {
+        match &self.print_sink {
+            Some((sink, length)) => sink.get(..**length).unwrap_or(&[]),
+            None => &[],
+        }
+    }
+
+    /// Forget what `print` wrote, once the host has taken it.
+    pub fn take_printed(&mut self) {
+        if let Some((_, length)) = &mut self.print_sink {
+            **length = 0;
+        }
+    }
+
+    /// Write one printed string to the attached sink, if any.
+    pub(in crate::vm) fn emit_print(&mut self, text: Handle) -> Result<(), Completion> {
+        let Some((sink, length)) = &mut self.print_sink else {
+            return Ok(());
+        };
+        let count = string::length(self.heap, text).map_err(|_| Completion::MALFORMED)?;
+        let start = **length;
+        let mut at = start;
+        let mut index = 0u32;
+        while index < count {
+            let unit = string::unit_at(self.heap, text, index)
+                .map_err(|_| Completion::MALFORMED)?
+                .unwrap_or(0);
+            let low = if index + 1 < count {
+                string::unit_at(self.heap, text, index + 1)
+                    .map_err(|_| Completion::MALFORMED)?
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let paired = (0xD800..=0xDBFF).contains(&unit) && (0xDC00..=0xDFFF).contains(&low);
+            let code_point = if paired {
+                0x1_0000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00)
+            } else {
+                u32::from(unit)
+            };
+            let needed = if code_point < 0x80 {
+                1
+            } else if code_point < 0x800 {
+                2
+            } else if code_point < 0x1_0000 {
+                3
+            } else {
+                4
+            };
+            let Some(out) = sink.get_mut(at..at + needed) else {
+                // The call does not fit: the sink keeps what it held, and the
+                // buffer is the host's quota on output.
+                **length = start;
+                return Ok(());
+            };
+            match needed {
+                1 => out[0] = code_point as u8,
+                2 => {
+                    out[0] = 0xC0 | (code_point >> 6) as u8;
+                    out[1] = 0x80 | (code_point & 0x3F) as u8;
+                }
+                3 => {
+                    out[0] = 0xE0 | (code_point >> 12) as u8;
+                    out[1] = 0x80 | ((code_point >> 6) & 0x3F) as u8;
+                    out[2] = 0x80 | (code_point & 0x3F) as u8;
+                }
+                _ => {
+                    out[0] = 0xF0 | (code_point >> 18) as u8;
+                    out[1] = 0x80 | ((code_point >> 12) & 0x3F) as u8;
+                    out[2] = 0x80 | ((code_point >> 6) & 0x3F) as u8;
+                    out[3] = 0x80 | (code_point & 0x3F) as u8;
+                }
+            }
+            at += needed;
+            index += if paired { 2 } else { 1 };
+        }
+        let Some(end) = sink.get_mut(at) else {
+            **length = start;
+            return Ok(());
+        };
+        *end = b'\n';
+        **length = at + 1;
+        Ok(())
+    }
+
     /// How many calls this machine is waiting on.
     pub fn in_flight(&self) -> u32 {
         match &self.bindings {

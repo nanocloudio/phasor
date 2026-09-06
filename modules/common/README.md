@@ -63,7 +63,9 @@ target; it is not a Cargo crate and not a runtime of its own.
   closed set of task outcomes.
 - `agent.rs` is the one bring-up of a machine over a host's storage: `fresh`
   over new storage, `adopt` over storage a previous step left, every seam
-  attached in one order under a `policy::Policy`.
+  attached in one order under a `policy::Policy` — the bindings a host
+  admits, a closure's instances, a compiler asked in place, and the sink a
+  host-installed `print` writes to.
 - `replay.rs` records a run's identity, its inputs, and a digest of its result.
 - `module.rs` holds module identity, imports, closures, and their states.
 - `link.rs` orders a closure and checks that every import resolved: `link`

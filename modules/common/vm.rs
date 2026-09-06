@@ -568,6 +568,9 @@ pub struct Vm<'a, 'u, 'h, 'atoms> {
     /// What a host-installed `print` reported: 0 none, 1 the async-test
     /// completion line, 2 anything else.
     print_status: u8,
+    /// Where a host-installed `print` writes its text, when the host attached
+    /// somewhere: the buffer and how much of it is filled.
+    print_sink: Option<(&'a mut [u8], &'a mut usize)>,
     /// The state `Math.random` draws from: a fixed seed, so the sequence
     /// replays exactly unless the host seeds it from an entropy capability.
     random_state: u64,
@@ -654,6 +657,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             outbox: None,
             outbox_length: 0,
             print_status: 0,
+            print_sink: None,
             random_state: RANDOM_SEED,
             realms: [Some(realm), None, None, None],
             unit_realm: [0; MAX_UNIT_REALMS],

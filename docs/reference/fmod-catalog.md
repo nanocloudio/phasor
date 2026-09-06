@@ -17,6 +17,7 @@ binary records with explicit lengths and checked offsets.
 | `phasor_time` | Adapter | `request_in` | `reply_out` | A time observation from the `source` its parameter names — monotonic milliseconds or microseconds, or Unix milliseconds — under the `quota` it sets |
 | `phasor_entropy` | Adapter | `request_in` | `reply_out` | A random number from the platform's own source, 32 or 53 bits wide as the `width` parameter says, under a `quota` |
 | `phasor_eval` | Transformer | `source_in` | `result_out`, `exit` | The bounded expression evaluator, kept as the smallest end-to-end path |
+| `phasor_shell` | Cli | `args`, `stdin`, `clock_reply`, `entropy_reply` | `stdout`, `exit`, `clock_call`, `entropy_call` | The shell: a script, `-e`, or a REPL over one realm, each input a bounded task; `--grant clock` and `--grant entropy` admit the two bindings its graph wires directly to the adapters; `--steps` sets the fuel. Installed as the `phasor` applet from `packaging/cli/` |
 
 A source stream ending in a hang-up is one source; an image stream ending in a
 hang-up is one image. Nothing carries a length prefix it could lie about, and
@@ -71,6 +72,7 @@ Every fmod's work is bounded per step and its state carries the rest.
 | `phasor_host_router` | calls in flight, frames staged per output |
 | `phasor_fault_host`, `phasor_time`, `phasor_entropy` | replies staged, and the quota an adapter was given |
 | `phasor_cli` | bytes of result and of rendered text |
+| `phasor_shell` | `--steps` a program may run, clamped to the ceiling; instructions per slice, jobs per slice, collection slice, calls in flight, units a session may make, and what `print` may write between steps, all compiled in |
 
 No step loops until a variable-sized input is exhausted. The isolate rebuilds
 its machine over its own storage on each step, which is what lets a task that

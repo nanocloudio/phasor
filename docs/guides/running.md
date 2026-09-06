@@ -15,6 +15,41 @@ make -C ../fluxor install
 make build
 ```
 
+## Run as a command
+
+The shell is the engine as a command: one applet fmod over the `cli` stack,
+installed once and dispatched by `fluxor exec`, or by name through a busybox
+link.
+
+```sh
+fluxor install packaging/cli/workload.toml --link ~/.cargo/bin
+printf 'function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } fib(18)' | phasor
+# 2584
+phasor -e '[1, 2, 3].map(n => n * n)'
+# 1,4,9
+phasor -i
+# > let a = 20
+# undefined
+# > a * 2 + 2
+# 42
+```
+
+A script on standard input runs once, and the value of its last expression
+is printed when it is not `undefined`; `print(x)` writes a line. `-i` reads
+a line at a time and keeps one realm between lines, continuing a line that
+has not parsed to its end. Every input is a bounded task: a runaway loop
+ends as `phasor: fuel-exhausted` with a non-zero status, and `--steps <n>`
+sets the budget up to the compiled-in ceiling.
+
+Nothing is ambient. The realm has no clock and no randomness until
+`--grant clock` or `--grant entropy` admits the binding, answered by the
+adapter the applet's graph wires to it; the shell prints what it granted.
+The graph is `packaging/cli/linux.yaml`.
+
+The terminal is the program's: what the runtime says while the shell runs is
+filed per run and read back with `fluxor applet logs phasor`, and
+`fluxor exec -v phasor -- …` shows it live.
+
 ## Evaluate an expression
 
 The expression evaluator is the smallest end-to-end path: one expression on

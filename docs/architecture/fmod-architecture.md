@@ -210,6 +210,7 @@ modules/
     phasor_host_router/         admitted host-call routing fmod
     phasor_cli/                 the human edge: results and rendered diagnostics
     phasor_eval/                the bounded expression evaluator
+    phasor_shell/               the shell: the engine as a command, over the cli stack
     phasor_time/                standard clock adapter fmod
     phasor_entropy/             standard entropy adapter fmod
   fixtures/
@@ -217,6 +218,7 @@ modules/
     phasor_fault_host/          host completion fault injector fmod
     phasor_test262/             Test262 front-end oracle fmod
     phasor_run262/              Test262 execution oracle fmod
+packaging/cli/                  the shell's applet graph and workload manifest
 tests/                          shadow graph scenarios and orchestration only
 examples/                       shadow runnable graph compositions
 ```

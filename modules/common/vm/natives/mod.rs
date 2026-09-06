@@ -1047,6 +1047,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             native::PRINT => {
                 let value = arguments.first().copied().unwrap_or(Value::UNDEFINED);
                 let text = self.coerce_to_string(value)?;
+                self.emit_print(text.as_handle())?;
                 let expected = self.ascii_string(b"Test262:AsyncTestComplete")?;
                 let complete = self.strict_equals(text, expected)?;
                 // The first report wins: the async test protocol prints once.

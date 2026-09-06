@@ -32,6 +32,7 @@ runs, and held to a per-file baseline.
 modules/common/             allocation-free language and VM cores
 modules/app/                Fluxor stream components: compiler, linker, isolate, router, adapters
 modules/fixtures/           on-graph conformance probes and Test262 oracles
+packaging/cli/              the shell's applet graph and workload manifest
 docs/                       canonical architecture and guarantees
 tests/                      shadow-tracked graph orchestration only
 examples/                   shadow-tracked runnable Fluxor graphs
@@ -62,6 +63,15 @@ Operational commands remain explicit:
 ```sh
 fluxor modules build --all --strict
 printf '40 + 2' | fluxor run examples/addition/linux.yaml
+```
+
+The engine as a command is the `phasor` applet: a script on standard input,
+`-e` for an expression, `-i` for a REPL over one realm, and `--grant` for the
+clock and entropy bindings, which are the only authority a program can have.
+
+```sh
+fluxor install packaging/cli/workload.toml --link ~/.cargo/bin
+printf '40 + 2' | phasor
 ```
 
 The repository contains no Cargo packages. Language assertions and conformance

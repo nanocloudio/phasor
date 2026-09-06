@@ -111,6 +111,8 @@ pub struct Attachments<'a, 'u> {
     pub module_names: &'a [([u8; 128], usize, u32)],
     pub module_cycles: &'a [(u32, u32)],
     pub compiler: Option<InPlaceCompiler<'a, 'u>>,
+    /// Where a host-installed `print` writes, and how much of it is filled.
+    pub print: Option<(&'a mut [u8], &'a mut usize)>,
 }
 
 impl<'a, 'u> Attachments<'a, 'u> {
@@ -121,6 +123,7 @@ impl<'a, 'u> Attachments<'a, 'u> {
         module_names: &[],
         module_cycles: &[],
         compiler: None,
+        print: None,
     };
 }
 
@@ -279,6 +282,9 @@ fn run<'a, 'u, R>(
     }
     if let Some(compiler) = attach.compiler {
         machine.attach_compiler(compiler.state, compiler.compile, compiler.units);
+    }
+    if let Some((sink, length)) = attach.print {
+        machine.attach_print(sink, length);
     }
     if let Some(saves) = saves {
         machine.restore_all(saves);

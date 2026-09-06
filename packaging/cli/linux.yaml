@@ -1,0 +1,42 @@
+# The phasor shell as a cli-applet: `fluxor exec phasor -- …`, or `phasor …`
+# through the busybox link. One module over the cli stack, with the two
+# standard adapters wired to ports of their own. Wiring an adapter grants
+# nothing: a binding exists only when `--grant` admits it, and a program with
+# no grant has no clock and no randomness.
+target: linux
+tick_us: 1000
+
+# Each adapter answers the shell on the port it asked from: a cycle by
+# construction, and an intended one.
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+
+modules:
+  - name: phasor_shell
+  - name: phasor_time
+    params:
+      source: unix_ms
+  - name: phasor_entropy
+    params:
+      width: bits53
+
+wiring:
+  - from: cli_in.args_out
+    to: phasor_shell.args
+  - from: cli_in.stdin_out
+    to: phasor_shell.stdin
+  - from: phasor_shell.stdout
+    to: cli_out.bytes_in
+  - from: phasor_shell.exit
+    to: cli_out.exit_in
+  - from: phasor_shell.clock_call
+    to: phasor_time.request_in
+  - from: phasor_time.reply_out
+    to: phasor_shell.clock_reply
+  - from: phasor_shell.entropy_call
+    to: phasor_entropy.request_in
+  - from: phasor_entropy.reply_out
+    to: phasor_shell.entropy_reply
