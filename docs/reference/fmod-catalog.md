@@ -14,10 +14,12 @@ binary records with explicit lengths and checked offsets.
 | `phasor_isolate` | EventHandler | `image_in`, `completion_in`, `control_in` | `result_out`, `call_out`, `diagnostic`, `exit` | Realm, machine, objects, heap, collection, jobs, promises, pending calls, module evaluation |
 | `phasor_host_router` | Protocol | `call_in`, `reply_in` | `completion_out`, `request_out` | Binding admission, routing, correlation, bounded in-flight table |
 | `phasor_cli` | Cli | `result_in`, `diagnostic_in`, `runtime_in` | `stdout`, `stderr`, `exit` | Human framing: the only place that turns a diagnostic's numbers into words |
-| `phasor_time` | Adapter | `request_in` | `reply_out` | A time observation from the `source` its parameter names — monotonic milliseconds or microseconds, or Unix milliseconds — under the `quota` it sets |
+| `phasor_time` | Adapter | `request_in` | `reply_out` | A time observation from the `source` its parameter names — monotonic milliseconds or microseconds, or Unix milliseconds — under the `quota` it sets. Also serves waiting: a `sleep` call is held until its delay has passed, which is what a timer is built on |
 | `phasor_entropy` | Adapter | `request_in` | `reply_out` | A random number from the platform's own source, 32 or 53 bits wide as the `width` parameter says, under a `quota` |
+| `phasor_store` | Adapter | `request_in` | `reply_out` | A bounded object store: keys and values a program put there and nothing else. Answers with bytes behind the frame, and with handles for `open`. Bounded by `capacity` bytes and a call `quota` |
+| `phasor_fs` | Adapter | `request_in` | `reply_out` | Files under the directory the graph runs in, and nothing above it: an absolute name or one that climbs is refused before anything is opened. Reading and writing are separate bindings, and `writable` gates writing in the adapter itself. Declares the Fluxor `fs` contract in its manifest |
 | `phasor_eval` | Transformer | `source_in` | `result_out`, `exit` | The bounded expression evaluator, kept as the smallest end-to-end path |
-| `phasor_shell` | Cli | `args`, `stdin`, `clock_reply`, `entropy_reply` | `stdout`, `exit`, `clock_call`, `entropy_call` | The shell: a script, `-e`, or a REPL over one realm, each input a bounded task; `--grant clock` and `--grant entropy` admit the two bindings its graph wires directly to the adapters; `--steps` sets the fuel. Installed as the `phasor` applet from `packaging/cli/` |
+| `phasor_shell` | Cli | `args`, `stdin`, `clock_reply`, `entropy_reply`, `store_reply` | `stdout`, `exit`, `clock_call`, `entropy_call`, `store_call` | The shell: a script, `-e`, or a REPL over one realm, each input a bounded task; `--grant clock`, `--grant entropy`, and `--grant store` admit the interfaces its graph wires to the adapters, each as a namespace of members; `--steps` sets the fuel. Installed as the `phasor` applet from `packaging/cli/` |
 
 A source stream ending in a hang-up is one source; an image stream ending in a
 hang-up is one image. Nothing carries a length prefix it could lie about, and
@@ -51,8 +53,8 @@ exact text. A fixture never ships in a production bundle.
 | Module record | provider -> `phasor_link` | a specifier and an image, each with its length in front |
 | Linked closure | `phasor_link` -> `phasor_isolate` | magic, format digest, feature digest, a digest of the payload, and every module's specifier and image in evaluation order |
 | `Diagnostic` | any phase -> `phasor_cli` | code, severity, span, and up to four arguments — 32 bytes, and never text |
-| `CallRecord` | `phasor_isolate` -> `phasor_host_router` -> adapter | request id, binding index, trace context, payload digest — 56 bytes |
-| `CompletionRecord` | adapter -> `phasor_host_router` -> `phasor_isolate` | request id, disposition, typed cause, trace context, optional number — 32 bytes |
+| `CallRecord` | `phasor_isolate` -> `phasor_host_router` -> adapter | request id, binding index, trace context, payload digest and length — 56 bytes, with the payload's own bytes following it |
+| `CompletionRecord` | adapter -> `phasor_host_router` -> `phasor_isolate` | request id, disposition, typed cause, trace context, and the answer: nothing, a number, bytes, or a resource handle — 32 bytes, with any bytes following it |
 | Result | `phasor_isolate` -> caller | the result's text, or `rejected: <cause>` |
 
 A call record carries no address, no credential, no pointer, and no display
@@ -72,6 +74,8 @@ Every fmod's work is bounded per step and its state carries the rest.
 | `phasor_host_router` | calls in flight, frames staged per output |
 | `phasor_fault_host`, `phasor_time`, `phasor_entropy` | replies staged, and the quota an adapter was given |
 | `phasor_cli` | bytes of result and of rendered text |
+| `phasor_store` | entries, bytes per key and per value, bytes in the whole store, calls answered |
+| `phasor_fs` | files open at once, bytes per read, name length, calls answered |
 | `phasor_shell` | `--steps` a program may run, clamped to the ceiling; instructions per slice, jobs per slice, collection slice, calls in flight, units a session may make, and what `print` may write between steps, all compiled in |
 
 No step loops until a variable-sized input is exhausted. The isolate rebuilds

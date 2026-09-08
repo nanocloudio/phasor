@@ -41,10 +41,42 @@ has not parsed to its end. Every input is a bounded task: a runaway loop
 ends as `phasor: fuel-exhausted` with a non-zero status, and `--steps <n>`
 sets the budget up to the compiled-in ceiling.
 
-Nothing is ambient. The realm has no clock and no randomness until
-`--grant clock` or `--grant entropy` admits the binding, answered by the
-adapter the applet's graph wires to it; the shell prints what it granted.
-The graph is `packaging/cli/linux.yaml`.
+Nothing is ambient. The realm has no clock, no randomness, and no storage
+until a grant admits one, and each interface arrives as a namespace of the
+members that were granted:
+
+```sh
+phasor --grant clock -e 'clock.now()'
+phasor --grant entropy -e 'entropy.random().then(n => n)'
+phasor --grant store -e 'store.write("k", "bytes").then(() => store.read("k"))'
+```
+
+`clock.now()` answers at once because a clock is a fact the adapter supplies
+at the task boundary rather than a call. Everything else is a call and answers
+a promise. `store.open(key)` answers a handle the program passes back to
+`store.readAt`; one it invents is refused. The shell prints what it granted,
+and the graph is `packaging/cli/linux.yaml`.
+
+Files come from `--grant fs`, and reach only the directory the graph runs in:
+
+```sh
+phasor --grant fs -e 'fs.read("README.md").then(t => t.length)'
+phasor --grant fs -e 'fs.write("note.txt", "written by a program")'
+```
+
+Granting the clock also brings timers, because being told later is what the
+clock's `sleep` is:
+
+```sh
+phasor --grant clock -e 'new Promise(r => setTimeout(() => r("later"), 50))'
+```
+
+Before any of that, every session already has the standard surface —
+`console`, `TextEncoder`, `TextDecoder`, `btoa`, `atob`, `Event`,
+`EventTarget`, `AbortController`, `queueMicrotask`, `structuredClone`. It is
+JavaScript compiled and run in the realm ahead of your program, not engine
+code, and `--bare` leaves it out. `docs/reference/capability-register.md`
+lists every capability and how each is named.
 
 The terminal is the program's: what the runtime says while the shell runs is
 filed per run and read back with `fluxor applet logs phasor`, and

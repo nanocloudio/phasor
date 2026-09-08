@@ -106,6 +106,8 @@ pub mod code {
     pub const LOWERING_NOT_ADMITTED: u16 = 0x0416;
     pub const IMAGE_NOT_ADMITTED: u16 = 0x0417;
     pub const FEATURE_LIST_MISMATCH: u16 = 0x0418;
+    /// The image states it requires a binding the deployment did not grant.
+    pub const BINDING_NOT_GRANTED: u16 = 0x0419;
 }
 
 /// Enumerated `image feature` argument values of the retired
@@ -228,6 +230,7 @@ pub fn name_of(value: u16) -> Option<&'static [u8]> {
         code::LOWERING_NOT_ADMITTED => b"lowering-not-admitted",
         code::IMAGE_NOT_ADMITTED => b"image-not-admitted",
         code::FEATURE_LIST_MISMATCH => b"feature-list-mismatch",
+        code::BINDING_NOT_GRANTED => b"binding-not-granted",
         termination::FUEL_EXHAUSTED => b"fuel-exhausted",
         termination::QUOTA_EXCEEDED => b"quota-exceeded",
         termination::CANCELLED => b"cancelled",

@@ -9,10 +9,46 @@
 //! A call is asynchronous by construction. The engine never waits: it records a
 //! pending call, hands the program a promise, and settles that promise when the
 //! completion arrives. That is what keeps a synchronous language operation from
-//! blocking a module step.
+//! blocking a module step. The one exception is a snapshot binding, whose
+//! value a host supplies before the task runs, so a program reads it with no
+//! call at all — which is what lets a clock be a capability and still answer
+//! synchronously.
+//!
+//! What crosses the boundary with a call is a payload: bytes, with their
+//! digest in the record, staged behind the fixed frame and invisible until the
+//! digest checks. A provider that answers with a resource rather than a value
+//! answers with a handle: an index and a generation, meaningful only to the
+//! binding that issued it, and stale for good once released.
 
 use crate::digest::Digest;
 use crate::value::Value;
+
+/// How a binding is served, which decides what a call to it does.
+///
+/// The classes are the ones a capability can honestly offer. A provider that
+/// answers over a channel is asynchronous and says so; presenting it as
+/// synchronous would mean blocking a module step, which no binding may do. A
+/// snapshot is the other way round: the fact is supplied before the task runs,
+/// so reading it is local and needs no call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Class {
+    /// The call returns a promise and completes through a later job.
+    Async = 0,
+    /// The host supplies the value before the task runs; a read is local and
+    /// answers at once.
+    Snapshot = 1,
+}
+
+impl Class {
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Async),
+            1 => Some(Self::Snapshot),
+            _ => None,
+        }
+    }
+}
 
 /// One admitted binding.
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +62,10 @@ pub struct Binding {
     pub in_flight_max: u32,
     /// Calls outstanding now.
     pub in_flight: u32,
+    /// How the binding is served.
+    pub class: Class,
+    /// A snapshot binding's value, supplied before the task runs.
+    pub snapshot: f64,
 }
 
 impl Binding {
@@ -34,6 +74,8 @@ impl Binding {
         schema: Digest([0; 32]),
         in_flight_max: 0,
         in_flight: 0,
+        class: Class::Async,
+        snapshot: 0.0,
     };
 }
 
@@ -50,6 +92,11 @@ pub enum CallError {
     UnknownRequest,
     /// The completion's payload does not match the binding's schema.
     SchemaMismatch,
+    /// The handle names no live resource of this binding, or its generation
+    /// is stale.
+    StaleHandle,
+    /// The handle table is full.
+    HandlesFull,
 }
 
 /// One call waiting for its completion.
@@ -159,6 +206,54 @@ impl Cause {
     }
 }
 
+/// One resource a provider opened, as the program sees it.
+///
+/// A handle is an index and a generation, and nothing else: no descriptor, no
+/// path, no address. The generation advances when the slot is released and
+/// never wraps, so a handle kept past its resource's life names nothing rather
+/// than naming whatever took the slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Handle {
+    pub index: u32,
+    pub generation: u32,
+}
+
+impl Handle {
+    /// The handle as one number, which is how it crosses the boundary and how
+    /// a program holds it. Both halves fit exactly, so nothing is lost.
+    pub const fn pack(self) -> u64 {
+        ((self.index as u64) << 32) | self.generation as u64
+    }
+
+    pub const fn unpack(packed: u64) -> Self {
+        Self {
+            index: (packed >> 32) as u32,
+            generation: packed as u32,
+        }
+    }
+}
+
+/// One slot of the handle table: which binding issued it, what the provider
+/// calls it, and whether it is live.
+#[derive(Clone, Copy, Debug)]
+pub struct Resource {
+    /// The binding that issued the handle. A handle is meaningful only to it.
+    pub binding: u32,
+    /// The provider's own identifier for the resource, opaque here.
+    pub token: u64,
+    pub generation: u32,
+    pub live: bool,
+}
+
+impl Resource {
+    pub const EMPTY: Self = Self {
+        binding: 0,
+        token: 0,
+        generation: 0,
+        live: false,
+    };
+}
+
 /// The admitted bindings and the calls outstanding on them.
 ///
 /// Both tables are caller-provided: a deployment admits a fixed number of
@@ -176,6 +271,9 @@ pub struct Bindings<'a> {
     pending: &'a mut [Pending],
     /// The next correlation identifier, which never repeats within a run.
     next_request: u64,
+    /// Resources providers opened, addressed by handle. Empty where a host
+    /// attached none, which is a host whose bindings return values only.
+    resources: Option<&'a mut [Resource]>,
 }
 
 impl<'a> Bindings<'a> {
@@ -201,7 +299,97 @@ impl<'a> Bindings<'a> {
             admitted: 0,
             pending,
             next_request: 1,
+            resources: None,
         }
+    }
+
+    /// Attach the table a provider's handles live in. A host that admits a
+    /// binding answering with resources attaches one; a host whose bindings
+    /// answer with values needs none.
+    pub fn attach_resources(&mut self, resources: &'a mut [Resource]) {
+        for slot in resources.iter_mut() {
+            *slot = Resource::EMPTY;
+        }
+        self.resources = Some(resources);
+    }
+
+    /// Take up a resource table a previous step left, with its handles intact:
+    /// a file open across a pause stays open.
+    pub fn adopt_resources(&mut self, resources: &'a mut [Resource]) {
+        self.resources = Some(resources);
+    }
+
+    /// Record a resource a provider opened on `binding`, answering the handle
+    /// the program holds it by.
+    pub fn open(&mut self, binding: u32, token: u64) -> Result<Handle, CallError> {
+        let Some(resources) = self.resources.as_deref_mut() else {
+            return Err(CallError::HandlesFull);
+        };
+        let mut scan = 0usize;
+        while scan < resources.len() {
+            let slot = &mut resources[scan];
+            if !slot.live {
+                slot.binding = binding;
+                slot.token = token;
+                slot.live = true;
+                return Ok(Handle {
+                    index: u32::try_from(scan).map_err(|_| CallError::HandlesFull)?,
+                    generation: slot.generation,
+                });
+            }
+            scan += 1;
+        }
+        Err(CallError::HandlesFull)
+    }
+
+    /// The provider's own identifier for a live handle issued on `binding`.
+    ///
+    /// A handle from another binding is as stale as a released one: a resource
+    /// is reachable only through the capability that opened it.
+    pub fn resolve(&self, binding: u32, handle: Handle) -> Result<u64, CallError> {
+        let resources = self.resources.as_deref().ok_or(CallError::StaleHandle)?;
+        let slot = resources
+            .get(handle.index as usize)
+            .ok_or(CallError::StaleHandle)?;
+        if !slot.live || slot.generation != handle.generation || slot.binding != binding {
+            return Err(CallError::StaleHandle);
+        }
+        Ok(slot.token)
+    }
+
+    /// Release a handle. The slot's generation advances, so the handle names
+    /// nothing ever again.
+    pub fn release(&mut self, binding: u32, handle: Handle) -> Result<u64, CallError> {
+        let token = self.resolve(binding, handle)?;
+        let resources = self
+            .resources
+            .as_deref_mut()
+            .ok_or(CallError::StaleHandle)?;
+        if let Some(slot) = resources.get_mut(handle.index as usize) {
+            slot.live = false;
+            slot.generation = slot.generation.wrapping_add(1);
+        }
+        Ok(token)
+    }
+
+    /// Handles live on a binding, which a host closes when a task ends.
+    pub fn open_handles(&self, out: &mut [Handle]) -> usize {
+        let Some(resources) = self.resources.as_deref() else {
+            return 0;
+        };
+        let mut written = 0usize;
+        for (index, slot) in resources.iter().enumerate() {
+            if slot.live {
+                if let Some(entry) = out.get_mut(written) {
+                    *entry = Handle {
+                        index: u32::try_from(index).unwrap_or(0),
+                        generation: slot.generation,
+                    };
+                    written += 1;
+                }
+            }
+        }
+        written
     }
 
     /// Take up storage a table was already using, with its saved state. The
@@ -217,6 +405,7 @@ impl<'a> Bindings<'a> {
             admitted: save.admitted,
             pending,
             next_request: save.next_request,
+            resources: None,
         }
     }
 
@@ -241,6 +430,36 @@ impl<'a> Bindings<'a> {
             return None;
         }
         self.bindings.get(index as usize)
+    }
+
+    /// The index of an admitted binding, by the digest of its name. This is
+    /// how an image's stated requirement meets what a deployment granted:
+    /// the name is the only thing both ends agree on.
+    pub fn index_of(&self, name: &Digest) -> Option<u32> {
+        let mut index = 0usize;
+        while index < self.admitted {
+            if self.bindings.get(index).is_some_and(|b| &b.name == name) {
+                return u32::try_from(index).ok();
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Supply a snapshot binding's value for the task about to run.
+    pub fn set_snapshot(&mut self, index: u32, value: f64) -> Result<(), CallError> {
+        if index as usize >= self.admitted {
+            return Err(CallError::NotAdmitted);
+        }
+        let slot = self
+            .bindings
+            .get_mut(index as usize)
+            .ok_or(CallError::NotAdmitted)?;
+        if slot.class != Class::Snapshot {
+            return Err(CallError::SchemaMismatch);
+        }
+        slot.snapshot = value;
+        Ok(())
     }
 
     /// Calls outstanding across every binding.
@@ -340,6 +559,17 @@ impl<'a> Bindings<'a> {
         written
     }
 
+    /// The binding an outstanding call was made on, which is what a
+    /// resource it opens is recorded against.
+    pub fn binding_of(&self, request: u64) -> Option<u32> {
+        for slot in self.pending.iter() {
+            if slot.live && slot.request == request {
+                return Some(slot.binding);
+            }
+        }
+        None
+    }
+
     /// The trace an outstanding call belongs to.
     pub fn trace_of(&self, request: u64) -> Option<u64> {
         for slot in self.pending.iter() {
@@ -369,12 +599,17 @@ impl<'a> Bindings<'a> {
 /// The record a call produces, which something else carries to a provider.
 ///
 /// It holds no address, no credential, and no pointer: a binding index, a
-/// correlation identifier, a trace context, and the digest of the payload the
-/// caller staged.
+/// correlation identifier, a trace context, and the digest and length of the
+/// payload the caller staged. The payload's bytes follow the frame on the same
+/// port; the digest is what makes them the caller's bytes rather than whatever
+/// arrived.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallRecord {
     pub request: u64,
     pub binding: u32,
+    /// Bytes of payload following this frame. Zero for a call that carries
+    /// nothing but its arguments' digest.
+    pub payload_length: u32,
     /// The trace this call belongs to, which a completion carries back so a
     /// deployment can correlate the two without inspecting either payload.
     pub trace: u64,
@@ -393,6 +628,7 @@ impl CallRecord {
         let mut frame = [0u8; CALL_FRAME];
         frame[0..8].copy_from_slice(&self.request.to_le_bytes());
         frame[8..12].copy_from_slice(&self.binding.to_le_bytes());
+        frame[12..16].copy_from_slice(&self.payload_length.to_le_bytes());
         frame[16..24].copy_from_slice(&self.trace.to_le_bytes());
         frame[24..56].copy_from_slice(&self.payload.0);
         frame
@@ -406,9 +642,38 @@ impl CallRecord {
         Some(Self {
             request: u64::from_le_bytes(<[u8; 8]>::try_from(frame.get(0..8)?).ok()?),
             binding: u32::from_le_bytes(<[u8; 4]>::try_from(frame.get(8..12)?).ok()?),
+            payload_length: u32::from_le_bytes(<[u8; 4]>::try_from(frame.get(12..16)?).ok()?),
             trace: u64::from_le_bytes(<[u8; 8]>::try_from(frame.get(16..24)?).ok()?),
             payload: Digest(payload),
         })
+    }
+}
+
+/// What a provider answered with: nothing, a number, bytes, or a resource.
+///
+/// Bytes travel behind the frame the way a call's payload does. A resource is
+/// a handle the binding issued, which the program can pass back and nothing
+/// else can forge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Answer {
+    /// The call succeeded and produced no value.
+    None,
+    /// A number, which is the whole answer.
+    Number(f64),
+    /// Bytes, of the given length, following the frame.
+    Payload(u32),
+    /// A resource the provider opened, as the packed handle.
+    Resource(u64),
+}
+
+impl Answer {
+    /// Bytes of payload following the frame, which is none for every answer
+    /// that is not one.
+    pub const fn payload_length(self) -> u32 {
+        match self {
+            Self::Payload(length) => length,
+            _ => 0,
+        }
     }
 }
 
@@ -420,10 +685,8 @@ pub struct CompletionRecord {
     pub cause: Cause,
     /// The trace the call carried, returned unchanged.
     pub trace: u64,
-    /// The value the provider produced, when it produced a number. A binding
-    /// whose payloads are richer than that carries them by digest and a
-    /// transfer, which this build does not implement.
-    pub value: Option<f64>,
+    /// What the provider produced.
+    pub answer: Answer,
 }
 
 impl CompletionRecord {
@@ -432,9 +695,11 @@ impl CompletionRecord {
         frame[0..8].copy_from_slice(&self.request.to_le_bytes());
         frame[8] = self.disposition as u8;
         frame[9] = self.cause as u8;
-        let (kind, bits) = match self.value {
-            Some(value) => (1u32, value.to_bits()),
-            None => (0, 0),
+        let (kind, bits) = match self.answer {
+            Answer::None => (0u32, 0u64),
+            Answer::Number(value) => (1, value.to_bits()),
+            Answer::Payload(length) => (2, u64::from(length)),
+            Answer::Resource(handle) => (3, handle),
         };
         frame[12..16].copy_from_slice(&kind.to_le_bytes());
         frame[16..24].copy_from_slice(&bits.to_le_bytes());
@@ -451,10 +716,11 @@ impl CompletionRecord {
             disposition: Disposition::from_byte(frame[8])?,
             cause: Cause::from_byte(frame[9])?,
             trace: u64::from_le_bytes(<[u8; 8]>::try_from(frame.get(24..32)?).ok()?),
-            value: if kind == 1 {
-                Some(f64::from_bits(bits))
-            } else {
-                None
+            answer: match kind {
+                1 => Answer::Number(f64::from_bits(bits)),
+                2 => Answer::Payload(u32::try_from(bits).ok()?),
+                3 => Answer::Resource(bits),
+                _ => Answer::None,
             },
         })
     }

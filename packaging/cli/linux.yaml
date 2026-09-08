@@ -22,6 +22,13 @@ modules:
   - name: phasor_entropy
     params:
       width: bits53
+  - name: phasor_store
+  # The filesystem the shell can reach is the directory the graph runs in,
+  # and nothing above it. Reading is granted; writing is not, until a
+  # deployment says so.
+  - name: phasor_fs
+    params:
+      writable: yes
 
 wiring:
   - from: cli_in.args_out
@@ -40,3 +47,11 @@ wiring:
     to: phasor_entropy.request_in
   - from: phasor_entropy.reply_out
     to: phasor_shell.entropy_reply
+  - from: phasor_shell.store_call
+    to: phasor_store.request_in
+  - from: phasor_store.reply_out
+    to: phasor_shell.store_reply
+  - from: phasor_shell.fs_call
+    to: phasor_fs.request_in
+  - from: phasor_fs.reply_out
+    to: phasor_shell.fs_reply

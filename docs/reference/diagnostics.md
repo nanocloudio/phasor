@@ -200,6 +200,7 @@ the first argument is the function index unless the table says otherwise.
 | `0x0416` | `lowering-not-admitted` | error | none |
 | `0x0417` | `image-not-admitted` | error | image feature |
 | `0x0418` | `feature-list-mismatch` | error | image failure |
+| `0x0419` | `binding-not-granted` | error | none |
 
 `verifier-storage-too-small` is fatal because verification did not finish, and a
 partial result would say nothing about the rest of the image.

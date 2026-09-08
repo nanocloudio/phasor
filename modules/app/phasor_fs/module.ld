@@ -5,14 +5,8 @@ ENTRY(module_init)
 
 MEMORY
 {
-    /* Raised cap for this applet: it carries the whole front end and the
-     * machine in one module, so the SDK's small-module guideline cap is not
-     * a fit. Not a real flash budget on any target — bcm2712 mmaps modules
-     * from RAM. */
-    /* The loader admits a megabyte of code per module, so this is the real
-     * ceiling rather than a flash budget: the shell carries the whole front
-     * end, the machine, and the standard surface's source, and what it can
-     * carry beyond them is what fits under it. */
+    /* Raised cap: the adapter holds a path buffer and open descriptors, which are
+     * data rather than code. Not a real flash budget on any target. */
     FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 1024K
 }
 

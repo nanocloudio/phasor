@@ -42,7 +42,7 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use binding::{CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
+use binding::{Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
 
 /// How wide a seed one call answers with.
 const WIDTH_32: u8 = 0;
@@ -99,7 +99,7 @@ fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> Comple
             disposition: Disposition::Rejected,
             cause: Cause::Denied,
             trace: record.trace,
-            value: None,
+            answer: Answer::None,
         };
     }
     let mut bytes = [0u8; 8];
@@ -119,7 +119,7 @@ fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> Comple
             disposition: Disposition::Rejected,
             cause: Cause::Unavailable,
             trace: record.trace,
-            value: None,
+            answer: Answer::None,
         };
     }
     let seed = u64::from_le_bytes(bytes);
@@ -128,7 +128,7 @@ fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> Comple
         disposition: Disposition::Fulfilled,
         cause: Cause::None,
         trace: record.trace,
-        value: Some(softfloat::from_u64(seed)),
+        answer: Answer::Number(softfloat::from_u64(seed)),
     }
 }
 

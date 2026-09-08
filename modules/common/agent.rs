@@ -56,6 +56,12 @@ pub struct Storage<'a> {
     pub descriptors: &'a mut [Binding],
     pub pending: &'a mut [Pending],
     pub outbox: &'a mut [CallRecord],
+    /// Where a call's payload bytes are staged. A host whose bindings answer
+    /// with numbers alone attaches none.
+    pub payloads: Option<&'a mut [u8]>,
+    /// Where the resources a provider opened are held, addressed by handle.
+    /// A host whose bindings open none attaches none.
+    pub resources: Option<&'a mut [crate::binding::Resource]>,
 }
 
 /// Build the borrowed `Storage` from any struct holding the machine's buffers
@@ -79,6 +85,8 @@ macro_rules! agent_storage {
             descriptors: &mut $s.descriptors,
             pending: &mut $s.pending,
             outbox: &mut $s.outbox,
+            payloads: None,
+            resources: None,
         }
     };
 }
@@ -145,7 +153,7 @@ pub struct Metering<'p> {
 /// The realm and the saves come back so a later `adopt` can continue.
 pub fn fresh<'u, R>(
     units: &[Unit<'u>],
-    storage: Storage<'_>,
+    mut storage: Storage<'_>,
     attach: Attachments<'_, 'u>,
     metering: Metering<'_>,
     step: impl FnOnce(&mut Vm<'_, 'u, '_, '_>) -> R,
@@ -158,6 +166,9 @@ pub fn fresh<'u, R>(
     let realm = realm::create(&mut heap, &mut atoms).map_err(AgentError::Realm)?;
     let mut queue = Queue::new(storage.jobs);
     let mut bindings = Bindings::new(storage.descriptors, storage.pending);
+    if let Some(resources) = storage.resources.take() {
+        bindings.attach_resources(resources);
+    }
     for binding in attach.admitted {
         if bindings.admit(*binding).is_err() {
             return Err(AgentError::Binding);
@@ -176,6 +187,7 @@ pub fn fresh<'u, R>(
         storage.undo,
         storage.subject,
         storage.outbox,
+        storage.payloads,
         realm,
         attach,
         metering,
@@ -190,7 +202,7 @@ pub fn fresh<'u, R>(
 /// one made before, and every seam attaches again; then run `step` and save.
 pub fn adopt<'u, R>(
     units: &[Unit<'u>],
-    storage: Storage<'_>,
+    mut storage: Storage<'_>,
     attach: Attachments<'_, 'u>,
     metering: Metering<'_>,
     realm: Realm,
@@ -204,6 +216,9 @@ pub fn adopt<'u, R>(
     let mut atoms = Atoms::adopt(storage.entries, storage.handles, &saves.atoms);
     let mut queue = Queue::new(storage.jobs);
     let mut bindings = Bindings::adopt(storage.descriptors, storage.pending, &saves.bindings);
+    if let Some(resources) = storage.resources.take() {
+        bindings.adopt_resources(resources);
+    }
     Ok(run(
         units,
         &mut heap,
@@ -217,6 +232,7 @@ pub fn adopt<'u, R>(
         storage.undo,
         storage.subject,
         storage.outbox,
+        storage.payloads,
         realm,
         attach,
         metering,
@@ -245,6 +261,7 @@ fn run<'a, 'u, R>(
     undo: &'a mut [(u8, u32)],
     subject: &'a mut [u16],
     outbox: &'a mut [CallRecord],
+    payloads: Option<&'a mut [u8]>,
     realm: Realm,
     attach: Attachments<'a, 'u>,
     metering: Metering<'_>,
@@ -265,6 +282,9 @@ fn run<'a, 'u, R>(
     machine.attach_regexp(choices, undo, subject);
     machine.attach_jobs(queue);
     machine.attach_bindings(bindings, outbox);
+    if let Some(payloads) = payloads {
+        machine.attach_payloads(payloads);
+    }
     machine.attach_collector(
         roots,
         metering.policy.collection_slice,

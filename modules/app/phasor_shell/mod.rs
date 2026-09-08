@@ -57,6 +57,8 @@ mod emit;
 mod env;
 #[path = "../../common/evalsite.rs"]
 mod evalsite;
+#[path = "../../common/facade.rs"]
+mod facade;
 #[path = "../../common/feature.rs"]
 mod feature;
 #[path = "../../common/gc.rs"]
@@ -108,7 +110,7 @@ mod wire;
 
 use arena::Node;
 use binding::{
-    Binding, CallRecord, Cause, CompletionRecord, Disposition, Pending, CALL_FRAME,
+    Answer, Binding, CallRecord, Cause, CompletionRecord, Disposition, Pending, CALL_FRAME,
     COMPLETION_FRAME,
 };
 use bytecode::{Constant, ExceptionRegion, ExportRecord, Function, ImportRecord, Unit};
@@ -208,13 +210,102 @@ const TRACE: u64 = 0x5041_5348_4f52_0002;
 
 // ------------------------------------------------------------- the grants
 
-/// The bindings a person may grant: each is a port pair on this module and
-/// an adapter the graph wires to it.
-const MAX_GRANTS: usize = 2;
+/// The interfaces a person may grant. Each is a port pair on this module and
+/// an adapter the graph wires to it, and each carries members: the bindings
+/// the deployment admits, one per operation the interface offers.
+const MAX_GRANTS: usize = 4;
+/// Bindings across every granted interface.
+const MAX_BINDINGS: usize = 16;
+/// Members one interface may carry.
+const MAX_MEMBERS: usize = 8;
 const GRANT_CLOCK: u8 = 1;
 const GRANT_ENTROPY: u8 = 2;
+const GRANT_STORE: u8 = 3;
+const GRANT_FS: u8 = 4;
 const PENDING_COUNT: usize = 16;
 const IN_FLIGHT_MAX: u32 = 8;
+/// Resources a program may hold open at once.
+const RESOURCE_COUNT: usize = 16;
+/// Bytes of payload staged behind the call records of one step.
+const CALL_PAYLOAD_BYTES: usize = 32 * 1024;
+/// Bytes of payload one answer may carry.
+const REPLY_PAYLOAD_BYTES: usize = 8 * 1024;
+
+/// One member of an interface: the name a program calls it by, how it is
+/// served, and the method number the adapter knows it as.
+///
+/// The name is held inline rather than borrowed: a module image takes no
+/// relocations, so a table of static references would not survive loading.
+#[derive(Clone, Copy)]
+struct Member {
+    name: [u8; 8],
+    name_length: usize,
+    class: binding::Class,
+    method: u32,
+}
+
+impl Member {
+    const EMPTY: Self = Self {
+        name: [0; 8],
+        name_length: 0,
+        class: binding::Class::Async,
+        method: 0,
+    };
+
+    const fn new(name: [u8; 8], name_length: usize, class: binding::Class, method: u32) -> Self {
+        Self {
+            name,
+            name_length,
+            class,
+            method,
+        }
+    }
+
+    fn name(&self) -> &[u8] {
+        self.name.get(..self.name_length).unwrap_or(&[])
+    }
+}
+
+/// The members of each interface, which are the bindings a grant admits.
+///
+/// A clock is a fact supplied at a task boundary, so its member is a snapshot
+/// and a program reads it with no call. Everything else is a call.
+fn members(kind: u8) -> ([Member; MAX_MEMBERS], usize) {
+    let mut out = [Member::EMPTY; MAX_MEMBERS];
+    let count = match kind {
+        GRANT_CLOCK => {
+            out[0] = Member::new(*b"now\0\0\0\0\0", 3, binding::Class::Snapshot, 0);
+            // Waiting is a call: the adapter holds it until the delay has
+            // passed, and the promise it answers is what a timer is built on.
+            out[1] = Member::new(*b"sleep\0\0\0", 5, binding::Class::Async, 1);
+            2
+        }
+        GRANT_ENTROPY => {
+            out[0] = Member::new(*b"random\0\0", 6, binding::Class::Async, 0);
+            1
+        }
+        GRANT_FS => {
+            out[0] = Member::new(*b"read\0\0\0\0", 4, binding::Class::Async, 0);
+            out[1] = Member::new(*b"write\0\0\0", 5, binding::Class::Async, 1);
+            out[2] = Member::new(*b"open\0\0\0\0", 4, binding::Class::Async, 4);
+            out[3] = Member::new(*b"readAt\0\0", 6, binding::Class::Async, 5);
+            out[4] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 6);
+            out[5] = Member::new(*b"size\0\0\0\0", 4, binding::Class::Async, 7);
+            6
+        }
+        GRANT_STORE => {
+            out[0] = Member::new(*b"read\0\0\0\0", 4, binding::Class::Async, 0);
+            out[1] = Member::new(*b"write\0\0\0", 5, binding::Class::Async, 1);
+            out[2] = Member::new(*b"list\0\0\0\0", 4, binding::Class::Async, 2);
+            out[3] = Member::new(*b"delete\0\0", 6, binding::Class::Async, 3);
+            out[4] = Member::new(*b"open\0\0\0\0", 4, binding::Class::Async, 4);
+            out[5] = Member::new(*b"readAt\0\0", 6, binding::Class::Async, 5);
+            6
+        }
+        _ => 0,
+    };
+    (out, count)
+}
 
 /// How the shell was asked to run.
 const MODE_SCRIPT: u8 = 0;
@@ -236,9 +327,12 @@ usage:\n\
   phasor help            this text\n\
 \n\
 options:\n\
-  --grant clock          admit clock(): a promise of the time in milliseconds\n\
-  --grant entropy        admit entropy(): a promise of a random number\n\
+  --grant clock          admit clock.now(): the time, read with no call\n\
+  --grant entropy        admit entropy.random(): a promise of a random number\n\
+  --grant store          admit store.read/write/list/delete/open/readAt\n\
+  --grant fs             admit fs.read/write/open/readAt/close/size\n\
   --steps <n>            instructions one input may run, up to the ceiling\n\
+  --bare                 leave out the standard surface: no console, no URL\n\
 \n\
 The value of the last expression is printed; print(x) writes a line.\n\
 Nothing is ambient: a program has only what was granted.\n";
@@ -255,11 +349,17 @@ struct Out {
 /// the other.
 #[repr(C)]
 struct GrantWire {
-    calls: [u8; CALL_FRAME * PENDING_COUNT],
+    calls: [u8; (CALL_FRAME + REPLY_PAYLOAD_BYTES) * 2],
     staged: usize,
     written: usize,
     reply: [u8; COMPLETION_FRAME],
     filled: usize,
+    /// The bytes the answer carries, and how many have arrived.
+    reply_payload: [u8; REPLY_PAYLOAD_BYTES],
+    reply_filled: usize,
+    reply_length: usize,
+    /// Whether the frame is whole and its payload is what remains.
+    frame_ready: bool,
     ready: bool,
 }
 
@@ -271,18 +371,41 @@ struct State {
     stdin_in: i32,
     clock_reply: i32,
     entropy_reply: i32,
+    store_reply: i32,
+    fs_reply: i32,
     exit_out: i32,
     clock_call: i32,
     entropy_call: i32,
+    store_call: i32,
+    fs_call: i32,
 
     mode: u8,
     phase: u8,
     waited: u32,
     steps: u64,
-    /// The grants, in binding-index order, as `GRANT_*` kinds.
+    /// The interfaces granted, as `GRANT_*` kinds.
     grants: [u8; MAX_GRANTS],
     grant_count: usize,
+    /// For each admitted binding, the interface it belongs to and the method
+    /// the adapter knows it as. This shell's own numbering is its own: what
+    /// crosses to an adapter is the method its interface names.
+    binding_kind: [u8; MAX_BINDINGS],
+    binding_method: [u32; MAX_BINDINGS],
+    binding_count: usize,
     wires: [GrantWire; MAX_GRANTS],
+    /// Whether the façade has been compiled and run in this session's realm.
+    /// It runs once, before anything a person typed.
+    facade_done: bool,
+    /// Whether the session runs without the façade at all.
+    bare: bool,
+    /// Whether the task in progress is the façade rather than a person's
+    /// input, so its value is not echoed.
+    running_facade: bool,
+    /// Whether a fresh snapshot has been taken for the task about to run,
+    /// whether one has been asked for, and what the last one said.
+    snapshot_ready: bool,
+    snapshot_asked: bool,
+    snapshot_value: f64,
 
     arec: [u8; ARGV_CAPACITY],
     arec_length: usize,
@@ -354,9 +477,11 @@ struct State {
     choices: [Choice; CHOICE_COUNT],
     undo: [(u8, u32); UNDO_COUNT],
     subject: [u16; SUBJECT_UNITS],
-    descriptors: [Binding; MAX_GRANTS],
+    descriptors: [Binding; MAX_BINDINGS],
     pending_calls: [Pending; PENDING_COUNT],
     outbox: [CallRecord; PENDING_COUNT],
+    resources: [binding::Resource; RESOURCE_COUNT],
+    call_payloads: [u8; CALL_PAYLOAD_BYTES],
     instances: [ModuleInstance; MAX_UNITS],
 
     realm: Realm,
@@ -593,6 +718,7 @@ fn read_argv(state: &mut State) -> Parsed {
         match word {
             b"help" | b"--help" | b"-h" => return Parsed::Help,
             b"-i" | b"repl" => state.mode = MODE_REPL,
+            b"--bare" => state.bare = true,
             b"-e" | b"eval" => {
                 let Some(source) = next else {
                     emit(&mut state.out, b"phasor: -e needs a source\n");
@@ -613,13 +739,12 @@ fn read_argv(state: &mut State) -> Parsed {
                 index += 1;
             }
             b"--grant" => {
-                let kind = match next {
-                    Some(b"clock") => GRANT_CLOCK,
-                    Some(b"entropy") => GRANT_ENTROPY,
-                    _ => {
-                        emit(&mut state.out, b"phasor: --grant takes clock or entropy\n");
-                        return Parsed::Refused;
-                    }
+                let Some(kind) = next.and_then(grant_of) else {
+                    emit(
+                        &mut state.out,
+                        b"phasor: --grant takes clock, entropy, store, or fs\n",
+                    );
+                    return Parsed::Refused;
                 };
                 let held = state.grants.get(..state.grant_count).unwrap_or(&[]);
                 if !held.contains(&kind) {
@@ -672,19 +797,56 @@ fn policy(state: &State) -> Policy {
     .clamped()
 }
 
-fn grant_name(kind: u8) -> &'static [u8] {
+/// The identifier a deployment grants an interface by, which is what the
+/// binding digests are taken over.
+///
+/// It follows the WebAssembly System Interface where an interface for the
+/// thing exists, so an adapter written to it means something outside this
+/// project; where none does, the name is this project's own and says so.
+/// `docs/reference/capability-register.md` is the register.
+fn interface_id(kind: u8) -> ([u8; 32], usize) {
     match kind {
-        GRANT_CLOCK => b"clock",
-        GRANT_ENTROPY => b"entropy",
-        _ => b"",
+        GRANT_CLOCK => (*b"wasi:clocks/wall-clock\0\0\0\0\0\0\0\0\0\0", 22),
+        GRANT_ENTROPY => (*b"wasi:random/random\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 18),
+        GRANT_FS => (*b"wasi:filesystem/types\0\0\0\0\0\0\0\0\0\0\0", 21),
+        GRANT_STORE => (*b"phasor:store/keyvalue\0\0\0\0\0\0\0\0\0\0\0", 21),
+        _ => ([0; 32], 0),
     }
 }
 
-fn grant_schema(kind: u8) -> &'static [u8] {
+/// The name a program calls an interface by, which is the namespace it finds
+/// in the realm. Held inline: a match returning borrowed literals becomes a
+/// switch table of pointers, and a module image takes no relocations for one.
+fn grant_name(kind: u8) -> ([u8; 8], usize) {
     match kind {
-        GRANT_CLOCK => b"()->number:milliseconds",
-        GRANT_ENTROPY => b"()->number:random",
-        _ => b"",
+        GRANT_CLOCK => (*b"clock\0\0\0", 5),
+        GRANT_ENTROPY => (*b"entropy\0", 7),
+        GRANT_STORE => (*b"store\0\0\0", 5),
+        GRANT_FS => (*b"fs\0\0\0\0\0\0", 2),
+        _ => ([0; 8], 0),
+    }
+}
+
+/// The interface a grant names on the command line.
+fn grant_of(word: &[u8]) -> Option<u8> {
+    match word {
+        b"clock" => Some(GRANT_CLOCK),
+        b"entropy" => Some(GRANT_ENTROPY),
+        b"store" => Some(GRANT_STORE),
+        b"fs" => Some(GRANT_FS),
+        _ => None,
+    }
+}
+
+/// The schema an interface's payloads follow, which both ends check by
+/// digest. Held inline for the same reason the name is.
+fn grant_schema(kind: u8) -> ([u8; 32], usize) {
+    match kind {
+        GRANT_CLOCK => (*b"()->number:milliseconds\0\0\0\0\0\0\0\0\0", 23),
+        GRANT_ENTROPY => (*b"()->number:random\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 17),
+        GRANT_STORE => (*b"(key,value?)->bytes|number\0\0\0\0\0\0", 26),
+        GRANT_FS => (*b"(name,bytes?)->bytes|number\0\0\0\0\0", 27),
+        _ => ([0; 32], 0),
     }
 }
 
@@ -694,10 +856,15 @@ fn grant_schema(kind: u8) -> &'static [u8] {
 /// answering its index, or the diagnostic that refused it.
 fn compile_input(state: &mut State) -> Result<u32, Diagnostic> {
     let length = state.source_length;
-    let mut storage = frontend_storage!(state);
     // SAFETY: the source is read once and never written while the front end
     // runs, and the front end's storage is every other field it borrows.
     let source: &[u8] = unsafe { core::slice::from_raw_parts(state.source.as_ptr(), length) };
+    compile_bytes(state, source)
+}
+
+/// Compile a source into a new unit of the session, answering its index.
+fn compile_bytes(state: &mut State, source: &[u8]) -> Result<u32, Diagnostic> {
+    let mut storage = frontend_storage!(state);
     let compiled = frontend::compile(source, Goal::Script, Limits::CEILING, FUEL, &mut storage)?;
     place_unit(state, compiled.length).ok_or(Diagnostic::at(
         code::COMPILE_BUDGET_EXHAUSTED,
@@ -926,6 +1093,8 @@ fn advance(state: &mut State) -> Advance {
     let policy = policy(state);
     let grants = state.grants;
     let grant_count = state.grant_count;
+    let snapshot_value = state.snapshot_value;
+    let running_facade = state.running_facade;
     let starting = state.task_starting;
     let current = state.current_unit;
     let mode = state.mode;
@@ -961,22 +1130,53 @@ fn advance(state: &mut State) -> Advance {
         base: attached,
     };
 
-    let mut admitted = [Binding::EMPTY; MAX_GRANTS];
+    // One binding per member of each granted interface, named by the digest
+    // of `interface.member`, which is what an image states it requires.
+    let mut admitted = [Binding::EMPTY; MAX_BINDINGS];
+    let mut count = 0usize;
     let mut grant = 0usize;
     while grant < grant_count {
         let kind = grants.get(grant).copied().unwrap_or(0);
-        if let Some(slot) = admitted.get_mut(grant) {
+        let (interface_members, member_count) = members(kind);
+        let mut position = 0usize;
+        while position < member_count {
+            let member = interface_members[position];
+            position += 1;
+            let Some(slot) = admitted.get_mut(count) else {
+                break;
+            };
+            let mut name = [0u8; 64];
+            let (schema, schema_length) = grant_schema(kind);
+            let schema_digest = digest::digest(schema.get(..schema_length).unwrap_or(&[]));
+            // The binding's identity is the interface's identifier and the
+            // member's name, which is what both ends agree on.
+            let (id, id_length) = interface_id(kind);
+            let mut at = text::put_ascii(&mut name, id.get(..id_length).unwrap_or(&[]));
+            at += text::put_ascii(name.get_mut(at..).unwrap_or(&mut []), b"#");
+            at += text::put_ascii(name.get_mut(at..).unwrap_or(&mut []), member.name());
             *slot = Binding {
-                name: digest::digest(grant_name(kind)),
-                schema: digest::digest(grant_schema(kind)),
+                name: digest::digest(name.get(..at).unwrap_or(&[])),
+                schema: schema_digest,
                 in_flight_max: IN_FLIGHT_MAX,
                 in_flight: 0,
+                class: member.class,
+                snapshot: snapshot_value,
             };
+            if let (Some(k), Some(m)) = (
+                state.binding_kind.get_mut(count),
+                state.binding_method.get_mut(count),
+            ) {
+                *k = kind;
+                *m = member.method;
+            }
+            count += 1;
         }
         grant += 1;
     }
+    state.binding_count = count;
+    let binding_count = count;
     let attach = agent::Attachments {
-        admitted: admitted.get(..grant_count).unwrap_or(&[]),
+        admitted: admitted.get(..binding_count).unwrap_or(&[]),
         modules: Some(agent::Closure {
             instances: state.instances.get_mut(..attached).unwrap_or(&mut []),
             imports: &[],
@@ -1011,19 +1211,39 @@ fn advance(state: &mut State) -> Advance {
         descriptors: &mut state.descriptors,
         pending: &mut state.pending_calls,
         outbox: &mut state.outbox,
+        payloads: Some(&mut state.call_payloads),
+        resources: Some(&mut state.resources),
     };
     let step = |machine: &mut Vm<'_, '_, '_, '_>| -> Advance {
         if first {
             // The realm's own additions: the grants, by name, and `print`.
+            // Each granted interface is one namespace object holding the
+            // members that were admitted. Nothing about it is privileged: it
+            // is reachable because it was granted, and holds exactly what was.
+            let mut index = 0u32;
             let mut grant = 0usize;
             while grant < grant_count {
-                let name = grant_name(grants.get(grant).copied().unwrap_or(0));
-                if machine
-                    .define_binding(name, u32::try_from(grant).unwrap_or(0))
-                    .is_err()
-                {
+                let kind = grants.get(grant).copied().unwrap_or(0);
+                let (interface, interface_length) = grant_name(kind);
+                let Ok(namespace) =
+                    machine.define_namespace(interface.get(..interface_length).unwrap_or(&[]))
+                else {
                     emit(&mut state.out, b"phasor: heap-exhausted\n");
                     return Advance::Failed;
+                };
+                let (interface_members, member_count) = members(kind);
+                let mut position = 0usize;
+                while position < member_count {
+                    let member = interface_members[position];
+                    position += 1;
+                    if machine
+                        .define_binding_in(namespace, member.name(), index)
+                        .is_err()
+                    {
+                        emit(&mut state.out, b"phasor: heap-exhausted\n");
+                        return Advance::Failed;
+                    }
+                    index += 1;
                 }
                 grant += 1;
             }
@@ -1051,8 +1271,18 @@ fn advance(state: &mut State) -> Advance {
             if wire.ready {
                 wire.ready = false;
                 wire.filled = 0;
-                if let Some(record) = CompletionRecord::decode(&wire.reply) {
-                    let _ = machine.apply_completion(&record);
+                let length = wire.reply_length;
+                let mut payload = [0u8; REPLY_PAYLOAD_BYTES];
+                copy_into(
+                    payload.get_mut(..length).unwrap_or(&mut []),
+                    wire.reply_payload.get(..length).unwrap_or(&[]),
+                );
+                wire.reply_length = 0;
+                wire.reply_filled = 0;
+                let reply = wire.reply;
+                if let Some(record) = CompletionRecord::decode(&reply) {
+                    let _ = machine
+                        .apply_completion_with(&record, payload.get(..length).unwrap_or(&[]));
                     progressed = true;
                 }
             }
@@ -1132,22 +1362,45 @@ fn advance(state: &mut State) -> Advance {
             machine.take_printed();
         }
 
-        // Calls leave on the port of the grant they were made on.
-        if outcome == Advance::Running {
+        // Calls leave on the port of the interface they were made on, each
+        // followed by its payload. What crosses is the method the interface
+        // names, not this shell's own binding numbering.
+        if outcome == Advance::Running && !machine.calls().is_empty() {
+            let mut copied = [0u8; CALL_PAYLOAD_BYTES];
+            let payloads = machine.call_payloads();
+            let taken = payloads.len().min(copied.len());
+            copy_into(
+                copied.get_mut(..taken).unwrap_or(&mut []),
+                payloads.get(..taken).unwrap_or(&[]),
+            );
+            let mut payload_at = 0usize;
             let mut staged_any = false;
             for record in machine.calls() {
-                let grant = record.binding as usize;
-                let Some(wire) = state.wires.get_mut(grant) else {
+                let index = record.binding as usize;
+                let kind = state.binding_kind.get(index).copied().unwrap_or(0);
+                let method = state.binding_method.get(index).copied().unwrap_or(0);
+                let length = record.payload_length as usize;
+                let payload = copied.get(payload_at..payload_at + length).unwrap_or(&[]);
+                payload_at += length;
+                let mut forwarded = *record;
+                forwarded.binding = method;
+                let frame = forwarded.encode();
+                let Some(wire) = wire_of(&mut state.wires, grants, grant_count, kind) else {
                     continue;
                 };
                 let at = wire.staged;
-                let Some(slot) = wire.calls.get_mut(at..at + CALL_FRAME) else {
-                    continue;
-                };
-                if !copy_into(slot, &record.encode()) {
+                if !copy_into(
+                    wire.calls.get_mut(at..at + CALL_FRAME).unwrap_or(&mut []),
+                    &frame,
+                ) || !copy_into(
+                    wire.calls
+                        .get_mut(at + CALL_FRAME..at + CALL_FRAME + length)
+                        .unwrap_or(&mut []),
+                    payload,
+                ) {
                     continue;
                 }
-                wire.staged = at + CALL_FRAME;
+                wire.staged = at + CALL_FRAME + length;
                 staged_any = true;
             }
             if staged_any {
@@ -1168,7 +1421,7 @@ fn advance(state: &mut State) -> Advance {
                         disposition: Disposition::Rejected,
                         cause: Cause::Timeout,
                         trace: TRACE,
-                        value: None,
+                        answer: Answer::None,
                     });
                 }
                 state.call_waited = 0;
@@ -1204,7 +1457,7 @@ fn advance(state: &mut State) -> Advance {
                 Some(Ok(value)) => {
                     // A script's completion is printed when it says something;
                     // the REPL echoes every value, as a REPL does.
-                    if mode == MODE_REPL || !value.is_undefined() {
+                    if !running_facade && (mode == MODE_REPL || !value.is_undefined()) {
                         emit_value(&mut state.out, machine, value);
                     }
                     outcome = Advance::Done;
@@ -1256,15 +1509,19 @@ fn advance(state: &mut State) -> Advance {
 
 /// Compile the gathered source and start it as the next task. Answers
 /// whether a task started; a source that does not compile says why.
+fn begin_task(state: &mut State, unit: u32) {
+    state.current_unit = unit;
+    state.task_starting = true;
+    state.task_running = true;
+    state.body_done = false;
+    state.call_waited = 0;
+    state.result_value = Value::UNDEFINED;
+}
+
 fn start_input(state: &mut State) -> bool {
     match compile_input(state) {
         Ok(unit) => {
-            state.current_unit = unit;
-            state.task_starting = true;
-            state.task_running = true;
-            state.body_done = false;
-            state.call_waited = 0;
-            state.result_value = Value::UNDEFINED;
+            begin_task(state, unit);
             true
         }
         Err(report) => {
@@ -1277,14 +1534,39 @@ fn start_input(state: &mut State) -> bool {
 
 // ---------------------------------------------------------- the ports
 
+/// The wire an interface's calls leave on, by the grant's position.
+fn wire_of<'w>(
+    wires: &'w mut [GrantWire; MAX_GRANTS],
+    grants: [u8; MAX_GRANTS],
+    grant_count: usize,
+    kind: u8,
+) -> Option<&'w mut GrantWire> {
+    let mut grant = 0usize;
+    while grant < grant_count {
+        if grants.get(grant).copied() == Some(kind) {
+            return wires.get_mut(grant);
+        }
+        grant += 1;
+    }
+    None
+}
+
+/// The ports an interface's calls and answers use.
+fn ports_of(state: &State, kind: u8) -> (i32, i32) {
+    match kind {
+        GRANT_CLOCK => (state.clock_call, state.clock_reply),
+        GRANT_ENTROPY => (state.entropy_call, state.entropy_reply),
+        GRANT_STORE => (state.store_call, state.store_reply),
+        GRANT_FS => (state.fs_call, state.fs_reply),
+        _ => (-1, -1),
+    }
+}
+
 fn push_calls(state: &mut State, syscalls: &SyscallTable) {
     let mut grant = 0usize;
     while grant < state.grant_count {
-        let port = match state.grants.get(grant).copied().unwrap_or(0) {
-            GRANT_CLOCK => state.clock_call,
-            GRANT_ENTROPY => state.entropy_call,
-            _ => -1,
-        };
+        let kind = state.grants.get(grant).copied().unwrap_or(0);
+        let (port, _) = ports_of(state, kind);
         let Some(wire) = state.wires.get_mut(grant) else {
             break;
         };
@@ -1307,22 +1589,104 @@ fn push_calls(state: &mut State, syscalls: &SyscallTable) {
 fn pull_replies(state: &mut State, syscalls: &SyscallTable) {
     let mut grant = 0usize;
     while grant < state.grant_count {
-        let port = match state.grants.get(grant).copied().unwrap_or(0) {
-            GRANT_CLOCK => state.clock_reply,
-            GRANT_ENTROPY => state.entropy_reply,
-            _ => -1,
-        };
+        let kind = state.grants.get(grant).copied().unwrap_or(0);
+        let (_, port) = ports_of(state, kind);
         let Some(wire) = state.wires.get_mut(grant) else {
             break;
         };
-        if port >= 0
-            && !wire.ready
-            && wire::take_frame(syscalls, port, &mut wire.reply, &mut wire.filled)
+        if port < 0 || wire.ready {
+            grant += 1;
+            continue;
+        }
+        if !wire.frame_ready && wire::take_frame(syscalls, port, &mut wire.reply, &mut wire.filled)
         {
+            wire.frame_ready = true;
+            wire.reply_filled = 0;
+            wire.reply_length = CompletionRecord::decode(&wire.reply)
+                .map_or(0, |record| record.answer.payload_length() as usize)
+                .min(REPLY_PAYLOAD_BYTES);
+        }
+        // The payload follows its frame: until every byte is here, the answer
+        // has not arrived.
+        if wire.frame_ready
+            && wire::take_payload(
+                syscalls,
+                port,
+                &mut wire.reply_payload,
+                &mut wire.reply_filled,
+                wire.reply_length,
+            )
+        {
+            wire.frame_ready = false;
             wire.ready = true;
         }
         grant += 1;
     }
+}
+
+/// Ask the clock adapter for the fact the task about to run will read.
+///
+/// A snapshot binding is never called by the program: the value is supplied
+/// at the task boundary, which is what lets a clock be a capability and still
+/// answer synchronously. The shell asks for it here, on the port a call would
+/// use, under a request identifier of its own. Answers whether it is ready.
+fn take_snapshot(state: &mut State, syscalls: &SyscallTable) -> bool {
+    let held =
+        (0..state.grant_count).find(|&grant| state.grants.get(grant).copied() == Some(GRANT_CLOCK));
+    let Some(grant) = held else {
+        state.snapshot_ready = true;
+        return true;
+    };
+    let (call_port, reply_port) = ports_of(state, GRANT_CLOCK);
+    if call_port < 0 || reply_port < 0 {
+        state.snapshot_ready = true;
+        return true;
+    }
+    if !state.snapshot_asked {
+        let record = CallRecord {
+            request: u64::MAX,
+            binding: 0,
+            payload_length: 0,
+            trace: TRACE,
+            payload: digest::digest(b""),
+        };
+        let frame = record.encode();
+        let Some(wire) = state.wires.get_mut(grant) else {
+            state.snapshot_ready = true;
+            return true;
+        };
+        let at = wire.staged;
+        if !copy_into(
+            wire.calls.get_mut(at..at + CALL_FRAME).unwrap_or(&mut []),
+            &frame,
+        ) {
+            state.snapshot_ready = true;
+            return true;
+        }
+        wire.staged = at + CALL_FRAME;
+        state.snapshot_asked = true;
+    }
+    push_calls(state, syscalls);
+    pull_replies(state, syscalls);
+    let Some(wire) = state.wires.get_mut(grant) else {
+        return false;
+    };
+    if !wire.ready {
+        return false;
+    }
+    wire.ready = false;
+    wire.filled = 0;
+    wire.reply_length = 0;
+    wire.reply_filled = 0;
+    let reply = wire.reply;
+    if let Some(record) = CompletionRecord::decode(&reply) {
+        if let Answer::Number(value) = record.answer {
+            state.snapshot_value = value;
+        }
+    }
+    state.snapshot_asked = false;
+    state.snapshot_ready = true;
+    true
 }
 
 // ------------------------------------------------------------ the REPL
@@ -1486,8 +1850,8 @@ fn repl_idle(state: &mut State, syscalls: &SyscallTable) {
 entry! {
     State;
     primary { args_in, stdout_out }
-    inputs { stdin_in = 1, clock_reply = 2, entropy_reply = 3 }
-    outputs { exit_out = 1, clock_call = 2, entropy_call = 3 }
+    inputs { stdin_in = 1, clock_reply = 2, entropy_reply = 3, store_reply = 4, fs_reply = 5 }
+    outputs { exit_out = 1, clock_call = 2, entropy_call = 3, store_call = 4, fs_call = 5 }
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -1543,9 +1907,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut grant = 0usize;
             while grant < state.grant_count {
                 emit(&mut state.out, b" ");
+                let (interface, interface_length) =
+                    grant_name(state.grants.get(grant).copied().unwrap_or(0));
                 emit(
                     &mut state.out,
-                    grant_name(state.grants.get(grant).copied().unwrap_or(0)),
+                    interface.get(..interface_length).unwrap_or(&[]),
                 );
                 grant += 1;
             }
@@ -1564,11 +1930,45 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if !drained && out_room(&state.out) < OUT_CAPACITY / 4 {
             return 0;
         }
+        // The standard surface goes into the realm before anything a person
+        // typed, as a program like any other: compiled by the same front end,
+        // verified, and run under the same bounds.
+        if !state.facade_done && !state.bare && !state.task_running {
+            state.facade_done = true;
+            // The façade compiles from its own source, so whatever a person
+            // gave on the command line is still waiting in the buffer.
+            match compile_bytes(state, facade::SOURCE) {
+                Ok(unit) => {
+                    state.running_facade = true;
+                    begin_task(state, unit);
+                }
+                Err(report) => {
+                    emit_diagnostic(&mut state.out, &report);
+                    state.failed = true;
+                    state.phase = PHASE_FINISH;
+                }
+            }
+            return 0;
+        }
         push_calls(state, syscalls);
         pull_replies(state, syscalls);
         if state.task_running {
+            // The task about to run reads facts rather than calling for them:
+            // the snapshot is taken here, at the boundary, before any of the
+            // program runs.
+            if !state.snapshot_ready && !take_snapshot(state, syscalls) {
+                return 0;
+            }
             if advance(state) != Advance::Running {
-                if state.mode == MODE_REPL {
+                state.snapshot_ready = false;
+                if state.running_facade {
+                    // The surface is in place; what a person asked for runs
+                    // next, in the same realm.
+                    state.running_facade = false;
+                    if state.mode == MODE_REPL {
+                        state.prompt_due = true;
+                    }
+                } else if state.mode == MODE_REPL {
                     state.prompt_due = true;
                 } else {
                     state.phase = PHASE_FINISH;

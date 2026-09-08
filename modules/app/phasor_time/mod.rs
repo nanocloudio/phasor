@@ -7,6 +7,13 @@
 //!
 //! Nothing here converts the sample into an ECMAScript value: what crosses the
 //! boundary is a number, and what the language makes of it is the engine's.
+//!
+//! The adapter also serves waiting. A `sleep` call is held rather than
+//! answered, and answers when the delay it named has passed, which is what a
+//! timer is: a program asks to be told later, and the deployment decides
+//! whether it may. Nothing here runs program code, and a held call is one of
+//! the isolate's own outstanding calls, so a program cannot wait for more
+//! than the deployment admits.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -40,7 +47,9 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use binding::{CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
+use binding::{
+    Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME,
+};
 
 /// Which observation a call is answered with.
 const SOURCE_MONOTONIC_MS: u8 = 0;
@@ -48,6 +57,34 @@ const SOURCE_MONOTONIC_US: u8 = 1;
 const SOURCE_UNIX_MS: u8 = 2;
 
 const STAGE: usize = 8;
+/// Calls held waiting for their delay to pass.
+const SLEEPERS: usize = 16;
+/// The method a call names: the sample, or the wait.
+const METHOD_NOW: u32 = 0;
+const METHOD_SLEEP: u32 = 1;
+/// The longest delay this adapter will hold a call for, in milliseconds. A
+/// program that asks for longer is answered at the ceiling rather than
+/// refused: waiting is not an error, and an unbounded wait is not a wait.
+const WAIT_CEILING: u64 = 60_000;
+
+/// One call held until its delay has passed.
+#[derive(Clone, Copy)]
+struct Sleeper {
+    request: u64,
+    trace: u64,
+    /// The reading of the monotonic clock this call is answered at.
+    due: u64,
+    live: bool,
+}
+
+impl Sleeper {
+    const EMPTY: Self = Self {
+        request: 0,
+        trace: 0,
+        due: 0,
+        live: false,
+    };
+}
 
 #[repr(C)]
 struct State {
@@ -56,6 +93,11 @@ struct State {
     reply_out: i32,
     request: [u8; CALL_FRAME],
     filled: usize,
+    /// The delay a `sleep` names, as the digits behind its frame.
+    payload: [u8; 32],
+    payload_filled: usize,
+    frame_ready: bool,
+    payload_length: usize,
     replies: [u8; COMPLETION_FRAME * STAGE],
     staged: usize,
     written: usize,
@@ -65,6 +107,8 @@ struct State {
     /// call; a deployment that wants a program to read the time a bounded
     /// number of times says so here.
     quota: u32,
+    /// Calls waiting for their delay to pass.
+    sleepers: [Sleeper; SLEEPERS],
     hung_up: bool,
     phase: u8,
 }
@@ -90,6 +134,41 @@ unsafe fn apply_params(state: &mut State, params: *const u8, params_len: usize) 
     }
 }
 
+/// Hold a call until its delay has passed, answering whether it was held.
+///
+/// The delay arrives as the payload's digits, which is how a number crosses
+/// as text. A delay of nothing is a call answered at once, which is what
+/// `setTimeout(fn, 0)` means.
+fn hold(state: &mut State, record: &CallRecord, delay: u64, syscalls: &SyscallTable) -> bool {
+    let Some(slot) = state.sleepers.iter().position(|held| !held.live) else {
+        return false;
+    };
+    // SAFETY: one call through the loader's table, live for the module's
+    // lifetime, with arguments that are plain numbers.
+    let now = unsafe { dev_millis(syscalls) };
+    state.sleepers[slot] = Sleeper {
+        request: record.request,
+        trace: record.trace,
+        due: now.saturating_add(delay.min(WAIT_CEILING)),
+        live: true,
+    };
+    true
+}
+
+/// The digits a payload carries, which is how a delay arrives.
+fn digits(bytes: &[u8]) -> u64 {
+    let mut value = 0u64;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'));
+    }
+    value
+}
+
 /// The answer to one call: a sample, or a refusal when the quota is spent.
 fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> CompletionRecord {
     if state.quota != 0 && state.answered >= u64::from(state.quota) {
@@ -98,7 +177,7 @@ fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> Comple
             disposition: Disposition::Rejected,
             cause: Cause::Denied,
             trace: record.trace,
-            value: None,
+            answer: Answer::None,
         };
     }
     // SAFETY: each sample is one call through the loader's syscall table, live
@@ -115,7 +194,7 @@ fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> Comple
         disposition: Disposition::Fulfilled,
         cause: Cause::None,
         trace: record.trace,
-        value: Some(softfloat::from_u64(sample)),
+        answer: Answer::Number(softfloat::from_u64(sample)),
     }
 }
 
@@ -146,25 +225,85 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         return 1;
     }
     // One request is taken only when there is room for its answer.
-    if state.staged + COMPLETION_FRAME <= state.replies.len()
-        && wire::take_frame(
-            syscalls,
-            state.request_in,
-            &mut state.request,
-            &mut state.filled,
-        )
-    {
-        state.filled = 0;
-        if let Some(record) = CallRecord::decode(&state.request) {
-            let reply = answer(state, &record, syscalls);
-            let at = state.staged;
-            let frame = reply.encode();
-            if let Some(slot) = state.replies.get_mut(at..at + COMPLETION_FRAME) {
-                slot.copy_from_slice(&frame);
-                state.staged = at + COMPLETION_FRAME;
-            }
-            state.answered = state.answered.saturating_add(1);
+    if state.staged + COMPLETION_FRAME <= state.replies.len() {
+        if !state.frame_ready
+            && wire::take_frame(
+                syscalls,
+                state.request_in,
+                &mut state.request,
+                &mut state.filled,
+            )
+        {
+            state.filled = 0;
+            state.frame_ready = true;
+            state.payload_filled = 0;
+            state.payload_length = CallRecord::decode(&state.request)
+                .map_or(0, |record| record.payload_length as usize)
+                .min(state.payload.len());
         }
+        if state.frame_ready
+            && wire::take_payload(
+                syscalls,
+                state.request_in,
+                &mut state.payload,
+                &mut state.payload_filled,
+                state.payload_length,
+            )
+        {
+            state.frame_ready = false;
+            if let Some(record) = CallRecord::decode(&state.request) {
+                // A wait is held rather than answered; everything else is
+                // answered from a sample taken now.
+                let delay = digits(state.payload.get(..state.payload_length).unwrap_or(&[]));
+                let held = record.binding == METHOD_SLEEP
+                    && delay > 0
+                    && hold(state, &record, delay, syscalls);
+                if !held {
+                    let reply = answer(state, &record, syscalls);
+                    let at = state.staged;
+                    let frame = reply.encode();
+                    if let Some(slot) = state.replies.get_mut(at..at + COMPLETION_FRAME) {
+                        slot.copy_from_slice(&frame);
+                        state.staged = at + COMPLETION_FRAME;
+                    }
+                    state.answered = state.answered.saturating_add(1);
+                }
+            }
+            state.payload_filled = 0;
+            state.payload_length = 0;
+        }
+    }
+
+    // A held call is answered when the delay it named has passed. Nothing
+    // here runs program code: the answer settles a promise, and whatever
+    // waits on it runs as a job in the isolate.
+    // SAFETY: one call through the loader's table, live for the module's
+    // lifetime, with arguments that are plain numbers.
+    let now = unsafe { dev_millis(syscalls) };
+    let mut slot = 0usize;
+    while slot < SLEEPERS {
+        let sleeper = state.sleepers[slot];
+        if sleeper.live
+            && now >= sleeper.due
+            && state.staged + COMPLETION_FRAME <= state.replies.len()
+        {
+            let frame = CompletionRecord {
+                request: sleeper.request,
+                disposition: Disposition::Fulfilled,
+                cause: Cause::None,
+                trace: sleeper.trace,
+                answer: Answer::Number(softfloat::from_u64(now)),
+            }
+            .encode();
+            let at = state.staged;
+            if let Some(place) = state.replies.get_mut(at..at + COMPLETION_FRAME) {
+                place.copy_from_slice(&frame);
+                state.staged = at + COMPLETION_FRAME;
+                state.sleepers[slot] = Sleeper::EMPTY;
+                state.answered = state.answered.saturating_add(1);
+            }
+        }
+        slot += 1;
     }
 
     wire::push_staged(
@@ -175,7 +314,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         &mut state.written,
     );
 
-    if !state.hung_up && wire::hung_up(syscalls, state.request_in) {
+    if !state.hung_up
+        && wire::hung_up(syscalls, state.request_in)
+        && !state.sleepers.iter().any(|held| held.live)
+    {
         state.hung_up = true;
     }
     if state.hung_up && state.staged == 0 && state.filled == 0 {

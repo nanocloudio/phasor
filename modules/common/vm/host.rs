@@ -2,6 +2,7 @@
 //! the collector, and what the host retains.
 
 use super::*;
+use crate::binding::{Answer, Class};
 
 pub(super) const MAX_ARGUMENTS: usize = 16;
 
@@ -48,6 +49,59 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         Ok(())
     }
 
+    /// Make an admitted binding reachable as a member of a namespace object,
+    /// which is how an image's `phasor:` import is answered: the interface is
+    /// one object, its methods are the bindings the deployment granted.
+    ///
+    /// A namespace is an ordinary object with ordinary properties. Nothing
+    /// about it is privileged: it is reachable because it was granted, and
+    /// what it holds is exactly what was admitted.
+    pub fn define_binding_in(
+        &mut self,
+        namespace: Handle,
+        name: &[u8],
+        binding: u32,
+    ) -> Result<(), Completion> {
+        let function = object::create_native(
+            self.heap,
+            Value::object(self.realm.function_prototype),
+            native::BINDING_BASE + binding,
+            0,
+        )
+        .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        let key = self.ascii_key(name)?;
+        object::define_own_property(
+            self.heap,
+            namespace,
+            key,
+            Descriptor::data(
+                Value::object(function),
+                attribute::WRITABLE | attribute::CONFIGURABLE,
+            ),
+        )
+        .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        Ok(())
+    }
+
+    /// Put an empty namespace object on the global under `name`, for the
+    /// bindings of one interface to be defined in.
+    pub fn define_namespace(&mut self, name: &[u8]) -> Result<Handle, Completion> {
+        let namespace = object::create(self.heap, Value::object(self.realm.object_prototype))
+            .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        let key = self.ascii_key(name)?;
+        object::define_own_property(
+            self.heap,
+            self.realm.global,
+            key,
+            Descriptor::data(
+                Value::object(namespace),
+                attribute::WRITABLE | attribute::CONFIGURABLE,
+            ),
+        )
+        .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        Ok(namespace)
+    }
+
     /// The call records the program has produced and the host has not taken.
     pub fn calls(&self) -> &[CallRecord] {
         match &self.outbox {
@@ -59,6 +113,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// Forget the call records the host has taken.
     pub fn take_calls(&mut self) {
         self.outbox_length = 0;
+        self.payload_length = 0;
     }
 
     /// Answer a call the program made.
@@ -99,6 +154,16 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// match the one that comes back: a completion for the right request under
     /// the wrong trace is refused.
     pub fn apply_completion(&mut self, record: &CompletionRecord) -> Result<(), CallError> {
+        self.apply_completion_with(record, &[])
+    }
+
+    /// Apply a completion whose answer carried bytes: the payload the host
+    /// read off the port, behind the frame.
+    pub fn apply_completion_with(
+        &mut self,
+        record: &CompletionRecord,
+        payload: &[u8],
+    ) -> Result<(), CallError> {
         let trace = {
             let Some(bindings) = self.bindings.as_deref() else {
                 return Err(CallError::UnknownRequest);
@@ -111,10 +176,18 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             return Err(CallError::UnknownRequest);
         }
 
+        // Which binding answered, so a resource it opened is recorded
+        // against it: a handle is meaningful only to the capability that
+        // issued it.
+        self.completing_binding = self
+            .bindings
+            .as_deref()
+            .and_then(|bindings| bindings.binding_of(record.request))
+            .unwrap_or(u32::MAX);
         let value = match record.disposition {
-            Disposition::Fulfilled => match record.value {
-                Some(number) => Value::number(number),
-                None => Value::UNDEFINED,
+            Disposition::Fulfilled => match self.answered_value(record, payload) {
+                Ok(value) => value,
+                Err(_) => return Err(CallError::SchemaMismatch),
             },
             Disposition::Rejected => match self.create_cause_error(record.cause) {
                 Ok(value) => value,
@@ -122,6 +195,91 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             },
         };
         self.complete_call(record.request, record.disposition, value)
+    }
+
+    /// The value a fulfilled completion settles with: nothing, a number, the
+    /// payload as text, or the handle of a resource the provider opened.
+    ///
+    /// A handle is a number the program can hold and pass back, and nothing
+    /// more: it is meaningful only to the binding that issued it, and the
+    /// table checks its generation, so one kept past its resource's life
+    /// names nothing rather than naming whatever took the slot.
+    pub(super) fn answered_value(
+        &mut self,
+        record: &CompletionRecord,
+        payload: &[u8],
+    ) -> Result<Value, Completion> {
+        match record.answer {
+            Answer::None => Ok(Value::UNDEFINED),
+            Answer::Number(number) => Ok(Value::number(number)),
+            Answer::Payload(length) => {
+                let bytes = payload.get(..length as usize).unwrap_or(&[]);
+                self.utf8_string(bytes)
+            }
+            Answer::Resource(token) => {
+                // The provider's own identifier never reaches the program:
+                // the table records it and answers with a handle, which is an
+                // index and a generation the binding checks on every use.
+                let binding = self.completing_binding;
+                let Some(bindings) = self.bindings.as_deref_mut() else {
+                    return Ok(Value::UNDEFINED);
+                };
+                match bindings.open(binding, token) {
+                    Ok(handle) => Ok(Value::number(handle.pack() as f64)),
+                    Err(_) => Err(Completion::QUOTA_EXCEEDED),
+                }
+            }
+        }
+    }
+
+    /// A string cell from UTF-8 bytes, which is how a payload reaches a
+    /// program. Malformed bytes are not a program error: the provider's
+    /// answer is its own, and the replacement character says what arrived.
+    pub(super) fn utf8_string(&mut self, bytes: &[u8]) -> Result<Value, Completion> {
+        let mut units = [0u16; 512];
+        let mut count = 0usize;
+        let mut at = 0usize;
+        while at < bytes.len() && count + 2 <= units.len() {
+            let first = bytes[at];
+            let (code_point, width) = if first < 0x80 {
+                (u32::from(first), 1)
+            } else if first & 0xE0 == 0xC0 && at + 1 < bytes.len() {
+                (
+                    (u32::from(first & 0x1F) << 6) | u32::from(bytes[at + 1] & 0x3F),
+                    2,
+                )
+            } else if first & 0xF0 == 0xE0 && at + 2 < bytes.len() {
+                (
+                    (u32::from(first & 0x0F) << 12)
+                        | (u32::from(bytes[at + 1] & 0x3F) << 6)
+                        | u32::from(bytes[at + 2] & 0x3F),
+                    3,
+                )
+            } else if first & 0xF8 == 0xF0 && at + 3 < bytes.len() {
+                (
+                    (u32::from(first & 0x07) << 18)
+                        | (u32::from(bytes[at + 1] & 0x3F) << 12)
+                        | (u32::from(bytes[at + 2] & 0x3F) << 6)
+                        | u32::from(bytes[at + 3] & 0x3F),
+                    4,
+                )
+            } else {
+                (0xFFFD, 1)
+            };
+            at += width;
+            if code_point >= 0x1_0000 {
+                let offset = code_point - 0x1_0000;
+                units[count] = u16::try_from(0xD800 + (offset >> 10)).unwrap_or(0xFFFD);
+                units[count + 1] = u16::try_from(0xDC00 + (offset & 0x3FF)).unwrap_or(0xFFFD);
+                count += 2;
+            } else {
+                units[count] = u16::try_from(code_point).unwrap_or(0xFFFD);
+                count += 1;
+            }
+        }
+        let handle = string::create(self.heap, units.get(..count).unwrap_or(&[]))
+            .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        Ok(Value::string(handle))
     }
 
     /// The error a rejected completion settles with: an ordinary error object
@@ -702,8 +860,20 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         binding: u32,
         arguments: &[Value],
     ) -> Result<Value, Completion> {
+        // A snapshot binding is not called at all: the host supplied its value
+        // before the task ran, so the read is local and answers at once. That
+        // is what lets a clock be a capability without a channel round trip.
+        if let Some(descriptor) = self
+            .bindings
+            .as_deref()
+            .and_then(|bindings| bindings.binding(binding))
+        {
+            if descriptor.class == Class::Snapshot {
+                return Ok(Value::number(descriptor.snapshot));
+            }
+        }
         let promise = self.new_promise()?;
-        let payload = self.payload_digest(arguments)?;
+        let (payload_length, payload) = self.stage_payload(binding, arguments)?;
 
         let outcome = {
             let Some(bindings) = self.bindings.as_deref_mut() else {
@@ -726,6 +896,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         let record = CallRecord {
             request,
             binding,
+            payload_length,
             trace: self.trace,
             payload,
         };
@@ -742,27 +913,126 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         Ok(Value::object(promise))
     }
 
-    /// The digest of a call's arguments, which is what crosses the boundary in
-    /// place of the values themselves.
-    pub(super) fn payload_digest(
+    /// Stage a call's arguments as its payload: each argument as text, one
+    /// per NUL-separated field, in the buffer the host attached. Answers how
+    /// many bytes were staged.
+    ///
+    /// A host that attached no payload buffer stages nothing, and its calls
+    /// carry their arguments' digest alone — which is every binding whose
+    /// answer is a number.
+    pub(super) fn stage_payload(
         &mut self,
+        binding: u32,
         arguments: &[Value],
-    ) -> Result<crate::digest::Digest, Completion> {
+    ) -> Result<(u32, crate::digest::Digest), Completion> {
         let mut hasher = crate::digest::Hasher::new();
-        for &argument in arguments {
+        let mut at = self.payload_length;
+        for (position, &argument) in arguments.iter().enumerate() {
+            // A number that resolves as one of this binding's handles crosses
+            // as the provider's own identifier for the resource. A forged,
+            // stale, or another binding's handle resolves to nothing, and the
+            // argument crosses as the number it is — which the provider will
+            // not recognise.
+            let argument = match self.resolve_handle(binding, argument) {
+                Some(token) => Value::number(token as f64),
+                None => argument,
+            };
             let text = self.coerce_to_string(argument)?;
             let handle = text.as_handle();
             let length = string::length(self.heap, handle).map_err(|_| Completion::MALFORMED)?;
-            hasher.update(&length.to_le_bytes());
+            if position > 0 {
+                hasher.update(&[0]);
+                if let Some(out) = self.payload_out.as_deref_mut() {
+                    match out.get_mut(at) {
+                        Some(slot) => *slot = 0,
+                        None => return Err(Completion::QUOTA_EXCEEDED),
+                    }
+                    at += 1;
+                }
+            }
             let mut index = 0u32;
             while index < length {
                 let unit = string::unit_at(self.heap, handle, index)
                     .map_err(|_| Completion::MALFORMED)?
                     .unwrap_or(0);
-                hasher.update(&unit.to_le_bytes());
+                // A payload is bytes: the text crosses as UTF-8, and a unit
+                // above the Latin-1 range takes the bytes it needs.
+                let mut encoded = [0u8; 3];
+                let width = if unit < 0x80 {
+                    encoded[0] = u8::try_from(unit).unwrap_or(b'?');
+                    1
+                } else if unit < 0x800 {
+                    encoded[0] = 0xC0 | u8::try_from(unit >> 6).unwrap_or(0);
+                    encoded[1] = 0x80 | u8::try_from(unit & 0x3F).unwrap_or(0);
+                    2
+                } else {
+                    encoded[0] = 0xE0 | u8::try_from(unit >> 12).unwrap_or(0);
+                    encoded[1] = 0x80 | u8::try_from((unit >> 6) & 0x3F).unwrap_or(0);
+                    encoded[2] = 0x80 | u8::try_from(unit & 0x3F).unwrap_or(0);
+                    3
+                };
+                // The digest covers the bytes whether or not a buffer holds
+                // them: a host that stages no payload still carries what the
+                // call said, and one that does carries both.
+                hasher.update(encoded.get(..width).unwrap_or(&[]));
+                if let Some(out) = self.payload_out.as_deref_mut() {
+                    let Some(slot) = out.get_mut(at..at + width) else {
+                        return Err(Completion::QUOTA_EXCEEDED);
+                    };
+                    slot.copy_from_slice(encoded.get(..width).unwrap_or(&[]));
+                    at += width;
+                }
                 index += 1;
             }
         }
-        Ok(hasher.finish())
+        let staged = at - self.payload_length;
+        self.payload_length = at;
+        let length = u32::try_from(staged).map_err(|_| Completion::QUOTA_EXCEEDED)?;
+        Ok((length, hasher.finish()))
+    }
+
+    /// The provider's identifier for a handle a program passed, when the
+    /// value is one this binding issued and has not released.
+    pub(super) fn resolve_handle(&self, binding: u32, value: Value) -> Option<u64> {
+        if !matches!(value.tag(), Tag::Number) {
+            return None;
+        }
+        let number = value.as_number();
+        // no_std has no `fract`: a handle is a whole number in range, and
+        // the round trip through the integer proves it.
+        if !(0.0..=9_007_199_254_740_992.0).contains(&number) {
+            return None;
+        }
+        let packed = number as u64;
+        if packed as f64 != number {
+            return None;
+        }
+        let handle = crate::binding::Handle::unpack(packed);
+        self.bindings.as_deref()?.resolve(binding, handle).ok()
+    }
+
+    /// Attach the buffer a call's payload is staged in. A host that attaches
+    /// one can carry bytes; one that does not carries digests alone.
+    pub fn attach_payloads(&mut self, out: &'a mut [u8]) {
+        self.payload_out = Some(out);
+        self.payload_length = 0;
+    }
+
+    /// The payload bytes staged behind the call records the host has not
+    /// taken, in the order the records were made.
+    pub fn call_payloads(&self) -> &[u8] {
+        match &self.payload_out {
+            Some(out) => out.get(..self.payload_length).unwrap_or(&[]),
+            None => &[],
+        }
+    }
+
+    /// Record a resource a provider opened, answering the packed handle the
+    /// program holds it by.
+    pub fn open_resource(&mut self, binding: u32, token: u64) -> Result<u64, CallError> {
+        let bindings = self.bindings.as_deref_mut().ok_or(CallError::NotAdmitted)?;
+        bindings
+            .open(binding, token)
+            .map(crate::binding::Handle::pack)
     }
 }

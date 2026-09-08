@@ -30,6 +30,8 @@ mod bigint;
 mod binding;
 #[path = "../../common/bytecode.rs"]
 mod bytecode;
+#[path = "../../common/capability.rs"]
+mod capability;
 #[path = "../../common/diagnostic.rs"]
 mod diagnostic;
 #[path = "../../common/digest.rs"]
@@ -95,7 +97,7 @@ mod wire;
 
 use arena::{Arena, Node, NodeKind};
 use binding::{
-    Binding, Bindings, CallError, CallRecord, Cause, CompletionRecord, Disposition, Pending,
+    Answer, Binding, Bindings, CallError, CallRecord, Cause, CompletionRecord, Disposition, Pending,
 };
 use bytecode::{Constant, ExceptionRegion, ExportRecord, Function, ImportRecord, Opcode, Unit};
 use emit::{CodeBuilder, Patch, UnitWriter};
@@ -113,7 +115,7 @@ use string::Atoms;
 use value::{Handle, Value};
 use vm::{Completion, Frame, Vm};
 
-const CASE_COUNT: u16 = 20;
+const CASE_COUNT: u16 = 26;
 const FUEL: u32 = 400_000;
 /// The trace every call the probe makes belongs to.
 const TRACE: u64 = 0x5041_5348_4f52_0001;
@@ -247,6 +249,8 @@ fn with_binding(
         schema: digest::digest(b"schema"),
         in_flight_max,
         in_flight: 0,
+        class: binding::Class::Async,
+        snapshot: 0.0,
     });
     let Ok(admitted) = admitted else {
         return false;
@@ -327,6 +331,8 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 schema: digest::digest(b"s"),
                 in_flight_max: 1,
                 in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
             });
             index == Ok(0) && bindings.admitted() == 1
         }
@@ -345,6 +351,8 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 schema: digest::digest(b"s"),
                 in_flight_max: 2,
                 in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
             }) else {
                 return false;
             };
@@ -366,6 +374,8 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 schema: digest::digest(b"s"),
                 in_flight_max: 2,
                 in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
             }) else {
                 return false;
             };
@@ -523,6 +533,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             let record = CallRecord {
                 request: 7,
                 binding: 3,
+                payload_length: 0,
                 trace: 0x0102_0304_0506_0708,
                 payload: digest::digest(b"a"),
             };
@@ -535,7 +546,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 disposition: Disposition::Fulfilled,
                 cause: Cause::None,
                 trace: 9,
-                value: Some(42.5),
+                answer: Answer::Number(42.5),
             };
             let frame = record.encode();
             CompletionRecord::decode(&frame) == Some(record)
@@ -547,7 +558,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 disposition: Disposition::Rejected,
                 cause: Cause::Timeout,
                 trace: 9,
-                value: None,
+                answer: Answer::None,
             };
             CompletionRecord::decode(&record.encode()) == Some(record)
                 && Cause::Timeout.retryable()
@@ -572,7 +583,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                             disposition: Disposition::Fulfilled,
                             cause: Cause::None,
                             trace: TRACE,
-                            value: Some(42.0),
+                            answer: Answer::Number(42.0),
                         })
                         .is_ok()
                     && promise_is(machine, value, promise::FULFILLED)
@@ -592,7 +603,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                     disposition: Disposition::Fulfilled,
                     cause: Cause::None,
                     trace: TRACE ^ 1,
-                    value: Some(42.0),
+                    answer: Answer::Number(42.0),
                 }) == Err(CallError::UnknownRequest)
                     && promise_is(machine, value, promise::PENDING)
             },
@@ -614,7 +625,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                         disposition: Disposition::Rejected,
                         cause: Cause::Denied,
                         trace: TRACE,
-                        value: None,
+                        answer: Answer::None,
                     })
                     .is_err()
                 {
@@ -639,8 +650,125 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                     && !retryable.as_boolean()
             },
         ),
+
+        // What an image states it requires. A capability import is an
+        // ordinary import with a scheme, so the requirement is recorded in
+        // the image's own table and nothing outside it can claim one.
+        20 => requires(
+            storage,
+            b"import { read } from \"phasor:store\"; export default 1;",
+            |required, count| {
+                count == 1
+                    && required[0].interface() == b"store"
+                    && required[0].member() == b"read"
+                    && required[0].name() == digest::digest(b"store.read")
+            },
+        ),
+        21 => requires(
+            storage,
+            b"import { now } from \"phasor:clock\";\nimport { read } from \"phasor:store\";\nexport default 1;",
+            |required, count| {
+                count == 2 && required[0].interface() == b"clock" && required[1].member() == b"read"
+            },
+        ),
+        // An ordinary module import states no requirement.
+        22 => requires(
+            storage,
+            b"import { x } from \"./other.js\"; export default 1;",
+            |_, count| count == 0,
+        ),
+        23 => {
+            capability::is_capability(&[0x70, 0x68, 0x61, 0x73, 0x6F, 0x72, 0x3A, 0x61])
+                && !capability::is_capability(&[0x2E, 0x2F, 0x61])
+                && !capability::is_capability(&[0x70, 0x68])
+        }
+
+        // A resource a provider opened comes back as a handle: an index and a
+        // generation, meaningful only to the binding that issued it.
+        24 => {
+            let mut descriptors = [Binding::EMPTY; 2];
+            let mut pending = [Pending::EMPTY; 2];
+            let mut resources = [binding::Resource::EMPTY; 4];
+            let mut bindings = Bindings::new(&mut descriptors, &mut pending);
+            bindings.attach_resources(&mut resources);
+            let admitted = bindings.admit(Binding {
+                name: digest::digest(b"store.open"),
+                schema: digest::digest(b"s"),
+                in_flight_max: 2,
+                in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
+            });
+            let Ok(index) = admitted else {
+                return false;
+            };
+            let Ok(handle) = bindings.open(index, 0x5A) else {
+                return false;
+            };
+            bindings.resolve(index, handle) == Ok(0x5A)
+                && bindings.resolve(index + 1, handle) == Err(CallError::StaleHandle)
+                && binding::Handle::unpack(handle.pack()) == handle
+        }
+        25 => {
+            let mut descriptors = [Binding::EMPTY; 1];
+            let mut pending = [Pending::EMPTY; 1];
+            let mut resources = [binding::Resource::EMPTY; 2];
+            let mut bindings = Bindings::new(&mut descriptors, &mut pending);
+            bindings.attach_resources(&mut resources);
+            let admitted = bindings.admit(Binding {
+                name: digest::digest(b"store.open"),
+                schema: digest::digest(b"s"),
+                in_flight_max: 1,
+                in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
+            });
+            let Ok(index) = admitted else {
+                return false;
+            };
+            let Ok(handle) = bindings.open(index, 7) else {
+                return false;
+            };
+            // A released handle names nothing ever again: the slot's
+            // generation advanced, and the slot itself may be reused.
+            bindings.release(index, handle) == Ok(7)
+                && bindings.resolve(index, handle) == Err(CallError::StaleHandle)
+                && bindings.open(index, 9).is_ok_and(|next| {
+                    next.index == handle.index && next.generation != handle.generation
+                })
+        }
         _ => true,
     }
+}
+
+/// Compile a module and hand its stated requirements to `check`.
+fn requires(
+    storage: &mut Storage,
+    source: &[u8],
+    check: impl Fn(&[capability::Requirement; 8], usize) -> bool,
+) -> bool {
+    let length = {
+        let mut front = frontend_storage!(storage);
+        match frontend::compile(
+            source,
+            frontend::Goal::Module,
+            Limits::CEILING,
+            FUEL,
+            &mut front,
+        ) {
+            Ok(compiled) => compiled.length,
+            Err(_) => return false,
+        }
+    };
+    let Some(bytes) = storage.image.get(..length) else {
+        return false;
+    };
+    let Ok(unit) = Unit::parse(bytes) else {
+        return false;
+    };
+    let mut required = [capability::Requirement::EMPTY; 8];
+    let count = capability::requirements(&unit, &mut required);
+    check(&required, count)
 }
 
 #[repr(C)]

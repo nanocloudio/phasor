@@ -1,0 +1,27 @@
+version          = "0.0.1"
+hardware_targets = ["bcm2712"]
+
+# Call frames a router or a shell forwarded, each followed by its payload.
+[[ports]]
+name         = "request_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 32768
+
+# Completion frames, each followed by the bytes it answers with.
+[[ports]]
+name         = "reply_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 32768
+
+# The Fluxor-side grant: this adapter reaches the host filesystem, and says
+# so where a deployment can see it. The Phasor-side grant is separate and
+# narrower — a program reaches this adapter only through a binding, and only
+# under the root the graph named.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "adapter whose evidence is the completions it emits"

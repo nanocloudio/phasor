@@ -29,6 +29,8 @@ mod entry;
 
 #[path = "../../common/bytecode.rs"]
 mod bytecode;
+#[path = "../../common/capability.rs"]
+mod capability;
 #[path = "../../common/closure.rs"]
 mod closure;
 #[path = "../../common/diagnostic.rs"]
@@ -152,17 +154,32 @@ fn link(state: &mut State) -> bool {
         if registry.register(key_of(modules[index].0), Form::Image) != Ok(index) {
             return false;
         }
+        // A capability import is not a module import: the registry never
+        // holds one, and the isolate answers it at admission.
         let mut import = 0u32;
         while import < units[index].header().import_count {
+            let mut specifier = [0u16; 64];
+            let mut name = [0u16; 64];
+            let Some((specifier_length, _, _)) =
+                units[index].import_at(import, &mut specifier, &mut name)
+            else {
+                return false;
+            };
+            import += 1;
+            if capability::is_capability(specifier.get(..specifier_length).unwrap_or(&[])) {
+                continue;
+            }
             if registry.add_import(index, 0, 0).is_err() {
                 return false;
             }
-            import += 1;
         }
         index += 1;
     }
     let mut index = 0usize;
     while index < count {
+        // The registry holds only the module imports, in the order they were
+        // added, so the position a resolution names is counted here.
+        let mut registered = 0usize;
         let mut import = 0u32;
         while import < units[index].header().import_count {
             let mut specifier = [0u16; 64];
@@ -172,6 +189,15 @@ fn link(state: &mut State) -> bool {
             else {
                 return false;
             };
+            // A capability import names what the deployment grants, not a
+            // module the stream carries: the linker records nothing for it
+            // and the isolate answers it at admission.
+            if capability::is_capability(specifier.get(..specifier_length).unwrap_or(&[])) {
+                import += 1;
+                continue;
+            }
+            let position = registered;
+            registered += 1;
             let Some(source) = find_module(modules, &specifier, specifier_length) else {
                 return false;
             };
@@ -183,7 +209,7 @@ fn link(state: &mut State) -> bool {
                 return false;
             }
             if registry
-                .resolve(index, import as usize, key_of(modules[source].0))
+                .resolve(index, position, key_of(modules[source].0))
                 .is_err()
             {
                 return false;

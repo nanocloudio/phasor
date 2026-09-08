@@ -39,7 +39,7 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use binding::{CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
+use binding::{Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
 
 /// Bindings this router admits. A call on any other index is refused here.
 const ADMITTED: u32 = 1;
@@ -126,7 +126,7 @@ fn route(state: &mut State, record: &CallRecord) {
                 disposition: Disposition::Rejected,
                 cause: Cause::Denied,
                 trace: record.trace,
-                value: None,
+                answer: Answer::None,
             },
         );
         return;
@@ -140,7 +140,7 @@ fn route(state: &mut State, record: &CallRecord) {
                 disposition: Disposition::Rejected,
                 cause: Cause::Busy,
                 trace: record.trace,
-                value: None,
+                answer: Answer::None,
             },
         );
         return;
@@ -154,7 +154,7 @@ fn route(state: &mut State, record: &CallRecord) {
                 disposition: Disposition::Rejected,
                 cause: Cause::Busy,
                 trace: record.trace,
-                value: None,
+                answer: Answer::None,
             },
         );
         return;
@@ -195,7 +195,7 @@ fn correlate(state: &mut State, record: &CompletionRecord) {
                 disposition: Disposition::Rejected,
                 cause: Cause::Malformed,
                 trace,
-                value: None,
+                answer: Answer::None,
             },
         );
         return;

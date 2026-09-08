@@ -44,6 +44,7 @@ How the engine works. These are the authoritative references.
 ## Reference
 
 - [reference/fmod-catalog.md](reference/fmod-catalog.md) — every fmod the project ships, its ports, and its parameters
+- [reference/capability-register.md](reference/capability-register.md) — every capability a program can reach, and how each is named and served
 - [reference/diagnostics.md](reference/diagnostics.md) — the diagnostic vocabulary, code by code
 
 ## Conformance

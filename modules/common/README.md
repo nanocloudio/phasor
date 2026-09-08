@@ -73,8 +73,17 @@ target; it is not a Cargo crate and not a runtime of its own.
   is what the linker's stream needs.
 - `job.rs` is the bounded job queue.
 - `promise.rs` holds promise state, reactions, and settling.
-- `binding.rs` is the typed seam to a capability: admitted bindings, in-flight
-  calls, and completions.
+- `binding.rs` is the typed seam to a capability: admitted bindings and how
+  each is served, in-flight calls, the records that cross with their payload
+  lengths, and the generation-checked handles a provider's resources come
+  back as.
+- `facade.rs` holds the standard surface as JavaScript source: console,
+  text encoding, base64, events, abort, timers, and structured clone. A host
+  compiles it and runs it in the realm before the program, so it is a
+  program rather than engine code and takes no privilege of its own.
+- `capability.rs` reads what an image says it requires: every import whose
+  specifier carries the `phasor:` scheme, which a deployment checks against
+  what it granted before anything runs.
 - `source.rs` holds source limits, UTF-8 decoding, and the line table that maps
   a byte offset to a line and column.
 - `numeric.rs` converts numeric literals to binary64 with correct rounding,

@@ -37,6 +37,22 @@ direction    = "input"
 content_type = "OctetStream"
 buffer_size  = 512
 
+# Completion frames from the store adapter, each followed by its bytes.
+[[ports]]
+name         = "store_reply"
+index        = 4
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 8192
+
+# Completion frames from the filesystem adapter, each followed by its bytes.
+[[ports]]
+name         = "fs_reply"
+index        = 5
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 32768
+
 # Values, printed lines, prompts, and failures in words.
 [[ports]]
 name         = "stdout"
@@ -66,6 +82,22 @@ index        = 3
 direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 1024
+
+# Call frames for the store binding, each followed by its payload.
+[[ports]]
+name         = "store_call"
+index        = 4
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 8192
+
+# Call frames for the filesystem binding, each followed by its payload.
+[[ports]]
+name         = "fs_call"
+index        = 5
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 32768
 
 [observability]
 exempt = "run-to-completion applet whose evidence is the text it writes and its exit status"

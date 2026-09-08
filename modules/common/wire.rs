@@ -124,6 +124,30 @@ pub fn take_frame(sys: &SyscallTable, port: i32, frame: &mut [u8], filled: &mut 
     *filled == frame.len()
 }
 
+/// Take a payload of exactly `length` bytes, in whatever pieces it arrives.
+///
+/// A payload follows the fixed frame that declares it, on the same port. It
+/// is not a record of its own: until every byte of it is here, the frame it
+/// belongs to has not been answered.
+pub fn take_payload(
+    sys: &SyscallTable,
+    port: i32,
+    into: &mut [u8],
+    filled: &mut usize,
+    length: usize,
+) -> bool {
+    if *filled >= length {
+        return true;
+    }
+    let wanted = length.min(into.len());
+    let Some(rest) = into.get_mut(*filled..wanted) else {
+        return true;
+    };
+    let read = read_available(sys, port, rest);
+    *filled += read;
+    *filled >= wanted
+}
+
 /// Push `bytes[written..staged]` out, and forget them once they are all gone:
 /// both counts return to zero when the port has taken everything.
 pub fn push_staged(

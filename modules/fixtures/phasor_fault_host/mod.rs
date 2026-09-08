@@ -36,7 +36,7 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use binding::{CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
+use binding::{Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
 
 /// Answers this adapter can give.
 const MODE_ANSWER: u8 = 0;
@@ -84,14 +84,14 @@ fn answer(state: &State, record: &CallRecord) -> Option<CompletionRecord> {
     } else {
         state.mode
     };
-    let (disposition, cause, value) = match mode {
-        MODE_DENY => (Disposition::Rejected, Cause::Denied, None),
-        MODE_UNAVAILABLE => (Disposition::Rejected, Cause::Unavailable, None),
+    let (disposition, cause, answer) = match mode {
+        MODE_DENY => (Disposition::Rejected, Cause::Denied, Answer::None),
+        MODE_UNAVAILABLE => (Disposition::Rejected, Cause::Unavailable, Answer::None),
         MODE_SILENT => return None,
         _ => (
             Disposition::Fulfilled,
             Cause::None,
-            Some(f64::from(state.value)),
+            Answer::Number(f64::from(state.value)),
         ),
     };
     Some(CompletionRecord {
@@ -99,7 +99,7 @@ fn answer(state: &State, record: &CallRecord) -> Option<CompletionRecord> {
         disposition,
         cause,
         trace: record.trace,
-        value,
+        answer,
     })
 }
 

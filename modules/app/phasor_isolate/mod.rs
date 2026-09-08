@@ -40,6 +40,8 @@ mod bigint;
 mod binding;
 #[path = "../../common/bytecode.rs"]
 mod bytecode;
+#[path = "../../common/capability.rs"]
+mod capability;
 #[path = "../../common/closure.rs"]
 mod closure;
 #[path = "../../common/diagnostic.rs"]
@@ -88,12 +90,12 @@ mod vm;
 mod wire;
 
 use binding::{
-    Binding, Bindings, BindingsSave, CallRecord, Cause, CompletionRecord, Disposition, Pending,
-    CALL_FRAME, COMPLETION_FRAME,
+    Answer, Binding, Bindings, BindingsSave, CallRecord, Cause, CompletionRecord, Disposition,
+    Pending, CALL_FRAME, COMPLETION_FRAME,
 };
 use bytecode::Unit;
 use closure::Closure;
-use diagnostic::{Diagnostic, Severity};
+use diagnostic::{code, Diagnostic, Severity};
 use heap::Slot;
 use job::{Job, Queue, QueueSave};
 use policy::Policy;
@@ -153,6 +155,8 @@ const WAIT_LIMIT: u32 = 5_000;
 const CONTROL_FRAME: usize = 12;
 /// Modules one closure may hold, and imports it may have in total.
 const MAX_MODULES: usize = 16;
+/// Bindings one image may state it requires.
+const MAX_REQUIREMENTS: usize = 32;
 const MAX_IMPORTS: usize = 128;
 /// The trace every call this isolate makes belongs to.
 const TRACE: u64 = 0x5041_5348_4f52_0001;
@@ -203,6 +207,19 @@ fn attachments<'a>(
         compiler: None,
         print: None,
     }
+}
+
+/// The bindings this isolate admits, by the digest of each name and schema.
+/// What answers one, and where that is, the isolate never learns.
+fn admitted_bindings() -> [Binding; 1] {
+    [Binding {
+        name: digest::digest(b"host"),
+        schema: digest::digest(b"number->number"),
+        in_flight_max: IN_FLIGHT_MAX,
+        in_flight: 0,
+        class: binding::Class::Async,
+        snapshot: 0.0,
+    }]
 }
 
 /// What one step of the machine did.
@@ -418,14 +435,7 @@ fn start(state: &mut State) -> bool {
     } else {
         state.instances[0] = ModuleInstance::EMPTY;
     }
-    // One binding is admitted here, by the digest of its name and schema. What
-    // answers it, and where that is, the isolate never learns.
-    let admitted = [Binding {
-        name: digest::digest(b"host"),
-        schema: digest::digest(b"number->number"),
-        in_flight_max: IN_FLIGHT_MAX,
-        in_flight: 0,
-    }];
+    let admitted = admitted_bindings();
     let policy = policy(state);
     let metering = agent::Metering {
         policy: &policy,
@@ -706,7 +716,7 @@ fn advance(state: &mut State) -> Advance {
                         disposition: Disposition::Rejected,
                         cause: Cause::Unavailable,
                         trace,
-                        value: None,
+                        answer: Answer::None,
                     });
                 }
                 progressed = true;
@@ -748,7 +758,7 @@ fn advance(state: &mut State) -> Advance {
                             disposition: Disposition::Rejected,
                             cause: Cause::Timeout,
                             trace: TRACE,
-                            value: None,
+                            answer: Answer::None,
                         });
                     }
                     state.wire.waited = 0;
@@ -1015,6 +1025,67 @@ fn drain_control(state: &mut State, syscalls: &SyscallTable) {
     }
 }
 
+/// Whether every binding the staged image states it requires is one this
+/// isolate admits.
+///
+/// The requirements are read from the image's own import table, where nothing
+/// outside the image can claim one for it, and checked before anything is
+/// admitted or run.
+fn requirements_granted(state: &State) -> bool {
+    let Some(bytes) = state.image.get(..state.image_length) else {
+        return true;
+    };
+    let mut units = [Unit::EMPTY; MAX_MODULES];
+    let count = match Closure::parse(bytes) {
+        Ok(closure) => {
+            let count = (closure.count() as usize).min(MAX_MODULES);
+            let mut index = 0usize;
+            while index < count {
+                let (Some(image), Ok(unit)) = (
+                    closure.image(u32::try_from(index).unwrap_or(0)),
+                    closure
+                        .image(u32::try_from(index).unwrap_or(0))
+                        .ok_or(())
+                        .and_then(|image| Unit::parse(image).map_err(|_| ())),
+                ) else {
+                    return true;
+                };
+                let _ = image;
+                units[index] = unit;
+                index += 1;
+            }
+            count
+        }
+        Err(_) => match Unit::parse(bytes) {
+            Ok(unit) => {
+                units[0] = unit;
+                1
+            }
+            Err(_) => return true,
+        },
+    };
+    let mut required = [capability::Requirement::EMPTY; MAX_REQUIREMENTS];
+    let mut index = 0usize;
+    while index < count {
+        let Some(unit) = units.get(index) else {
+            break;
+        };
+        let stated = capability::requirements(unit, &mut required);
+        let mut position = 0usize;
+        while position < stated {
+            if !admitted_bindings()
+                .iter()
+                .any(|binding| binding.name == required[position].name())
+            {
+                return false;
+            }
+            position += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
 /// Stage the whole image before admitting it: a partial image is not an image,
 /// and its digest would not be the one that was compiled.
 fn stage_image(state: &mut State, syscalls: &SyscallTable) -> bool {
@@ -1077,6 +1148,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     if state.phase == 0 {
         if !stage_image(state, syscalls) {
+            return 0;
+        }
+        // Every binding the image says it requires must be one the deployment
+        // granted, or the image is refused whole. A program never starts and
+        // then discovers that a capability it imported is `undefined`.
+        if !requirements_granted(state) {
+            state.diagnostic =
+                Diagnostic::at(code::BINDING_NOT_GRANTED, Severity::Error, 0).encode();
+            state.has_diagnostic = true;
+            state.failed = true;
+            state.phase = 2;
             return 0;
         }
         if state.image_length == 0 {

@@ -588,6 +588,13 @@ pub struct Vm<'a, 'u, 'h, 'atoms> {
     /// Call records the program produced and the host has not taken.
     outbox: Option<&'a mut [CallRecord]>,
     outbox_length: usize,
+    /// Where a call's payload bytes are staged, and how much is staged: the
+    /// host takes them behind the records they belong to.
+    payload_out: Option<&'a mut [u8]>,
+    payload_length: usize,
+    /// The binding whose completion is being applied, so a resource it
+    /// answered with is recorded against it.
+    completing_binding: u32,
 }
 
 /// The error type used inside the interpreter, where a throw and a termination
@@ -656,6 +663,9 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             bindings: None,
             outbox: None,
             outbox_length: 0,
+            payload_out: None,
+            payload_length: 0,
+            completing_binding: u32::MAX,
             print_status: 0,
             print_sink: None,
             random_state: RANDOM_SEED,
