@@ -173,15 +173,13 @@ fn find(state: &State, key: &[u8]) -> Option<usize> {
     None
 }
 
-/// A payload's first field, up to the separator: the key every method names.
-fn key_of(payload: &[u8]) -> (&[u8], &[u8]) {
-    match payload.iter().position(|&byte| byte == 0) {
-        Some(at) => (
-            payload.get(..at).unwrap_or(&[]),
-            payload.get(at + 1..).unwrap_or(&[]),
-        ),
-        None => (payload, &[]),
-    }
+/// A payload's fields: the key every method names, and whatever follows it.
+fn key_of<'a>(payload: &'a [u8], parts: &mut [&'a [u8]; 2]) -> (&'a [u8], &'a [u8]) {
+    let taken = wire::fields(payload, parts);
+    (
+        if taken > 0 { parts[0] } else { &[] },
+        if taken > 1 { parts[1] } else { &[] },
+    )
 }
 
 /// A refusal, with the cause that says why.
@@ -209,7 +207,21 @@ fn answer(state: &mut State, record: &CallRecord, out: &mut [u8]) -> (Completion
         .get(..state.payload_length)
         .unwrap_or(&[])
         .to_owned_bounded();
-    let (key, value) = key_of(payload.as_slice());
+    let mut parts: [&[u8]; 2] = [&[], &[]];
+    let taken = wire::fields(payload.as_slice(), &mut parts);
+    // How many fields each method is: the shape of a call, checked rather
+    // than assumed. A call that does not have the fields its method takes is
+    // refused here instead of being read as though it did.
+    let shape = match record.binding {
+        METHOD_LIST => (0, 0),
+        METHOD_READ | METHOD_DELETE | METHOD_OPEN | METHOD_READ_AT => (1, 1),
+        METHOD_WRITE => (2, 2),
+        _ => (0, usize::MAX),
+    };
+    if taken < shape.0 || taken > shape.1 {
+        return refuse(record, Cause::Malformed);
+    }
+    let (key, value) = key_of(payload.as_slice(), &mut parts);
     // A read through a resource names no key: the handle the engine resolved
     // is the provider's own identifier for the entry, and arrives as digits.
     if record.binding == METHOD_READ_AT {

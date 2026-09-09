@@ -286,7 +286,7 @@ impl Decimal {
             if self.truncated {
                 return true;
             }
-            return place > 0 && self.digit(place - 1) % 2 != 0;
+            return place > 0 && !self.digit(place - 1).is_multiple_of(2);
         }
         self.digit(place) >= 5
     }
@@ -584,9 +584,11 @@ pub fn exact_i32(value: f64) -> Option<i32> {
 /// The Number `parseInt` reads from the front of a string.
 ///
 /// Leading white space and an optional sign are admitted, then digits in the
-/// radix; anything after them is ignored, and a string with no digits at all is
-/// NaN. A radix of 16 admits the `0x` prefix, and so does a radix of zero,
-/// which the caller resolves to 16 or 10.
+/// radix; anything after them is ignored, and a string with no digits at all
+/// is NaN. A radix of sixteen admits the `0x` prefix, and so does a radix of
+/// zero, which is how a caller says none was given: it becomes sixteen behind
+/// that prefix and ten without one. An explicit ten is not zero, so
+/// `parseInt("0x1f", 10)` reads the leading zero and stops.
 pub fn parse_int_prefix(units: &[u16], radix: u32) -> f64 {
     let mut index = 0usize;
     while index < units.len() && crate::value::is_string_whitespace_unit(units[index]) {
@@ -598,7 +600,7 @@ pub fn parse_int_prefix(units: &[u16], radix: u32) -> f64 {
         index += 1;
     }
     let mut radix = radix;
-    if (radix == 16 || radix == 10)
+    if (radix == 16 || radix == 0)
         && index + 1 < units.len()
         && units[index] == u16::from(b'0')
         && (units[index + 1] == u16::from(b'x') || units[index + 1] == u16::from(b'X'))
@@ -606,12 +608,22 @@ pub fn parse_int_prefix(units: &[u16], radix: u32) -> f64 {
         radix = 16;
         index += 2;
     }
+    if radix == 0 {
+        radix = 10;
+    }
     if !(2..=36).contains(&radix) {
         return f64::NAN;
     }
+    // Digits are kept twice over, because the two exact paths want them as
+    // text and every other radix has no exact path to want them for.
+    // `extra` counts the digits past the buffer: they are far beyond what the
+    // format holds, so they move the value's scale and nothing else.
     let mut digits = [0u8; 128];
     let mut count = 0usize;
-    while index < units.len() && count < digits.len() {
+    let mut extra = 0i32;
+    let mut running = 0f64;
+    let mut any = false;
+    while index < units.len() {
         let unit = units[index];
         let digit = match unit {
             0x30..=0x39 => (unit - 0x30) as u32,
@@ -622,14 +634,39 @@ pub fn parse_int_prefix(units: &[u16], radix: u32) -> f64 {
         if digit >= radix {
             break;
         }
-        digits[count] = digit as u8 + if digit < 10 { b'0' } else { b'a' - 10 };
-        count += 1;
+        any = true;
+        running = running * f64::from(radix) + f64::from(digit);
+        if count < digits.len() {
+            digits[count] = digit as u8 + if digit < 10 { b'0' } else { b'a' - 10 };
+            count += 1;
+        } else {
+            extra = extra.saturating_add(1);
+        }
         index += 1;
     }
-    if count == 0 {
+    if !any {
         return f64::NAN;
     }
-    let value = radix_value(digits.get(..count).unwrap_or(&[]), radix);
+    let held = digits.get(..count).unwrap_or(&[]);
+    // Ten and the powers of two each have a helper that rounds the whole
+    // string at once rather than digit by digit, which is the difference
+    // between the nearest double and one a rounding error away from it.
+    let value = match radix {
+        10 => decimal_value(DecimalLiteral {
+            integer: held,
+            fraction: &[],
+            exponent: extra,
+        }),
+        2 | 8 | 16 => {
+            let held = radix_value(held, radix);
+            if extra == 0 {
+                held
+            } else {
+                held * power(f64::from(radix), f64::from(extra))
+            }
+        }
+        _ => running,
+    };
     if negative {
         -value
     } else {

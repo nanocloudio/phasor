@@ -51,12 +51,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 let radix = if id == native::PARSE_INT {
                     let value = arguments.get(1).copied().unwrap_or(Value::UNDEFINED);
                     let number = self.coerce_to_number(value)?;
-                    let radix = value::to_uint32(number);
-                    if radix == 0 {
-                        10
-                    } else {
-                        radix
-                    }
+                    // Zero stands for "no radix was given" all the way down:
+                    // only an absent radix admits a `0x` prefix, so resolving
+                    // it to ten here would make `parseInt("0x1f", 10)` read a
+                    // hexadecimal number a program asked to read as decimal.
+                    value::to_uint32(number)
                 } else {
                     10
                 };

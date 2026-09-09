@@ -13,6 +13,7 @@ scheduler:
 
 platform:
   cli: {}
+  net: {}
 
 modules:
   - name: phasor_shell
@@ -22,10 +23,23 @@ modules:
   - name: phasor_entropy
     params:
       width: bits53
+  - name: phasor_surface
   - name: phasor_store
   # The filesystem the shell can reach is the directory the graph runs in,
   # and nothing above it. Reading is granted; writing is not, until a
   # deployment says so.
+  # One endpoint, named here rather than by any program: a loopback HTTP
+  # server on port 8080. A deployment that wants another wires another
+  # adapter, and each is granted separately.
+  - name: phasor_net
+    params:
+      address: 2130706433
+      port: 8080
+      # What that endpoint is called. A program may write this in a URL and
+      # it travels as the request's authority; the address is where the
+      # stack goes. Without it the endpoint is its address and port, which
+      # is honest but is not a name a certificate or a virtual host knows.
+      authority: "localhost:8080"
   - name: phasor_fs
     params:
       writable: yes
@@ -47,10 +61,20 @@ wiring:
     to: phasor_entropy.request_in
   - from: phasor_entropy.reply_out
     to: phasor_shell.entropy_reply
+  - from: phasor_surface.source_out
+    to: phasor_shell.surface_in
   - from: phasor_shell.store_call
     to: phasor_store.request_in
   - from: phasor_store.reply_out
     to: phasor_shell.store_reply
+  - from: phasor_shell.net_call
+    to: phasor_net.request_in
+  - from: phasor_net.reply_out
+    to: phasor_shell.net_reply
+  - from: phasor_net.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: phasor_net.net_in
   - from: phasor_shell.fs_call
     to: phasor_fs.request_in
   - from: phasor_fs.reply_out

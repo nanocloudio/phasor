@@ -199,17 +199,6 @@ fn resolve(name: &[u8], out: &mut [u8; PATH_BYTES]) -> Option<usize> {
     Some(name.len())
 }
 
-/// A payload's fields: the name, and whatever follows it.
-fn split(payload: &[u8]) -> (&[u8], &[u8]) {
-    match payload.iter().position(|&byte| byte == 0) {
-        Some(at) => (
-            payload.get(..at).unwrap_or(&[]),
-            payload.get(at + 1..).unwrap_or(&[]),
-        ),
-        None => (payload, &[]),
-    }
-}
-
 /// Read digits, which is how a handle the engine resolved arrives.
 fn digits(text: &[u8]) -> Option<usize> {
     if text.is_empty() {
@@ -291,7 +280,24 @@ fn answer(
     ) {
         return refuse(record, Cause::Internal);
     }
-    let (name, rest) = split(held.get(..length).unwrap_or(&[]));
+    let mut parts: [&[u8]; 2] = [&[], &[]];
+    let taken = wire::fields(held.get(..length).unwrap_or(&[]), &mut parts);
+    // How many fields each method is: the shape of a call, checked rather
+    // than assumed. A call that does not have the fields its method takes is
+    // refused here instead of being read as though it did.
+    let shape = match record.binding {
+        METHOD_LIST => (0, 0),
+        METHOD_READ | METHOD_DELETE | METHOD_OPEN | METHOD_CLOSE | METHOD_SIZE => (1, 1),
+        // The length a read may answer with is the caller's to leave out.
+        METHOD_READ_AT => (1, 2),
+        METHOD_WRITE => (2, 2),
+        _ => (0, usize::MAX),
+    };
+    if taken < shape.0 || taken > shape.1 {
+        return refuse(record, Cause::Malformed);
+    }
+    let name = if taken > 0 { parts[0] } else { &[][..] };
+    let rest = if taken > 1 { parts[1] } else { &[][..] };
     let writes = matches!(record.binding, METHOD_WRITE | METHOD_DELETE);
     if writes && state.writable == 0 {
         return refuse(record, Cause::Denied);

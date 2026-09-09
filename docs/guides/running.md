@@ -64,6 +64,37 @@ phasor --grant fs -e 'fs.read("README.md").then(t => t.length)'
 phasor --grant fs -e 'fs.write("note.txt", "written by a program")'
 ```
 
+The network is one endpoint and the deployment names it, so `--grant net`
+brings `fetch` and `fetch` goes where the graph said:
+
+```sh
+phasor --grant net -e 'fetch("/hello.txt").then(r => r.text())'
+phasor --grant net -e 'fetch("/data.json").then(r => r.json()).then(v => v.n)'
+```
+
+`connect` takes no arguments because there is nothing for a program to
+choose, and a URL naming any other host is refused rather than sent to the
+one that was wired. Whether that endpoint is reached over TLS is the graph's
+to say and nothing a program can see: `examples/net/https.yaml` is the same
+shell with Fluxor's `tls` between the adapter and the socket.
+
+Without the grant there is no `net` and no `fetch` either: the surface
+defines it over the binding, so a program that was granted nothing finds
+nothing.
+
+A WebSocket is a request that changes protocol, so it needs the same
+connection and, because a client must mask what it sends, the randomness to
+mask with:
+
+```sh
+phasor --grant net --grant entropy -e '
+new Promise(done => {
+  const ws = new WebSocket("/chat");
+  ws.addEventListener("open", () => ws.send("hello"));
+  ws.addEventListener("message", e => { ws.close(); done(e.data); });
+})'
+```
+
 Granting the clock also brings timers, because being told later is what the
 clock's `sleep` is:
 
@@ -72,11 +103,12 @@ phasor --grant clock -e 'new Promise(r => setTimeout(() => r("later"), 50))'
 ```
 
 Before any of that, every session already has the standard surface —
-`console`, `TextEncoder`, `TextDecoder`, `btoa`, `atob`, `Event`,
-`EventTarget`, `AbortController`, `queueMicrotask`, `structuredClone`. It is
-JavaScript compiled and run in the realm ahead of your program, not engine
-code, and `--bare` leaves it out. `docs/reference/capability-register.md`
-lists every capability and how each is named.
+`console`, `TextEncoder`, `TextDecoder`, `btoa`, `atob`, `URL`,
+`URLSearchParams`, `Event`, `EventTarget`, `AbortController`,
+`queueMicrotask`, `structuredClone`. It is JavaScript compiled and run in the
+realm ahead of your program, not engine code, and `--bare` leaves it out.
+`docs/reference/capability-register.md` lists every capability and how each is
+named.
 
 The terminal is the program's: what the runtime says while the shell runs is
 filed per run and read back with `fluxor applet logs phasor`, and

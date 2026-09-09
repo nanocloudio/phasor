@@ -114,7 +114,7 @@ use string::Atoms;
 use value::{Handle, Value};
 use vm::{Completion, Frame, Progress, Vm};
 
-const CASE_COUNT: u16 = 12;
+const CASE_COUNT: u16 = 15;
 const FUEL: u32 = 400_000;
 const STEPS: u64 = 400_000;
 
@@ -349,6 +349,68 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             let mut second = first;
             second.finish(digest::digest(b"out"));
             !first.reproduces(&second) && !second.reproduces(&first)
+        }
+        // A completion is an event like any other: two runs that were
+        // answered differently are two different runs, and a recording that
+        // did not cover the answer could not say so.
+        12 => {
+            let mut first =
+                Recording::new(Profile::Observed, digest::digest(b"image"), &Policy::MODEST);
+            let mut second = first;
+            first.record(Event::Completion {
+                request: 1,
+                payload: digest::digest(b"yes"),
+            });
+            second.record(Event::Completion {
+                request: 1,
+                payload: digest::digest(b"no"),
+            });
+            first.finish(digest::digest(b"out"));
+            second.finish(digest::digest(b"out"));
+            !first.reproduces(&second)
+        }
+
+        // And the request it answered is part of it: the same bytes to a
+        // different call is not the same run.
+        13 => {
+            let mut first =
+                Recording::new(Profile::Observed, digest::digest(b"image"), &Policy::MODEST);
+            let mut second = first;
+            let answer = digest::digest(b"same");
+            first.record(Event::Completion {
+                request: 1,
+                payload: answer,
+            });
+            second.record(Event::Completion {
+                request: 2,
+                payload: answer,
+            });
+            first.finish(digest::digest(b"out"));
+            second.finish(digest::digest(b"out"));
+            let mut third =
+                Recording::new(Profile::Observed, digest::digest(b"image"), &Policy::MODEST);
+            third.record(Event::Completion {
+                request: 1,
+                payload: answer,
+            });
+            third.finish(digest::digest(b"out"));
+            !first.reproduces(&second) && first.reproduces(&third)
+        }
+
+        // A completion and a time are not the same event, even where the
+        // numbers in them line up.
+        14 => {
+            let mut first =
+                Recording::new(Profile::Observed, digest::digest(b"image"), &Policy::MODEST);
+            let mut second = first;
+            first.record(Event::Completion {
+                request: 0,
+                payload: digest::digest(b""),
+            });
+            second.record(Event::Time(0));
+            first.finish(digest::digest(b"out"));
+            second.finish(digest::digest(b"out"));
+            !first.reproduces(&second)
         }
         _ => true,
     }

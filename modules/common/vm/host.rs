@@ -184,17 +184,28 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             .as_deref()
             .and_then(|bindings| bindings.binding_of(record.request))
             .unwrap_or(u32::MAX);
-        let value = match record.disposition {
+        // A completion the program cannot be given is still a completion. If
+        // the answer cannot be built — the heap is spent, most often, because
+        // the payload is large — the call settles as rejected rather than
+        // returning here. Returning strands it: the pending slot stays live,
+        // the count of calls in flight never comes down, and the promise a
+        // program is holding never settles at all. A refusal it can catch is
+        // the lesser of the two, and the only one it can act on.
+        let (disposition, value) = match record.disposition {
             Disposition::Fulfilled => match self.answered_value(record, payload) {
-                Ok(value) => value,
-                Err(_) => return Err(CallError::SchemaMismatch),
+                Ok(value) => (Disposition::Fulfilled, value),
+                Err(_) => (
+                    Disposition::Rejected,
+                    self.create_cause_error(Cause::Internal)
+                        .unwrap_or(Value::UNDEFINED),
+                ),
             },
             Disposition::Rejected => match self.create_cause_error(record.cause) {
-                Ok(value) => value,
-                Err(_) => Value::UNDEFINED,
+                Ok(value) => (Disposition::Rejected, value),
+                Err(_) => (Disposition::Rejected, Value::UNDEFINED),
             },
         };
-        self.complete_call(record.request, record.disposition, value)
+        self.complete_call(record.request, disposition, value)
     }
 
     /// The value a fulfilled completion settles with: nothing, a number, the
@@ -214,7 +225,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             Answer::Number(number) => Ok(Value::number(number)),
             Answer::Payload(length) => {
                 let bytes = payload.get(..length as usize).unwrap_or(&[]);
-                self.utf8_string(bytes)
+                self.payload_string(bytes)
             }
             Answer::Resource(token) => {
                 // The provider's own identifier never reaches the program:
@@ -235,51 +246,42 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// A string cell from UTF-8 bytes, which is how a payload reaches a
     /// program. Malformed bytes are not a program error: the provider's
     /// answer is its own, and the replacement character says what arrived.
-    pub(super) fn utf8_string(&mut self, bytes: &[u8]) -> Result<Value, Completion> {
-        let mut units = [0u16; 512];
+    pub(super) fn payload_string(&mut self, bytes: &[u8]) -> Result<Value, Completion> {
+        // One byte, one unit. A payload is bytes, and the string a program
+        // receives is those bytes exactly — not a reading of them. Decoding
+        // as UTF-8 here would replace every byte that is not valid UTF-8
+        // with U+FFFD and lose what arrived, so a program could not read a
+        // file, a stored value, or a response body that is not text.
+        //
+        // Text is recovered by decoding, which the surface does with
+        // TextDecoder, and the bytes survive for everything that is not
+        // text. `charCodeAt` gives a byte back, which is the convention
+        // btoa and atob already use.
+        const BLOCK: usize = 512;
+        let mut units = [0u16; BLOCK];
         let mut count = 0usize;
-        let mut at = 0usize;
-        while at < bytes.len() && count + 2 <= units.len() {
-            let first = bytes[at];
-            let (code_point, width) = if first < 0x80 {
-                (u32::from(first), 1)
-            } else if first & 0xE0 == 0xC0 && at + 1 < bytes.len() {
-                (
-                    (u32::from(first & 0x1F) << 6) | u32::from(bytes[at + 1] & 0x3F),
-                    2,
-                )
-            } else if first & 0xF0 == 0xE0 && at + 2 < bytes.len() {
-                (
-                    (u32::from(first & 0x0F) << 12)
-                        | (u32::from(bytes[at + 1] & 0x3F) << 6)
-                        | u32::from(bytes[at + 2] & 0x3F),
-                    3,
-                )
-            } else if first & 0xF8 == 0xF0 && at + 3 < bytes.len() {
-                (
-                    (u32::from(first & 0x07) << 18)
-                        | (u32::from(bytes[at + 1] & 0x3F) << 12)
-                        | (u32::from(bytes[at + 2] & 0x3F) << 6)
-                        | u32::from(bytes[at + 3] & 0x3F),
-                    4,
-                )
-            } else {
-                (0xFFFD, 1)
-            };
-            at += width;
-            if code_point >= 0x1_0000 {
-                let offset = code_point - 0x1_0000;
-                units[count] = u16::try_from(0xD800 + (offset >> 10)).unwrap_or(0xFFFD);
-                units[count + 1] = u16::try_from(0xDC00 + (offset & 0x3FF)).unwrap_or(0xFFFD);
-                count += 2;
-            } else {
-                units[count] = u16::try_from(code_point).unwrap_or(0xFFFD);
-                count += 1;
+        let mut joined: Option<Handle> = None;
+        for &byte in bytes {
+            units[count] = u16::from(byte);
+            count += 1;
+            if count == BLOCK {
+                joined = Some(self.join_units(joined, units.get(..count).unwrap_or(&[]))?);
+                count = 0;
             }
         }
-        let handle = string::create(self.heap, units.get(..count).unwrap_or(&[]))
-            .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        let handle = self.join_units(joined, units.get(..count).unwrap_or(&[]))?;
         Ok(Value::string(handle))
+    }
+
+    /// Append a block of units to what has been decoded so far.
+    fn join_units(&mut self, left: Option<Handle>, units: &[u16]) -> Result<Handle, Completion> {
+        let block = string::create(self.heap, units).map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        match left {
+            None => Ok(block),
+            Some(held) => {
+                string::concat(self.heap, held, block).map_err(|_| Completion::HEAP_EXHAUSTED)
+            }
+        }
     }
 
     /// The error a rejected completion settles with: an ordinary error object
@@ -925,9 +927,28 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         binding: u32,
         arguments: &[Value],
     ) -> Result<(u32, crate::digest::Digest), Completion> {
+        // Arguments are length-prefixed, not separated. A separator has to be
+        // a byte that cannot occur in a field, and no such byte exists here:
+        // a JavaScript string may hold U+0000 and a byte argument may hold
+        // 0x00, so a reader splitting on one would take a field the caller
+        // did not write. The frame is
+        //
+        //     count: u16 LE, then for each argument: length: u32 LE, bytes
+        //
+        // which says where every field ends without reserving any value.
         let mut hasher = crate::digest::Hasher::new();
-        let mut at = self.payload_length;
-        for (position, &argument) in arguments.iter().enumerate() {
+        let start = self.payload_length;
+        let mut at = start;
+        // A call with no arguments carries no payload at all, rather than a
+        // frame saying so. A provider that takes fixed-size records and never
+        // reads a payload would otherwise find two bytes of one behind every
+        // call, and read the next record from the wrong place.
+        if arguments.is_empty() {
+            return Ok((0, hasher.finish()));
+        }
+        let count = u16::try_from(arguments.len()).map_err(|_| Completion::QUOTA_EXCEEDED)?;
+        self.put_staged(&mut at, &mut hasher, &count.to_le_bytes())?;
+        for &argument in arguments {
             // A number that resolves as one of this binding's handles crosses
             // as the provider's own identifier for the resource. A forged,
             // stale, or another binding's handle resolves to nothing, and the
@@ -937,58 +958,88 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 Some(token) => Value::number(token as f64),
                 None => argument,
             };
+            // Bytes a program already holds cross as themselves. Anything
+            // else is the text it reads as, in UTF-8.
+            if let Some((cells, start, span)) = self.view_bytes(argument)? {
+                self.put_staged(&mut at, &mut hasher, &span.to_le_bytes())?;
+                let mut index = 0u32;
+                while index < span {
+                    let held = self.element(cells, start + index)?;
+                    let byte =
+                        [u8::try_from(value::to_uint32(held.as_number()) & 0xFF).unwrap_or(0)];
+                    self.put_staged(&mut at, &mut hasher, &byte)?;
+                    index += 1;
+                }
+                continue;
+            }
+            // A string is its bytes, one unit one byte, which is the same
+            // convention the answer arrives under and the one btoa and atob
+            // already use. A unit above a byte is not a byte: it is refused
+            // rather than truncated or re-encoded behind the program's back,
+            // because either would put different bytes on the wire than the
+            // ones it is holding. Text above Latin-1 is encoded by the
+            // surface, which is where knowing it is text belongs.
             let text = self.coerce_to_string(argument)?;
             let handle = text.as_handle();
-            let length = string::length(self.heap, handle).map_err(|_| Completion::MALFORMED)?;
-            if position > 0 {
-                hasher.update(&[0]);
-                if let Some(out) = self.payload_out.as_deref_mut() {
-                    match out.get_mut(at) {
-                        Some(slot) => *slot = 0,
-                        None => return Err(Completion::QUOTA_EXCEEDED),
-                    }
-                    at += 1;
-                }
-            }
+            let units = string::length(self.heap, handle).map_err(|_| Completion::MALFORMED)?;
+            self.put_staged(&mut at, &mut hasher, &units.to_le_bytes())?;
             let mut index = 0u32;
-            while index < length {
+            while index < units {
                 let unit = string::unit_at(self.heap, handle, index)
                     .map_err(|_| Completion::MALFORMED)?
                     .unwrap_or(0);
-                // A payload is bytes: the text crosses as UTF-8, and a unit
-                // above the Latin-1 range takes the bytes it needs.
-                let mut encoded = [0u8; 3];
-                let width = if unit < 0x80 {
-                    encoded[0] = u8::try_from(unit).unwrap_or(b'?');
-                    1
-                } else if unit < 0x800 {
-                    encoded[0] = 0xC0 | u8::try_from(unit >> 6).unwrap_or(0);
-                    encoded[1] = 0x80 | u8::try_from(unit & 0x3F).unwrap_or(0);
-                    2
-                } else {
-                    encoded[0] = 0xE0 | u8::try_from(unit >> 12).unwrap_or(0);
-                    encoded[1] = 0x80 | u8::try_from((unit >> 6) & 0x3F).unwrap_or(0);
-                    encoded[2] = 0x80 | u8::try_from(unit & 0x3F).unwrap_or(0);
-                    3
+                let Ok(byte) = u8::try_from(unit) else {
+                    return Err(Completion::MALFORMED);
                 };
-                // The digest covers the bytes whether or not a buffer holds
-                // them: a host that stages no payload still carries what the
-                // call said, and one that does carries both.
-                hasher.update(encoded.get(..width).unwrap_or(&[]));
-                if let Some(out) = self.payload_out.as_deref_mut() {
-                    let Some(slot) = out.get_mut(at..at + width) else {
-                        return Err(Completion::QUOTA_EXCEEDED);
-                    };
-                    slot.copy_from_slice(encoded.get(..width).unwrap_or(&[]));
-                    at += width;
-                }
+                self.put_staged(&mut at, &mut hasher, &[byte])?;
                 index += 1;
             }
         }
-        let staged = at - self.payload_length;
+        let staged = at - start;
         self.payload_length = at;
         let length = u32::try_from(staged).map_err(|_| Completion::QUOTA_EXCEEDED)?;
         Ok((length, hasher.finish()))
+    }
+
+    /// The byte cells a typed array views, where the argument is one: the
+    /// array holding them, where this view starts, and how far it runs.
+    ///
+    /// A value that is not a view is not an error here — it is text, and the
+    /// caller reads it as text.
+    fn view_bytes(&mut self, value: Value) -> Result<Option<(Value, u32, u32)>, Completion> {
+        if !value.is_object()
+            || object::exotic_kind(self.heap, value.as_handle()).unwrap_or(0)
+                != object::exotic::TYPED_ARRAY
+        {
+            return Ok(None);
+        }
+        let Some(count) = self.typed_array_length(value)? else {
+            return Ok(Some((Value::UNDEFINED, 0, 0)));
+        };
+        let (buffer, kind, offset, _) = self.typed_array_parts(value)?;
+        let cells = self.array_buffer_bytes(buffer)?;
+        let span = count.saturating_mul(crate::realm::typed_array_element_size(kind));
+        Ok(Some((cells, offset, span)))
+    }
+
+    /// Put bytes into the staging buffer, and into the digest whether or not
+    /// a buffer holds them: a host that stages no payload still carries what
+    /// the call said, and one that does carries both.
+    fn put_staged(
+        &mut self,
+        at: &mut usize,
+        hasher: &mut crate::digest::Hasher,
+        bytes: &[u8],
+    ) -> Result<(), Completion> {
+        hasher.update(bytes);
+        if let Some(out) = self.payload_out.as_deref_mut() {
+            let Some(slot) = out.get_mut(*at..*at + bytes.len()) else {
+                return Err(Completion::QUOTA_EXCEEDED);
+            };
+            slot.copy_from_slice(bytes);
+            *at += bytes.len();
+        }
+        Ok(())
     }
 
     /// The provider's identifier for a handle a program passed, when the

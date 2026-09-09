@@ -1,6 +1,10 @@
 # Phasor's production sources are PIC module sources compiled directly rather
-# than through a root Cargo workspace.
-msrv = "1.81"
+# than through a root Cargo workspace, so `fluxor ci` clippies them with
+# `clippy-driver`, which reads THIS file for the MSRV. The Fluxor SDK the
+# modules mount uses `u64::is_multiple_of` (stable 1.87) and
+# `Option::is_none_or` (stable 1.82), so the modules are past the 1.81 floor
+# in ../standards/lints.md §0.
+msrv = "1.87"
 
 disallowed-macros = [
     { path = "std::println", reason = "production modules are no_std and emit through Fluxor observability" },

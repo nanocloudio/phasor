@@ -42,7 +42,9 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use binding::{Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
+use binding::{
+    Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME,
+};
 
 /// How wide a seed one call answers with.
 const WIDTH_32: u8 = 0;

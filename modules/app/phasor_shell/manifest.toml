@@ -53,6 +53,23 @@ direction    = "input"
 content_type = "OctetStream"
 buffer_size  = 32768
 
+# The standard surface's source, from the module that holds it. A graph that
+# wires nothing here runs programs against the bare realm.
+[[ports]]
+name         = "surface_in"
+index        = 6
+direction    = "input"
+content_type = "TextPlain"
+buffer_size  = 65536
+
+# Completion frames from the network adapter, each followed by its bytes.
+[[ports]]
+name         = "net_reply"
+index        = 7
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
 # Values, printed lines, prompts, and failures in words.
 [[ports]]
 name         = "stdout"
@@ -98,6 +115,14 @@ index        = 5
 direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 32768
+
+# Call frames for the network binding, each followed by its payload.
+[[ports]]
+name         = "net_call"
+index        = 6
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
 
 [observability]
 exempt = "run-to-completion applet whose evidence is the text it writes and its exit status"

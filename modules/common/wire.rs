@@ -221,3 +221,42 @@ pub fn has_input(sys: &SyscallTable, port: i32) -> bool {
 pub unsafe fn params_are_tlv(params: *const u8, len: usize, magic: u8, version: u8) -> bool {
     !params.is_null() && len >= 4 && *params == magic && *params.add(1) == version
 }
+
+/// The fields of a call's payload, which are length-prefixed rather than
+/// separated.
+///
+/// A separator has to be a byte that cannot occur inside a field, and a call
+/// carries both text that may hold U+0000 and bytes that may hold 0x00, so no
+/// such byte exists. The frame states every length instead:
+///
+/// ```text
+/// count: u16 LE, then for each field: length: u32 LE, bytes
+/// ```
+///
+/// Answers how many fields were written into `out`, which is none when the
+/// frame is malformed — a reader takes what the frame describes or nothing,
+/// never a prefix it guessed at.
+pub fn fields<'a>(payload: &'a [u8], out: &mut [&'a [u8]]) -> usize {
+    let Some(head) = payload.get(..2) else {
+        return 0;
+    };
+    let count = usize::from(u16::from_le_bytes([head[0], head[1]]));
+    let mut at = 2usize;
+    let mut taken = 0usize;
+    while taken < count {
+        let Some(header) = payload.get(at..at + 4) else {
+            return 0;
+        };
+        let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        at += 4;
+        let Some(bytes) = payload.get(at..at + length) else {
+            return 0;
+        };
+        at += length;
+        if let Some(slot) = out.get_mut(taken) {
+            *slot = bytes;
+        }
+        taken += 1;
+    }
+    taken.min(out.len())
+}

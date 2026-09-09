@@ -36,7 +36,9 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use binding::{Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
+use binding::{
+    Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME,
+};
 
 /// Answers this adapter can give.
 const MODE_ANSWER: u8 = 0;

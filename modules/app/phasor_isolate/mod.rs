@@ -209,12 +209,11 @@ fn attachments<'a>(
     }
 }
 
-/// The bindings this isolate admits, by the digest of each name and schema.
+/// The bindings this isolate admits, by the digest of each name.
 /// What answers one, and where that is, the isolate never learns.
 fn admitted_bindings() -> [Binding; 1] {
     [Binding {
         name: digest::digest(b"host"),
-        schema: digest::digest(b"number->number"),
         in_flight_max: IN_FLIGHT_MAX,
         in_flight: 0,
         class: binding::Class::Async,

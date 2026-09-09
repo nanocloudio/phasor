@@ -1,7 +1,7 @@
 //! Host bindings: the typed seam between a program and a capability.
 //!
 //! A program reaches the outside only through a binding the deployment
-//! admitted. A binding names what it is, what schema its payloads follow, and
+//! admitted. A binding names what it is, how it is served, and
 //! how many calls may be outstanding at once. The engine holds no provider
 //! address, no credential, and no transport: it produces a call record and
 //! consumes a completion record, and something else moves them.
@@ -56,8 +56,6 @@ pub struct Binding {
     /// The digest of the binding's name, which is what an image states it
     /// requires and what a deployment grants.
     pub name: Digest,
-    /// The digest of the payload schema both ends check.
-    pub schema: Digest,
     /// Calls that may be outstanding on this binding at once.
     pub in_flight_max: u32,
     /// Calls outstanding now.
@@ -71,7 +69,6 @@ pub struct Binding {
 impl Binding {
     pub const EMPTY: Self = Self {
         name: Digest([0; 32]),
-        schema: Digest([0; 32]),
         in_flight_max: 0,
         in_flight: 0,
         class: Class::Async,
@@ -90,8 +87,10 @@ pub enum CallError {
     PendingFull,
     /// No pending call has that request identifier, or its generation is stale.
     UnknownRequest,
-    /// The completion's payload does not match the binding's schema.
-    SchemaMismatch,
+    /// The binding is not served the way the caller is treating it: a value
+    /// supplied at the task boundary belongs to a snapshot, and a binding
+    /// answered over a channel is not one.
+    ClassMismatch,
     /// The handle names no live resource of this binding, or its generation
     /// is stale.
     StaleHandle,
@@ -161,7 +160,9 @@ pub enum Cause {
     Unavailable = 2,
     /// The provider took too long.
     Timeout = 3,
-    /// The payload did not match the binding's schema.
+    /// The call did not have the fields the member takes, or a field did not
+    /// hold what it must. A provider checks the shape of what it is given
+    /// rather than reading it as though it were right.
     Malformed = 4,
     /// The provider failed for its own reasons.
     Internal = 5,
@@ -456,7 +457,7 @@ impl<'a> Bindings<'a> {
             .get_mut(index as usize)
             .ok_or(CallError::NotAdmitted)?;
         if slot.class != Class::Snapshot {
-            return Err(CallError::SchemaMismatch);
+            return Err(CallError::ClassMismatch);
         }
         slot.snapshot = value;
         Ok(())

@@ -57,8 +57,6 @@ mod emit;
 mod env;
 #[path = "../../common/evalsite.rs"]
 mod evalsite;
-#[path = "../../common/facade.rs"]
-mod facade;
 #[path = "../../common/feature.rs"]
 mod feature;
 #[path = "../../common/gc.rs"]
@@ -148,6 +146,8 @@ const PRINT_CAPACITY: usize = 64 * 1024;
 
 /// A script, or the REPL's lines gathered until they parse.
 const SOURCE_CAPACITY: usize = 1024 * 1024;
+/// The standard surface's source, as the surface module writes it.
+const SURFACE_CAPACITY: usize = 128 * 1024;
 const LINE_STARTS: usize = 16384;
 const NODE_CAPACITY: usize = 131072;
 const LIST_CAPACITY: usize = 131072;
@@ -213,7 +213,7 @@ const TRACE: u64 = 0x5041_5348_4f52_0002;
 /// The interfaces a person may grant. Each is a port pair on this module and
 /// an adapter the graph wires to it, and each carries members: the bindings
 /// the deployment admits, one per operation the interface offers.
-const MAX_GRANTS: usize = 4;
+const MAX_GRANTS: usize = 5;
 /// Bindings across every granted interface.
 const MAX_BINDINGS: usize = 16;
 /// Members one interface may carry.
@@ -222,6 +222,7 @@ const GRANT_CLOCK: u8 = 1;
 const GRANT_ENTROPY: u8 = 2;
 const GRANT_STORE: u8 = 3;
 const GRANT_FS: u8 = 4;
+const GRANT_NET: u8 = 5;
 const PENDING_COUNT: usize = 16;
 const IN_FLIGHT_MAX: u32 = 8;
 /// Resources a program may hold open at once.
@@ -284,6 +285,14 @@ fn members(kind: u8) -> ([Member; MAX_MEMBERS], usize) {
             out[0] = Member::new(*b"random\0\0", 6, binding::Class::Async, 0);
             1
         }
+        GRANT_NET => {
+            out[0] = Member::new(*b"connect\0", 7, binding::Class::Async, 0);
+            out[1] = Member::new(*b"send\0\0\0\0", 4, binding::Class::Async, 1);
+            out[2] = Member::new(*b"receive\0", 7, binding::Class::Async, 2);
+            out[3] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 3);
+            out[4] = Member::new(*b"endpoint", 8, binding::Class::Async, 4);
+            5
+        }
         GRANT_FS => {
             out[0] = Member::new(*b"read\0\0\0\0", 4, binding::Class::Async, 0);
             out[1] = Member::new(*b"write\0\0\0", 5, binding::Class::Async, 1);
@@ -331,8 +340,9 @@ options:\n\
   --grant entropy        admit entropy.random(): a promise of a random number\n\
   --grant store          admit store.read/write/list/delete/open/readAt\n\
   --grant fs             admit fs.read/write/open/readAt/close/size\n\
+  --grant net            admit net.connect/send/receive/close/endpoint\n\
   --steps <n>            instructions one input may run, up to the ceiling\n\
-  --bare                 leave out the standard surface: no console, no URL\n\
+  --bare                 leave out the standard surface the graph offers\n\
 \n\
 The value of the last expression is printed; print(x) writes a line.\n\
 Nothing is ambient: a program has only what was granted.\n";
@@ -373,11 +383,14 @@ struct State {
     entropy_reply: i32,
     store_reply: i32,
     fs_reply: i32,
+    net_reply: i32,
+    surface_in: i32,
     exit_out: i32,
     clock_call: i32,
     entropy_call: i32,
     store_call: i32,
     fs_call: i32,
+    net_call: i32,
 
     mode: u8,
     phase: u8,
@@ -396,6 +409,13 @@ struct State {
     /// Whether the façade has been compiled and run in this session's realm.
     /// It runs once, before anything a person typed.
     facade_done: bool,
+    /// The surface's source, as the module that holds it wrote it, and how
+    /// much has arrived. A graph that wires no surface has no façade, which
+    /// is the same as asking for none.
+    surface: [u8; SURFACE_CAPACITY],
+    surface_length: usize,
+    surface_overflowed: bool,
+    surface_ready: bool,
     /// Whether the session runs without the façade at all.
     bare: bool,
     /// Whether the task in progress is the façade rather than a person's
@@ -742,7 +762,7 @@ fn read_argv(state: &mut State) -> Parsed {
                 let Some(kind) = next.and_then(grant_of) else {
                     emit(
                         &mut state.out,
-                        b"phasor: --grant takes clock, entropy, store, or fs\n",
+                        b"phasor: --grant takes clock, entropy, store, fs, or net\n",
                     );
                     return Parsed::Refused;
                 };
@@ -809,6 +829,7 @@ fn interface_id(kind: u8) -> ([u8; 32], usize) {
         GRANT_CLOCK => (*b"wasi:clocks/wall-clock\0\0\0\0\0\0\0\0\0\0", 22),
         GRANT_ENTROPY => (*b"wasi:random/random\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 18),
         GRANT_FS => (*b"wasi:filesystem/types\0\0\0\0\0\0\0\0\0\0\0", 21),
+        GRANT_NET => (*b"wasi:sockets/tcp\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16),
         GRANT_STORE => (*b"phasor:store/keyvalue\0\0\0\0\0\0\0\0\0\0\0", 21),
         _ => ([0; 32], 0),
     }
@@ -823,6 +844,7 @@ fn grant_name(kind: u8) -> ([u8; 8], usize) {
         GRANT_ENTROPY => (*b"entropy\0", 7),
         GRANT_STORE => (*b"store\0\0\0", 5),
         GRANT_FS => (*b"fs\0\0\0\0\0\0", 2),
+        GRANT_NET => (*b"net\0\0\0\0\0", 3),
         _ => ([0; 8], 0),
     }
 }
@@ -834,19 +856,8 @@ fn grant_of(word: &[u8]) -> Option<u8> {
         b"entropy" => Some(GRANT_ENTROPY),
         b"store" => Some(GRANT_STORE),
         b"fs" => Some(GRANT_FS),
+        b"net" => Some(GRANT_NET),
         _ => None,
-    }
-}
-
-/// The schema an interface's payloads follow, which both ends check by
-/// digest. Held inline for the same reason the name is.
-fn grant_schema(kind: u8) -> ([u8; 32], usize) {
-    match kind {
-        GRANT_CLOCK => (*b"()->number:milliseconds\0\0\0\0\0\0\0\0\0", 23),
-        GRANT_ENTROPY => (*b"()->number:random\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 17),
-        GRANT_STORE => (*b"(key,value?)->bytes|number\0\0\0\0\0\0", 26),
-        GRANT_FS => (*b"(name,bytes?)->bytes|number\0\0\0\0\0", 27),
-        _ => ([0; 32], 0),
     }
 }
 
@@ -1146,8 +1157,6 @@ fn advance(state: &mut State) -> Advance {
                 break;
             };
             let mut name = [0u8; 64];
-            let (schema, schema_length) = grant_schema(kind);
-            let schema_digest = digest::digest(schema.get(..schema_length).unwrap_or(&[]));
             // The binding's identity is the interface's identifier and the
             // member's name, which is what both ends agree on.
             let (id, id_length) = interface_id(kind);
@@ -1156,7 +1165,6 @@ fn advance(state: &mut State) -> Advance {
             at += text::put_ascii(name.get_mut(at..).unwrap_or(&mut []), member.name());
             *slot = Binding {
                 name: digest::digest(name.get(..at).unwrap_or(&[])),
-                schema: schema_digest,
                 in_flight_max: IN_FLIGHT_MAX,
                 in_flight: 0,
                 class: member.class,
@@ -1535,12 +1543,12 @@ fn start_input(state: &mut State) -> bool {
 // ---------------------------------------------------------- the ports
 
 /// The wire an interface's calls leave on, by the grant's position.
-fn wire_of<'w>(
-    wires: &'w mut [GrantWire; MAX_GRANTS],
+fn wire_of(
+    wires: &mut [GrantWire; MAX_GRANTS],
     grants: [u8; MAX_GRANTS],
     grant_count: usize,
     kind: u8,
-) -> Option<&'w mut GrantWire> {
+) -> Option<&mut GrantWire> {
     let mut grant = 0usize;
     while grant < grant_count {
         if grants.get(grant).copied() == Some(kind) {
@@ -1558,6 +1566,7 @@ fn ports_of(state: &State, kind: u8) -> (i32, i32) {
         GRANT_ENTROPY => (state.entropy_call, state.entropy_reply),
         GRANT_STORE => (state.store_call, state.store_reply),
         GRANT_FS => (state.fs_call, state.fs_reply),
+        GRANT_NET => (state.net_call, state.net_reply),
         _ => (-1, -1),
     }
 }
@@ -1850,8 +1859,23 @@ fn repl_idle(state: &mut State, syscalls: &SyscallTable) {
 entry! {
     State;
     primary { args_in, stdout_out }
-    inputs { stdin_in = 1, clock_reply = 2, entropy_reply = 3, store_reply = 4, fs_reply = 5 }
-    outputs { exit_out = 1, clock_call = 2, entropy_call = 3, store_call = 4, fs_call = 5 }
+    inputs {
+        stdin_in = 1,
+        clock_reply = 2,
+        entropy_reply = 3,
+        store_reply = 4,
+        fs_reply = 5,
+        surface_in = 6,
+        net_reply = 7,
+    }
+    outputs {
+        exit_out = 1,
+        clock_call = 2,
+        entropy_call = 3,
+        store_call = 4,
+        fs_call = 5,
+        net_call = 6,
+    }
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -1934,10 +1958,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // typed, as a program like any other: compiled by the same front end,
         // verified, and run under the same bounds.
         if !state.facade_done && !state.bare && !state.task_running {
+            // The surface arrives from the module that holds it, whole, ended
+            // by a hang-up. A graph that wired none has no façade at all,
+            // which is what asking for none looks like.
+            if state.surface_in < 0 {
+                state.facade_done = true;
+                return 0;
+            }
+            if !state.surface_ready {
+                let staged = wire::stage_stream(
+                    syscalls,
+                    state.surface_in,
+                    &mut state.surface,
+                    &mut state.surface_length,
+                    &mut state.surface_overflowed,
+                );
+                if staged != wire::Staged::Complete {
+                    return 0;
+                }
+                state.surface_ready = true;
+                if state.surface_overflowed {
+                    emit(&mut state.out, b"phasor: surface too large\n");
+                    state.failed = true;
+                    state.phase = PHASE_FINISH;
+                    return 0;
+                }
+            }
             state.facade_done = true;
-            // The façade compiles from its own source, so whatever a person
-            // gave on the command line is still waiting in the buffer.
-            match compile_bytes(state, facade::SOURCE) {
+            if state.surface_length == 0 {
+                return 0;
+            }
+            // SAFETY: the surface is staged and never written while the front
+            // end runs, and the front end's storage is every other field.
+            let source: &[u8] = unsafe {
+                core::slice::from_raw_parts(state.surface.as_ptr(), state.surface_length)
+            };
+            match compile_bytes(state, source) {
                 Ok(unit) => {
                     state.running_facade = true;
                     begin_task(state, unit);

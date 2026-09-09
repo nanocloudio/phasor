@@ -39,7 +39,9 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use binding::{Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME};
+use binding::{
+    Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME,
+};
 
 /// Bindings this router admits. A call on any other index is refused here.
 const ADMITTED: u32 = 1;

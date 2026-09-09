@@ -18,8 +18,10 @@ binary records with explicit lengths and checked offsets.
 | `phasor_entropy` | Adapter | `request_in` | `reply_out` | A random number from the platform's own source, 32 or 53 bits wide as the `width` parameter says, under a `quota` |
 | `phasor_store` | Adapter | `request_in` | `reply_out` | A bounded object store: keys and values a program put there and nothing else. Answers with bytes behind the frame, and with handles for `open`. Bounded by `capacity` bytes and a call `quota` |
 | `phasor_fs` | Adapter | `request_in` | `reply_out` | Files under the directory the graph runs in, and nothing above it: an absolute name or one that climbs is refused before anything is opened. Reading and writing are separate bindings, and `writable` gates writing in the adapter itself. Declares the Fluxor `fs` contract in its manifest |
+| `phasor_net` | Adapter | `request_in`, `net_in` | `reply_out`, `net_out` | One TCP endpoint, fixed by the `address` and `port` its parameters name and called by the `authority` they may add: `connect` takes nothing, because there is nothing for a program to choose. Answers with a handle, carries bytes both ways behind the frame, and holds a read until the connection has some. Speaks Fluxor's stream protocol, to the socket or to `tls`, under a call `quota` |
+| `phasor_surface` | Transformer | | `source_out` | The standard surface as source: written once, then a hang-up. A host that runs scripts reads it here instead of carrying it, so the surface grows to this module's room rather than the host's |
 | `phasor_eval` | Transformer | `source_in` | `result_out`, `exit` | The bounded expression evaluator, kept as the smallest end-to-end path |
-| `phasor_shell` | Cli | `args`, `stdin`, `clock_reply`, `entropy_reply`, `store_reply` | `stdout`, `exit`, `clock_call`, `entropy_call`, `store_call` | The shell: a script, `-e`, or a REPL over one realm, each input a bounded task; `--grant clock`, `--grant entropy`, and `--grant store` admit the interfaces its graph wires to the adapters, each as a namespace of members; `--steps` sets the fuel. Installed as the `phasor` applet from `packaging/cli/` |
+| `phasor_shell` | Cli | `args`, `stdin`, `surface_in`, `clock_reply`, `entropy_reply`, `store_reply`, `fs_reply`, `net_reply` | `stdout`, `exit`, `clock_call`, `entropy_call`, `store_call`, `fs_call`, `net_call` | The shell: a script, `-e`, or a REPL over one realm, each input a bounded task. It reads the standard surface from `surface_in` and compiles it ahead of the program, or leaves it out under `--bare`. A `--grant` admits one of the interfaces its graph wires to the adapters, each as a namespace of members, and `--steps` sets the fuel. Installed as the `phasor` applet from `packaging/cli/` |
 
 A source stream ending in a hang-up is one source; an image stream ending in a
 hang-up is one image. Nothing carries a length prefix it could lie about, and
@@ -76,6 +78,7 @@ Every fmod's work is bounded per step and its state carries the rest.
 | `phasor_cli` | bytes of result and of rendered text |
 | `phasor_store` | entries, bytes per key and per value, bytes in the whole store, calls answered |
 | `phasor_fs` | files open at once, bytes per read, name length, calls answered |
+| `phasor_net` | connections open at once, bytes per send and per read, reads held, calls answered |
 | `phasor_shell` | `--steps` a program may run, clamped to the ceiling; instructions per slice, jobs per slice, collection slice, calls in flight, units a session may make, and what `print` may write between steps, all compiled in |
 
 No step loops until a variable-sized input is exhausted. The isolate rebuilds

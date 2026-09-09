@@ -610,7 +610,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// Whether a deferred namespace's module has already run to its end.
     pub(super) fn deferred_done(&self, target: Value) -> bool {
         self.module_of_deferred(target)
-            .map_or(true, |module| self.module_status(module) >= 2)
+            .is_none_or(|module| self.module_status(module) >= 2)
     }
 
     /// Run just a module's instantiation: its bindings exist afterwards,

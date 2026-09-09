@@ -246,7 +246,6 @@ fn with_binding(
     let mut bindings = Bindings::new(&mut storage.descriptors, &mut storage.pending_calls);
     let admitted = bindings.admit(Binding {
         name: digest::digest(name),
-        schema: digest::digest(b"schema"),
         in_flight_max,
         in_flight: 0,
         class: binding::Class::Async,
@@ -328,7 +327,6 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             let mut bindings = Bindings::new(&mut descriptors, &mut pending);
             let index = bindings.admit(Binding {
                 name: digest::digest(b"clock"),
-                schema: digest::digest(b"s"),
                 in_flight_max: 1,
                 in_flight: 0,
                 class: binding::Class::Async,
@@ -348,7 +346,6 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             let mut bindings = Bindings::new(&mut descriptors, &mut pending);
             let Ok(index) = bindings.admit(Binding {
                 name: digest::digest(b"clock"),
-                schema: digest::digest(b"s"),
                 in_flight_max: 2,
                 in_flight: 0,
                 class: binding::Class::Async,
@@ -371,7 +368,6 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             let mut bindings = Bindings::new(&mut descriptors, &mut pending);
             let Ok(index) = bindings.admit(Binding {
                 name: digest::digest(b"clock"),
-                schema: digest::digest(b"s"),
                 in_flight_max: 2,
                 in_flight: 0,
                 class: binding::Class::Async,
@@ -693,7 +689,6 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             bindings.attach_resources(&mut resources);
             let admitted = bindings.admit(Binding {
                 name: digest::digest(b"store.open"),
-                schema: digest::digest(b"s"),
                 in_flight_max: 2,
                 in_flight: 0,
                 class: binding::Class::Async,
@@ -717,7 +712,6 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             bindings.attach_resources(&mut resources);
             let admitted = bindings.admit(Binding {
                 name: digest::digest(b"store.open"),
-                schema: digest::digest(b"s"),
                 in_flight_max: 1,
                 in_flight: 0,
                 class: binding::Class::Async,
