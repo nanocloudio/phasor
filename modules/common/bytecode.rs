@@ -1221,6 +1221,13 @@ pub const SOURCE_IMPORT_NAME: u32 = u32::MAX - 3;
 /// A resolved row the host refused: a source phase it does not serve.
 pub const HOST_POISON_IMPORT: u32 = u32::MAX - 3;
 
+/// A resolved import row naming this as its source is a capability the
+/// deployment granted rather than a module of the closure. Its slot is the
+/// index of the binding that serves it, so reading the import is reading the
+/// callable for that binding — an image may use what it was granted, and only
+/// what it was granted.
+pub const CAPABILITY_IMPORT_SOURCE: u32 = u32::MAX;
+
 /// One name a module exports.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExportRecord {

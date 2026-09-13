@@ -27,6 +27,20 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     ///
     /// The program gets a function; calling it makes a call record and returns
     /// a promise. Nothing about the provider is visible to it.
+    /// The callable that reaches one binding. A program holding it can make
+    /// the call the deployment admitted and nothing else: the binding index is
+    /// bound into the function, not passed to it.
+    pub fn binding_function(&mut self, binding: u32) -> Result<Value, Completion> {
+        let function = object::create_native(
+            self.heap,
+            Value::object(self.realm.function_prototype),
+            native::BINDING_BASE + binding,
+            0,
+        )
+        .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        Ok(Value::object(function))
+    }
+
     pub fn define_binding(&mut self, name: &[u8], binding: u32) -> Result<(), Completion> {
         let function = object::create_native(
             self.heap,

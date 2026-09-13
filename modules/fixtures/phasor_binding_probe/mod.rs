@@ -115,7 +115,7 @@ use string::Atoms;
 use value::{Handle, Value};
 use vm::{Completion, Frame, Vm};
 
-const CASE_COUNT: u16 = 26;
+const CASE_COUNT: u16 = 34;
 const FUEL: u32 = 400_000;
 /// The trace every call the probe makes belongs to.
 const TRACE: u64 = 0x5041_5348_4f52_0001;
@@ -652,26 +652,31 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
         // the image's own table and nothing outside it can claim one.
         20 => requires(
             storage,
-            b"import { read } from \"phasor:store\"; export default 1;",
-            |required, count| {
-                count == 1
-                    && required[0].interface() == b"store"
+            b"import { read } from \"phasor:store/keyvalue\"; export default 1;",
+            |required, stated| {
+                // The scheme is part of the interface, and `#` joins it to
+                // the member. This is the name the granting end builds and
+                // the register records; if either moves, this case fails.
+                stated == Ok(1)
+                    && required[0].interface() == b"phasor:store/keyvalue"
                     && required[0].member() == b"read"
-                    && required[0].name() == digest::digest(b"store.read")
+                    && required[0].name() == digest::digest(b"phasor:store/keyvalue#read")
             },
         ),
         21 => requires(
             storage,
-            b"import { now } from \"phasor:clock\";\nimport { read } from \"phasor:store\";\nexport default 1;",
-            |required, count| {
-                count == 2 && required[0].interface() == b"clock" && required[1].member() == b"read"
+            b"import { now } from \"wasi:clocks/wall-clock\";\nimport { read } from \"phasor:store/keyvalue\";\nexport default 1;",
+            |required, stated| {
+                stated == Ok(2)
+                    && required[0].interface() == b"wasi:clocks/wall-clock"
+                    && required[1].member() == b"read"
             },
         ),
         // An ordinary module import states no requirement.
         22 => requires(
             storage,
             b"import { x } from \"./other.js\"; export default 1;",
-            |_, count| count == 0,
+            |_, stated| stated == Ok(0),
         ),
         23 => {
             capability::is_capability(&[0x70, 0x68, 0x61, 0x73, 0x6F, 0x72, 0x3A, 0x61])
@@ -731,6 +736,106 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                     next.index == handle.index && next.generation != handle.generation
                 })
         }
+        // THE SEAM. The requiring end and the granting end must compute one
+        // name for one capability. This builds the granted name the way the
+        // shell does -- interface identifier, separator, member -- and the
+        // required name the way an image states it, and holds them equal.
+        // Nothing else in this file would notice if the two ends drifted,
+        // which is how they came to disagree.
+        26 => requires(
+            storage,
+            b"import { connect } from \"wasi:sockets/tcp\"; export default 1;",
+            |required, stated| {
+                let mut granted = [0u8; 64];
+                let interface: &[u8] = b"wasi:sockets/tcp";
+                let member: &[u8] = b"connect";
+                let mut at = 0usize;
+                while at < interface.len() {
+                    granted[at] = interface[at];
+                    at += 1;
+                }
+                granted[at] = capability::SEPARATOR;
+                at += 1;
+                let mut index = 0usize;
+                while index < member.len() {
+                    granted[at] = member[index];
+                    at += 1;
+                    index += 1;
+                }
+                stated == Ok(1)
+                    && required[0].name() == digest::digest(granted.get(..at).unwrap_or(&[]))
+                    && required[0].name() == capability::name_of(interface, member)
+            },
+        ),
+
+        // A WASI interface states a requirement like any other. These are the
+        // ones carrying a clock, randomness, a filesystem and a network, so
+        // an admission that cannot see them cannot refuse anything that
+        // matters.
+        27 => requires(
+            storage,
+            b"import { now } from \"wasi:clocks/wall-clock\";\nimport { random } from \"wasi:random/random\";\nimport { read } from \"wasi:filesystem/types\";\nexport default 1;",
+            |required, stated| {
+                stated == Ok(3)
+                    && required[0].name() == capability::name_of(b"wasi:clocks/wall-clock", b"now")
+                    && required[1].name() == capability::name_of(b"wasi:random/random", b"random")
+                    && required[2].name() == capability::name_of(b"wasi:filesystem/types", b"read")
+            },
+        ),
+
+        // A specifier longer than the reader holds refuses the image. It used
+        // to end the loop, so one long import left every LATER requirement
+        // unread -- the shorter list being the more permissive one every
+        // time.
+        28 => requires(
+            storage,
+            b"import { a } from \"phasor:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\nimport { b } from \"phasor:store/keyvalue\";\nexport default 1;",
+            |_, stated| stated == Err(capability::Refusal::Specifier),
+        ),
+
+        // More requirements than the caller left room for refuses, rather
+        // than checking the ones that fitted.
+        29 => requires(
+            storage,
+            b"import { a } from \"phasor:i/a\";\nimport { b } from \"phasor:i/b\";\nimport { c } from \"phasor:i/c\";\nimport { d } from \"phasor:i/d\";\nimport { e } from \"phasor:i/e\";\nimport { f } from \"phasor:i/f\";\nimport { g } from \"phasor:i/g\";\nimport { h } from \"phasor:i/h\";\nimport { i } from \"phasor:i/i\";\nexport default 1;",
+            |_, stated| stated == Err(capability::Refusal::TooMany),
+        ),
+
+        // A byte the grammar does not admit refuses. It used to stop the
+        // copy, so a specifier and that specifier with anything appended
+        // named one capability.
+        30 => requires(
+            storage,
+            b"import { a } from \"phasor:st\\u{00FF}ore\"; export default 1;",
+            |_, stated| stated == Err(capability::Refusal::Specifier),
+        ),
+
+        // And the separator itself is not a byte an interface may hold, which
+        // is what makes the joined name injective: without it `("a#b", "c")`
+        // and `("a", "b#c")` would be one name for two capabilities.
+        31 => requires(
+            storage,
+            b"import { c } from \"phasor:a#b\"; export default 1;",
+            |_, stated| stated == Err(capability::Refusal::Specifier),
+        ),
+
+        // A specifier with a scheme and nothing after it names no interface.
+        32 => requires(
+            storage,
+            b"import { a } from \"phasor:\"; export default 1;",
+            |_, stated| stated == Ok(0),
+        ),
+
+        // A specifier too long to read at all refuses. This is the path that
+        // used to leave the loop, so one long import early in the table left
+        // every requirement after it unread -- the bypass, rather than a
+        // shorter list that happened to be wrong.
+        33 => requires(
+            storage,
+            b"import { a } from \"phasor:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\nimport { b } from \"phasor:store/keyvalue\";\nexport default 1;",
+            |_, stated| stated == Err(capability::Refusal::Unreadable),
+        ),
+
         _ => true,
     }
 }
@@ -739,7 +844,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
 fn requires(
     storage: &mut Storage,
     source: &[u8],
-    check: impl Fn(&[capability::Requirement; 8], usize) -> bool,
+    check: impl Fn(&[capability::Requirement; 8], Result<usize, capability::Refusal>) -> bool,
 ) -> bool {
     let length = {
         let mut front = frontend_storage!(storage);
@@ -761,8 +866,8 @@ fn requires(
         return false;
     };
     let mut required = [capability::Requirement::EMPTY; 8];
-    let count = capability::requirements(&unit, &mut required);
-    check(&required, count)
+    let stated = capability::requirements(&unit, &mut required);
+    check(&required, stated)
 }
 
 #[repr(C)]

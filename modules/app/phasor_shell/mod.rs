@@ -43,6 +43,8 @@ mod arena;
 mod bigint;
 #[path = "../../common/binding.rs"]
 mod binding;
+#[path = "../../common/capability.rs"]
+mod capability;
 #[path = "../../common/bytecode.rs"]
 mod bytecode;
 #[path = "../../common/diagnostic.rs"]
@@ -824,14 +826,14 @@ fn policy(state: &State) -> Policy {
 /// thing exists, so an adapter written to it means something outside this
 /// project; where none does, the name is this project's own and says so.
 /// `docs/reference/capability-register.md` is the register.
-fn interface_id(kind: u8) -> ([u8; 32], usize) {
+fn interface_id(kind: u8) -> ([u8; capability::MAX_INTERFACE], usize) {
     match kind {
-        GRANT_CLOCK => (*b"wasi:clocks/wall-clock\0\0\0\0\0\0\0\0\0\0", 22),
-        GRANT_ENTROPY => (*b"wasi:random/random\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 18),
-        GRANT_FS => (*b"wasi:filesystem/types\0\0\0\0\0\0\0\0\0\0\0", 21),
-        GRANT_NET => (*b"wasi:sockets/tcp\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16),
-        GRANT_STORE => (*b"phasor:store/keyvalue\0\0\0\0\0\0\0\0\0\0\0", 21),
-        _ => ([0; 32], 0),
+        GRANT_CLOCK => (*b"wasi:clocks/wall-clock\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 22),
+        GRANT_ENTROPY => (*b"wasi:random/random\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 18),
+        GRANT_FS => (*b"wasi:filesystem/types\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 21),
+        GRANT_NET => (*b"wasi:sockets/tcp\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16),
+        GRANT_STORE => (*b"phasor:store/keyvalue\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 21),
+        _ => ([0; capability::MAX_INTERFACE], 0),
     }
 }
 
@@ -1156,15 +1158,13 @@ fn advance(state: &mut State) -> Advance {
             let Some(slot) = admitted.get_mut(count) else {
                 break;
             };
-            let mut name = [0u8; 64];
             // The binding's identity is the interface's identifier and the
-            // member's name, which is what both ends agree on.
+            // member's name. It is computed by the same function an image's
+            // stated requirement is, because two implementations of one name
+            // is how the two ends came to disagree about it.
             let (id, id_length) = interface_id(kind);
-            let mut at = text::put_ascii(&mut name, id.get(..id_length).unwrap_or(&[]));
-            at += text::put_ascii(name.get_mut(at..).unwrap_or(&mut []), b"#");
-            at += text::put_ascii(name.get_mut(at..).unwrap_or(&mut []), member.name());
             *slot = Binding {
-                name: digest::digest(name.get(..at).unwrap_or(&[])),
+                name: capability::name_of(id.get(..id_length).unwrap_or(&[]), member.name()),
                 in_flight_max: IN_FLIGHT_MAX,
                 in_flight: 0,
                 class: member.class,

@@ -128,6 +128,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         else {
             return Err(Completion::MALFORMED);
         };
+        if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
+            // A capability the deployment granted, not a module of the
+            // closure: the row names the binding that serves it, and reading
+            // the import is the callable for that binding. Admission already
+            // held the image to what was granted, so a row that reaches here
+            // names a binding the program may use.
+            return self.binding_function(slot);
+        }
         if slot == u32::MAX {
             // `import * as name` names the module itself.
             return self.namespace_of(source);
@@ -499,6 +507,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .and_then(|imports| imports.get((base + import) as usize))
                 .copied();
             if let Some((source, slot)) = row {
+                // A capability row names a binding the deployment granted, not a
+                // module of the closure. Every walk over the closure passes it by:
+                // it has no source to visit, no cycle to join and no evaluation to
+                // wait on.
+                if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
+                    import += 1;
+                    continue;
+                }
                 if slot == crate::bytecode::HOST_POISON_IMPORT {
                     return Err(self.throw_type_error());
                 }
@@ -543,6 +559,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .and_then(|imports| imports.get((base + import) as usize))
                 .copied();
             if let Some((source, slot)) = row {
+                // A capability row names a binding the deployment granted, not a
+                // module of the closure. Every walk over the closure passes it by:
+                // it has no source to visit, no cycle to join and no evaluation to
+                // wait on.
+                if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
+                    import += 1;
+                    continue;
+                }
                 if slot == crate::bytecode::POISON_IMPORT {
                     // A row linking refused: the SyntaxError it earned.
                     return Err(self.throw_error_of(ErrorKind::Syntax));
@@ -710,6 +734,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .and_then(|imports| imports.get((base + import) as usize))
                 .copied();
             if let Some((source, slot)) = row {
+                // A capability row names a binding the deployment granted, not a
+                // module of the closure. Every walk over the closure passes it by:
+                // it has no source to visit, no cycle to join and no evaluation to
+                // wait on.
+                if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
+                    import += 1;
+                    continue;
+                }
                 if source != module {
                     let crossing = behind_defer || slot == crate::bytecode::DEFER_IMPORT_NAME;
                     let found = self.defer_gate_scan(source, seen, count, crossing);
@@ -762,6 +794,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     .and_then(|imports| imports.get((base + import) as usize))
                     .copied();
                 if let Some((source, slot)) = row {
+                    // A capability row names a binding the deployment granted, not a
+                    // module of the closure. Every walk over the closure passes it by:
+                    // it has no source to visit, no cycle to join and no evaluation to
+                    // wait on.
+                    if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
+                        import += 1;
+                        continue;
+                    }
                     if slot == crate::bytecode::POISON_IMPORT {
                         return Err(self.throw_error_of(ErrorKind::Syntax));
                     }
@@ -1272,6 +1312,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .and_then(|imports| imports.get((base + import) as usize))
                 .copied();
             if let Some((source, _)) = row {
+                // A capability row names a binding the deployment granted, not a
+                // module of the closure. Every walk over the closure passes it by:
+                // it has no source to visit, no cycle to join and no evaluation to
+                // wait on.
+                if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
+                    import += 1;
+                    continue;
+                }
                 if source != module {
                     self.evaluate_async_reachable(source, seen, count, pending, owner)?;
                 }

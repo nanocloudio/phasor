@@ -123,7 +123,12 @@ const FRAME_COUNT: usize = 256;
 const REGISTER_COUNT: usize = 4096;
 const JOB_COUNT: usize = 32;
 /// Bindings this isolate admits, and calls it lets be outstanding at once.
-const BINDING_COUNT: usize = 1;
+///
+/// The general `host` call, and one for every capability a deployment may
+/// grant. `MAX_BINDINGS` is the same number: the table an image's imports
+/// resolve against and the table the machine admits are one table, so a
+/// capability that was granted is one the program can reach.
+const BINDING_COUNT: usize = MAX_BINDINGS;
 const PENDING_COUNT: usize = 4;
 const IN_FLIGHT_MAX: u32 = 4;
 /// Roots a collection stages before it starts: the registers in use, the
@@ -157,6 +162,11 @@ const CONTROL_FRAME: usize = 12;
 const MAX_MODULES: usize = 16;
 /// Bindings one image may state it requires.
 const MAX_REQUIREMENTS: usize = 32;
+/// The granted names a graph may name, as text.
+const GRANTS_BYTES: usize = 1024;
+/// Bindings this isolate may admit: the general `host` call, and one for each
+/// capability a deployment granted.
+const MAX_BINDINGS: usize = 17;
 const MAX_IMPORTS: usize = 128;
 /// The trace every call this isolate makes belongs to.
 const TRACE: u64 = 0x5041_5348_4f52_0001;
@@ -209,16 +219,80 @@ fn attachments<'a>(
     }
 }
 
-/// The bindings this isolate admits, by the digest of each name.
-/// What answers one, and where that is, the isolate never learns.
-fn admitted_bindings() -> [Binding; 1] {
-    [Binding {
+/// The bindings this isolate admits: the general `host` call it has always
+/// offered, and one for every capability the deployment granted.
+///
+/// What answers any of them, and where that is, the isolate never learns. The
+/// order is the admission order, so a binding's index here is the index a
+/// capability import resolves to.
+fn admitted_bindings(state: &State) -> ([Binding; MAX_BINDINGS], usize) {
+    let mut out = [Binding::EMPTY; MAX_BINDINGS];
+    out[0] = Binding {
         name: digest::digest(b"host"),
         in_flight_max: IN_FLIGHT_MAX,
         in_flight: 0,
         class: binding::Class::Async,
         snapshot: 0.0,
-    }]
+    };
+    let mut count = 1usize;
+    each_grant(state, |name| {
+        if let Some(slot) = out.get_mut(count) {
+            *slot = Binding {
+                name,
+                in_flight_max: IN_FLIGHT_MAX,
+                in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
+            };
+            count += 1;
+        }
+    });
+    (out, count)
+}
+
+/// Call `visit` with the name of every capability the graph granted.
+///
+/// The graph states them as text and this digests each in turn, so the name an
+/// image requires and the name a deployment grants are computed by one
+/// function over one form. A grant this cannot read is not a grant.
+fn each_grant(state: &State, mut visit: impl FnMut(crate::digest::Digest)) {
+    let names = state.grants.get(..state.grants_length).unwrap_or(&[]);
+    let mut at = 0usize;
+    while at < names.len() {
+        let mut end = at;
+        while end < names.len() && names.get(end).copied().unwrap_or(b',') != b',' {
+            end += 1;
+        }
+        let entry = trimmed(names.get(at..end).unwrap_or(&[]));
+        if !entry.is_empty() {
+            let mut cut = 0usize;
+            while cut < entry.len()
+                && entry.get(cut).copied().unwrap_or(0) != capability::SEPARATOR
+            {
+                cut += 1;
+            }
+            if cut < entry.len() {
+                visit(capability::name_of(
+                    entry.get(..cut).unwrap_or(&[]),
+                    entry.get(cut + 1..).unwrap_or(&[]),
+                ));
+            }
+        }
+        at = end + 1;
+    }
+}
+
+/// The binding that serves a capability, by the name both ends compute.
+fn binding_of(state: &State, want: crate::digest::Digest) -> Option<u32> {
+    let (admitted, count) = admitted_bindings(state);
+    let mut index = 0usize;
+    while index < count {
+        if admitted.get(index).is_some_and(|binding| binding.name == want) {
+            return u32::try_from(index).ok();
+        }
+        index += 1;
+    }
+    None
 }
 
 /// What one step of the machine did.
@@ -264,6 +338,16 @@ struct State {
     control_in: i32,
     steps: u32,
     call_wait: u32,
+    /// What this deployment granted, as the graph named it: a list of
+    /// `<interface>#<member>` separated by commas. An image may require
+    /// nothing that is not here.
+    ///
+    /// It is the graph's to state, because granting is the deployment's act
+    /// and not the image's. The isolate holds the names rather than their
+    /// digests so that one function computes a capability's identity for
+    /// both ends, which is what keeps them from drifting apart again.
+    grants: [u8; GRANTS_BYTES],
+    grants_length: usize,
     /// What the control port has asked for, applied to the machine each step.
     cancel_requested: bool,
     deadline: u64,
@@ -402,6 +486,32 @@ fn start(state: &mut State) -> bool {
                 else {
                     return false;
                 };
+                // A capability names what the deployment granted, not a
+                // module the stream carries. It resolves to the binding that
+                // serves it, so a program may use what it required -- and,
+                // because the gate and this table are the same table, only
+                // what it was granted.
+                if capability::is_capability(specifier.get(..specifier_length).unwrap_or(&[])) {
+                    let mut required = [capability::Requirement::EMPTY; 1];
+                    let Ok(1) = capability::requirements_of(
+                        specifier.get(..specifier_length).unwrap_or(&[]),
+                        name.get(..name_length).unwrap_or(&[]),
+                        &mut required,
+                    ) else {
+                        return false;
+                    };
+                    let Some(binding) = binding_of(state, required[0].name()) else {
+                        return false;
+                    };
+                    let Some(entry) = state.import_table.get_mut(state.import_count as usize)
+                    else {
+                        return false;
+                    };
+                    *entry = (crate::bytecode::CAPABILITY_IMPORT_SOURCE, binding);
+                    state.import_count += 1;
+                    import += 1;
+                    continue;
+                }
                 // The specifier is compared as bytes, which is what the
                 // container holds it as.
                 let mut text = [0u8; 64];
@@ -434,7 +544,7 @@ fn start(state: &mut State) -> bool {
     } else {
         state.instances[0] = ModuleInstance::EMPTY;
     }
-    let admitted = admitted_bindings();
+    let (admitted, admitted_count) = admitted_bindings(state);
     let policy = policy(state);
     let metering = agent::Metering {
         policy: &policy,
@@ -450,7 +560,7 @@ fn start(state: &mut State) -> bool {
         &state.import_table,
         module_count,
         import_count,
-        &admitted,
+        admitted.get(..admitted_count).unwrap_or(&[]),
     );
     let storage = agent_storage!(state);
     let started = agent::fresh(
@@ -934,6 +1044,19 @@ define_params! {
 
     2, call_wait, u32, 5_000
         => |s, d, len| { s.call_wait = p_u32(d, len, 0, WAIT_LIMIT); };
+
+    3, grants, str, 0
+        => |s, d, len| {
+            let taken = if len > GRANTS_BYTES { GRANTS_BYTES } else { len };
+            s.grants_length = taken;
+            if taken > 0 {
+                // SAFETY: the params reader hands a pointer valid for `len`
+                // bytes, and `taken` is no larger than it or the field.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(d, s.grants.as_mut_ptr(), taken);
+                }
+            }
+        };
 }
 
 /// Take the graph's parameters, or the defaults where it gave none.
@@ -1032,24 +1155,34 @@ fn drain_control(state: &mut State, syscalls: &SyscallTable) {
 /// admitted or run.
 fn requirements_granted(state: &State) -> bool {
     let Some(bytes) = state.image.get(..state.image_length) else {
-        return true;
+        // The image is not as long as it says. Nothing here can be read, and
+        // an image that cannot be read cannot be checked.
+        return false;
     };
+    if bytes.is_empty() {
+        // Nothing arrived. Whatever was to produce an image said why on its
+        // own port, and an image that does not exist requires nothing --
+        // which is not the same as one that could not be read.
+        return true;
+    }
     let mut units = [Unit::EMPTY; MAX_MODULES];
     let count = match Closure::parse(bytes) {
         Ok(closure) => {
-            let count = (closure.count() as usize).min(MAX_MODULES);
+            let count = closure.count() as usize;
+            // A closure with more modules than this reads is not a closure
+            // whose first sixteen modules are the whole of it.
+            if count > MAX_MODULES {
+                return false;
+            }
             let mut index = 0usize;
             while index < count {
-                let (Some(image), Ok(unit)) = (
-                    closure.image(u32::try_from(index).unwrap_or(0)),
-                    closure
-                        .image(u32::try_from(index).unwrap_or(0))
-                        .ok_or(())
-                        .and_then(|image| Unit::parse(image).map_err(|_| ())),
-                ) else {
-                    return true;
+                let Ok(unit) = closure
+                    .image(u32::try_from(index).unwrap_or(u32::MAX))
+                    .ok_or(())
+                    .and_then(|image| Unit::parse(image).map_err(|_| ()))
+                else {
+                    return false;
                 };
-                let _ = image;
                 units[index] = unit;
                 index += 1;
             }
@@ -1060,22 +1193,30 @@ fn requirements_granted(state: &State) -> bool {
                 units[0] = unit;
                 1
             }
-            Err(_) => return true,
+            Err(_) => return false,
         },
     };
     let mut required = [capability::Requirement::EMPTY; MAX_REQUIREMENTS];
     let mut index = 0usize;
     while index < count {
         let Some(unit) = units.get(index) else {
-            break;
+            return false;
         };
-        let stated = capability::requirements(unit, &mut required);
+        // A requirement that could not be read is not a requirement that is
+        // absent: refusing is the only answer that does not admit the image
+        // nobody could check.
+        // A requirement that could not be read is not a requirement that is
+        // absent: refusing is the only answer that does not admit the image
+        // nobody could check.
+        let Ok(stated) = capability::requirements(unit, &mut required) else {
+            return false;
+        };
         let mut position = 0usize;
         while position < stated {
-            if !admitted_bindings()
-                .iter()
-                .any(|binding| binding.name == required[position].name())
-            {
+            let Some(requirement) = required.get(position) else {
+                return false;
+            };
+            if !granted(state, requirement.name()) {
                 return false;
             }
             position += 1;
@@ -1083,6 +1224,26 @@ fn requirements_granted(state: &State) -> bool {
         index += 1;
     }
     true
+}
+
+/// Whether the deployment granted this capability. The gate and the table an
+/// image's imports resolve against are the same table, so an image cannot be
+/// admitted for a binding that is not there to use.
+fn granted(state: &State, want: crate::digest::Digest) -> bool {
+    binding_of(state, want).is_some()
+}
+
+/// A grant with the spaces a graph may have written around it taken off.
+fn trimmed(entry: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    while start < entry.len() && matches!(entry.get(start).copied(), Some(b' ') | Some(b'\t')) {
+        start += 1;
+    }
+    let mut end = entry.len();
+    while end > start && matches!(entry.get(end - 1).copied(), Some(b' ') | Some(b'\t')) {
+        end -= 1;
+    }
+    entry.get(start..end).unwrap_or(&[])
 }
 
 /// Stage the whole image before admitting it: a partial image is not an image,

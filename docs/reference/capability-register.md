@@ -8,17 +8,79 @@ without writing by granting one binding and not the other.
 
 ## How a capability is named
 
-A binding's identity is the digest of `<interface>#<member>`. The interface
-follows the [WebAssembly System Interface](https://github.com/WebAssembly/WASI)
-where an interface for the thing exists, so an adapter written to it means
-something outside this project and a schema has a published definition to be
-the digest of. Where no such interface exists the name carries the `phasor:`
-prefix and is this project's own.
+A binding's identity is the digest of `<interface>#<member>`, where the
+interface is the specifier **including its scheme**. The interface follows the
+[WebAssembly System Interface](https://github.com/WebAssembly/WASI) where an
+interface for the thing exists, so an adapter written to it means something
+outside this project and a schema has a published definition to be the digest
+of. Where no such interface exists the name carries the `phasor:` prefix and
+is this project's own.
 
-An image states what it requires through an import carrying the `phasor:`
-scheme, and the deployment checks each requirement against what it granted
-before anything runs. A capability that was not granted is
-`binding-not-granted` at admission, never `undefined` at the call.
+The scheme is part of the identity and not decoration: `wasi:sockets/tcp` is
+the published interface, and a `phasor:sockets/tcp` would be this project's
+own, and they are not the same capability. The whole of the name is therefore
+`digest("wasi:sockets/tcp#connect")`, and both ends compute it with one
+function —
+`capability::name_of` — because two implementations of one name is how they
+came to disagree about it.
+
+An image states what it requires through an import carrying a scheme, and the
+deployment checks each requirement against what it granted before anything
+runs. A capability that was not granted is `binding-not-granted` at admission,
+never `undefined` at the call.
+
+One that *was* granted resolves: the import names the binding that serves it,
+so the program calls what it required. The table the gate checks against and
+the table an image's imports resolve against are one table, which is what
+makes those two sentences describe the same thing. Admitting an image for a
+capability it could not then reach would answer the requirement with the very
+`undefined` the check exists to prevent.
+
+### The grammar
+
+```text
+specifier := scheme ":" interface
+scheme    := [a-z] [a-z0-9-]*
+interface := [a-z0-9] [a-z0-9/._@-]*
+member    := [A-Za-z] [A-Za-z0-9]*
+```
+
+A specifier carrying a scheme is a capability, whatever the scheme is: that is
+the shape rather than a list, so no scheme is privileged and `wasi:` is read
+like any other. A module specifier is a relative path or a bare name and
+carries none.
+
+The separator cannot appear in either part, which is what makes the joined
+name injective. Without that rule `("a#b", "c")` and `("a", "b#c")` would be
+one name for two capabilities.
+
+Anything the grammar does not admit refuses the image. So does a name too long
+to hold, an import too long to read, and more requirements than the reader was
+given room for. None of them yields a shorter list of requirements, because a
+shorter list is always the more permissive one, and the image that could not
+be checked is exactly the one that would be admitted by it.
+
+### What a deployment grants
+
+The shell takes its grants from `--grant`, and names each interface by a short
+namespace a program calls it through. A graph running the isolate states them
+instead, because granting is the deployment's act:
+
+```yaml
+modules:
+  - name: phasor_isolate
+    params:
+      grants: "phasor:store/keyvalue#read, wasi:clocks/wall-clock#now"
+```
+
+`examples/split/run.yaml` and `examples/split/run-granted.yaml` differ only in
+that line, which is what lets one image be admitted by the second and refused
+by the first.
+
+An interface name may be up to 64 bytes. A versioned WASI name reaches half of
+that exactly -- `wasi:http/outgoing-handler@0.2.0` is thirty-two characters --
+and a bound that a real name sits on is one that refuses the next name for no
+reason anybody chose.
 
 ## The interfaces
 
