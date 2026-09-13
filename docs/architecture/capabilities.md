@@ -42,18 +42,26 @@ bindings a program does, so it can acquire nothing on a program's behalf.
 
 ## 1b. What an image requires, and what a deployment grants
 
-An image states what it needs. `import { read } from "phasor:store"` is an
-ordinary import with a scheme, so the requirement is recorded in the image's
-own import table, where nothing outside the image can claim one for it. A
-deployment reads those requirements when it admits the image, checks each
-against what it granted, and refuses the image whole with
+An image states what it needs. `import { read } from "phasor:store/keyvalue"`
+is an ordinary import with a scheme, so the requirement is recorded in the
+image's own import table, where nothing outside the image can claim one for
+it. A deployment reads those requirements when it admits the image, checks
+each against what it granted, and refuses the image whole with
 `binding-not-granted` rather than starting a program that discovers its
 capability is `undefined`.
 
-The name both ends agree on is `interface.member`, by digest. An interface is
-a namespace of members, and each member is one binding: `store.read` and
-`store.write` are granted separately, so a deployment can give a program
-reading without writing.
+The name both ends agree on is the digest of `<interface>#<member>`, with the
+interface carrying its scheme. An interface is a namespace of members, and
+each member is one binding: `read` and `write` on `phasor:store/keyvalue` are
+granted separately, so a deployment can give a program reading without
+writing. [The register](../reference/capability-register.md) holds the
+names and the grammar they are held to.
+
+A granted requirement also resolves: the import names the binding that serves
+it, so the table the gate checks against and the table the image's imports
+resolve against are one table. Admitting an image for a capability it could
+not then reach would answer the requirement with the `undefined` the check
+exists to prevent.
 
 ## 2. A call is asynchronous by construction
 

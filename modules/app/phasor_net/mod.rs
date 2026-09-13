@@ -555,12 +555,59 @@ fn serve(state: &mut State, record: &CallRecord) {
 }
 
 /// Apply one frame the network stack produced.
+/// Whether the connection a staged frame is for can hold what it carries.
+///
+/// Only data frames are held back: everything else is bookkeeping that must
+/// arrive whether or not the program is reading.
+fn room_for(state: &State, frame: &[u8]) -> bool {
+    let Some(&kind) = frame.first() else {
+        return true;
+    };
+    if kind != proto::MSG_DATA {
+        return true;
+    }
+    let payload = frame.get(proto::FRAME_HDR..).unwrap_or(&[]);
+    if payload.len() < proto::CONN_ID_LEN {
+        return true;
+    }
+    let id = proto::conn_id(payload);
+    let carried = payload.len() - proto::CONN_ID_LEN;
+    match state
+        .connections
+        .iter()
+        .find(|held| held.live && held.id == id)
+    {
+        // A frame for a connection this adapter does not hold is dropped by
+        // `apply` either way; holding it back would stall the stream.
+        None => true,
+        Some(connection) => BUFFER_BYTES - connection.filled >= carried,
+    }
+}
+
 fn apply(state: &mut State, kind: u8, payload: &[u8]) {
     match kind {
         proto::MSG_CONNECTED => {
             if payload.len() < proto::CONN_ID_LEN {
                 return;
             }
+            // The stack's outbound lane is shared: every adapter wired to it
+            // sees every connection opened on it, including ones opened by
+            // another module entirely. A connection this adapter did not ask
+            // for is not its own, and adopting it is worse than untidy —
+            // nothing here will ever read that stream, so its buffer fills,
+            // and a full buffer stops the whole lane for the module the
+            // connection does belong to.
+            let mut index = 0usize;
+            let waiting = loop {
+                if index >= PENDING {
+                    return;
+                }
+                let held = state.held[index];
+                if held.live && held.method == METHOD_CONNECT {
+                    break index;
+                }
+                index += 1;
+            };
             let id = proto::conn_id(payload);
             let Some(slot) = state.connections.iter().position(|held| !held.live) else {
                 return;
@@ -574,22 +621,15 @@ fn apply(state: &mut State, kind: u8, payload: &[u8]) {
             };
             // The call that asked for a connection is answered with a handle
             // over this slot; the stack's own identifier stays here.
-            let mut index = 0usize;
-            while index < PENDING {
-                let held = state.held[index];
-                if held.live && held.method == METHOD_CONNECT {
-                    state.held[index] = Held::EMPTY;
-                    fulfil(
-                        state,
-                        held.request,
-                        held.trace,
-                        Answer::Resource(slot as u64),
-                        &[],
-                    );
-                    return;
-                }
-                index += 1;
-            }
+            let held = state.held[waiting];
+            state.held[waiting] = Held::EMPTY;
+            fulfil(
+                state,
+                held.request,
+                held.trace,
+                Answer::Resource(slot as u64),
+                &[],
+            );
         }
         proto::MSG_DATA => {
             if payload.len() < proto::CONN_ID_LEN {
@@ -605,13 +645,19 @@ fn apply(state: &mut State, kind: u8, payload: &[u8]) {
                 return;
             };
             if let Some(connection) = state.connections.get_mut(slot) {
+                // The frame was admitted only because the room was there, so
+                // this copies all of it or none: a short copy here would be
+                // the silent loss the admission exists to prevent.
                 let at = connection.filled;
-                let taken = data.len().min(BUFFER_BYTES - at);
-                copy_into(
-                    connection.buffer.get_mut(at..at + taken).unwrap_or(&mut []),
-                    data.get(..taken).unwrap_or(&[]),
-                );
-                connection.filled = at + taken;
+                if copy_into(
+                    connection
+                        .buffer
+                        .get_mut(at..at + data.len())
+                        .unwrap_or(&mut []),
+                    data,
+                ) {
+                    connection.filled = at + data.len();
+                }
             }
         }
         proto::MSG_CLOSED => {
@@ -701,6 +747,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             if state.net_filled < total {
+                break;
+            }
+            // A connection with no room for this frame is not a connection
+            // that should lose it. The frame stays where it is and is taken
+            // again once the program has read what is already buffered, which
+            // holds the stream still rather than dropping the middle of it.
+            if !room_for(state, state.net_frame.get(..total).unwrap_or(&[])) {
                 break;
             }
             // One copy, because `apply` takes the whole adapter while the

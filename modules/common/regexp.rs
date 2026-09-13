@@ -1347,6 +1347,15 @@ impl Choice {
 pub struct Matcher<'a> {
     pub choices: &'a mut [Choice],
     pub undo: &'a mut [(u8, u32)],
+    /// Set when the match stopped because it ran out of room or fuel rather
+    /// than because the pattern did not match.
+    ///
+    /// A matcher answers `None` for both, and the two are not the same
+    /// answer: one says the subject does not match, the other says nobody
+    /// found out. Without this the second is reported as the first, so
+    /// `/^B+$/.test(s)` on a long subject is `false` -- a wrong answer, not a
+    /// refused one, and nothing about it looks like a limit.
+    pub halted: bool,
 }
 
 /// What a match produced: the slots, in pairs, with `u32::MAX` for a group that
@@ -1373,6 +1382,7 @@ pub fn run(
 
     loop {
         if *fuel == 0 {
+            matcher.halted = true;
             return None;
         }
         *fuel -= 1;
@@ -1513,6 +1523,7 @@ pub fn run(
                 let second = read_i16(program.code, pc + 3);
                 let alternative = offset(pc + 1, second);
                 if choices >= matcher.choices.len() {
+                    matcher.halted = true;
                     return None;
                 }
                 matcher.choices[choices] = Choice {
@@ -1530,6 +1541,7 @@ pub fn run(
             op::SAVE => {
                 let slot = program.code.get(pc + 1).copied().unwrap_or(0) as usize;
                 if slot >= MAX_SLOTS || undo >= matcher.undo.len() {
+                    matcher.halted = true;
                     return None;
                 }
                 matcher.undo[undo] = (slot as u8, slots[slot]);
@@ -1619,13 +1631,18 @@ pub fn run(
                 };
                 // A lookahead is a match of its own, from here, that consumes
                 // nothing and keeps no captures of its own.
-                let matched = {
+                let (matched, ran_out) = {
                     let mut nested = Matcher {
                         choices: matcher.choices,
                         undo: matcher.undo,
+                        halted: false,
                     };
-                    run(&inner, input, position, &mut nested, fuel).is_some()
+                    let matched = run(&inner, input, position, &mut nested, fuel).is_some();
+                    (matched, nested.halted)
                 };
+                // A nested match that ran out carries that out with it: the
+                // assertion around it did not fail, it was never decided.
+                matcher.halted |= ran_out;
                 if matched != negated {
                     pc = body + length;
                 } else {

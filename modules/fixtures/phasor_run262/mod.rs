@@ -2411,6 +2411,28 @@ fn record_verdict(state: &mut State, verdict: u8) {
     }
 }
 
+/// Move `buffer[from..to]` down to the front.
+///
+/// `copy_within` carries a bounds check that panics, and it is instantiated
+/// out of line, so a guard at the call site does not reach it: whether the
+/// panic path survives to the link is the optimizer's decision rather than
+/// the code's. A checked walk has no such path to begin with, which is what
+/// a module that cannot panic needs from a buffer compaction.
+fn shift_down(buffer: &mut [u8], from: usize, to: usize) {
+    let mut index = 0usize;
+    while from + index < to {
+        let byte = match buffer.get(from + index) {
+            Some(byte) => *byte,
+            None => return,
+        };
+        match buffer.get_mut(index) {
+            Some(slot) => *slot = byte,
+            None => return,
+        }
+        index += 1;
+    }
+}
+
 /// Consume one complete record from the staging buffer, if one is there.
 ///
 /// One record per step: a case executes under a real instruction budget, and
@@ -2421,7 +2443,7 @@ fn drain_one(state: &mut State) {
         if drop == 0 {
             return;
         }
-        state.buffer.copy_within(drop..state.filled, 0);
+        shift_down(&mut state.buffer, drop, state.filled);
         state.filled -= drop;
         state.discarding -= drop;
         if state.discarding == 0 {
@@ -2442,7 +2464,7 @@ fn drain_one(state: &mut State) {
     let expectation = state.buffer[4];
 
     if length > CASE_CAPACITY {
-        state.buffer.copy_within(HEADER..state.filled, 0);
+        shift_down(&mut state.buffer, HEADER, state.filled);
         state.filled -= HEADER;
         state.discarding = length;
         state.discard_verdict = b'S';
@@ -2471,7 +2493,7 @@ fn drain_one(state: &mut State) {
         state.storage.fixture_count = 0;
         state.storage.entry_name_length = 0;
     }
-    state.buffer.copy_within(HEADER + length..state.filled, 0);
+    shift_down(&mut state.buffer, HEADER + length, state.filled);
     state.filled -= HEADER + length;
 }
 

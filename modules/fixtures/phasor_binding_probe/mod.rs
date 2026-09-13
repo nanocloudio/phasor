@@ -740,8 +740,9 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
         // name for one capability. This builds the granted name the way the
         // shell does -- interface identifier, separator, member -- and the
         // required name the way an image states it, and holds them equal.
-        // Nothing else in this file would notice if the two ends drifted,
-        // which is how they came to disagree.
+        // Nothing else in this file would notice if the two ends drifted
+        // apart, and a grant would then never match the requirement it
+        // answers.
         26 => requires(
             storage,
             b"import { connect } from \"wasi:sockets/tcp\"; export default 1;",
@@ -801,9 +802,9 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             |_, stated| stated == Err(capability::Refusal::TooMany),
         ),
 
-        // A byte the grammar does not admit refuses. It used to stop the
-        // copy, so a specifier and that specifier with anything appended
-        // named one capability.
+        // A byte the grammar does not admit refuses the whole specifier
+        // rather than stopping the copy, which would give a specifier and
+        // that specifier with anything appended one name.
         30 => requires(
             storage,
             b"import { a } from \"phasor:st\\u{00FF}ore\"; export default 1;",
@@ -826,10 +827,10 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             |_, stated| stated == Ok(0),
         ),
 
-        // A specifier too long to read at all refuses. This is the path that
-        // used to leave the loop, so one long import early in the table left
-        // every requirement after it unread -- the bypass, rather than a
-        // shorter list that happened to be wrong.
+        // A specifier too long to read at all refuses the image, rather than
+        // ending the walk: one long import early in the table would otherwise
+        // leave every requirement after it unread, which is a bypass rather
+        // than a shorter list that happened to be wrong.
         33 => requires(
             storage,
             b"import { a } from \"phasor:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\nimport { b } from \"phasor:store/keyvalue\";\nexport default 1;",

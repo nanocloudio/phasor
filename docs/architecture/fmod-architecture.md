@@ -120,9 +120,10 @@ are answered by the isolate itself with a timeout.
 
 JavaScript sees host bindings the isolate admitted: each is a name digest, a
 schema digest, an in-flight limit, and how it is served. An image states the
-bindings it requires through imports carrying the `phasor:` scheme, and a
-deployment that granted less refuses the image rather than starting it. A binding never contains a syscall
-number, device handle, URL, credential, or provider address.
+bindings it requires through imports whose specifier carries a scheme, and a
+deployment that granted less refuses the image rather than starting it. A
+binding never contains a syscall number, device handle, URL, credential, or
+provider address.
 
 `phasor_host_router` admits a call by its binding index alone, correlates the
 answer with the call by request identifier and trace context, and bounds how

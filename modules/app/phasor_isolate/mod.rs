@@ -219,8 +219,8 @@ fn attachments<'a>(
     }
 }
 
-/// The bindings this isolate admits: the general `host` call it has always
-/// offered, and one for every capability the deployment granted.
+/// The bindings this isolate admits: the general `host` call, and one for
+/// every capability the deployment granted.
 ///
 /// What answers any of them, and where that is, the isolate never learns. The
 /// order is the admission order, so a binding's index here is the index a
@@ -266,8 +266,7 @@ fn each_grant(state: &State, mut visit: impl FnMut(crate::digest::Digest)) {
         let entry = trimmed(names.get(at..end).unwrap_or(&[]));
         if !entry.is_empty() {
             let mut cut = 0usize;
-            while cut < entry.len()
-                && entry.get(cut).copied().unwrap_or(0) != capability::SEPARATOR
+            while cut < entry.len() && entry.get(cut).copied().unwrap_or(0) != capability::SEPARATOR
             {
                 cut += 1;
             }
@@ -287,7 +286,10 @@ fn binding_of(state: &State, want: crate::digest::Digest) -> Option<u32> {
     let (admitted, count) = admitted_bindings(state);
     let mut index = 0usize;
     while index < count {
-        if admitted.get(index).is_some_and(|binding| binding.name == want) {
+        if admitted
+            .get(index)
+            .is_some_and(|binding| binding.name == want)
+        {
             return u32::try_from(index).ok();
         }
         index += 1;

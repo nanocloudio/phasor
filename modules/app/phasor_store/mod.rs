@@ -7,11 +7,11 @@
 //! no directories, and no way to name anything outside the store, because
 //! there is nothing outside it.
 //!
-//! It is the first adapter whose answers are bytes rather than a number, and
-//! the first that issues handles. A `write` carries its payload behind the
-//! call frame; a `read` answers with the payload behind the completion. An
-//! `open` answers with a handle: an index and a generation the binding table
-//! checks, so a handle kept past its entry's life names nothing.
+//! Its answers are bytes rather than numbers, and it issues handles. A
+//! `write` carries its payload behind the call frame; a `read` answers with
+//! the payload behind the completion. An `open` answers with a handle: an
+//! index and a generation the binding table checks, so a handle kept past its
+//! entry's life names nothing.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(

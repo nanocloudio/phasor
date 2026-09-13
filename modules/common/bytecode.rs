@@ -1226,6 +1226,9 @@ pub const HOST_POISON_IMPORT: u32 = u32::MAX - 3;
 /// index of the binding that serves it, so reading the import is reading the
 /// callable for that binding — an image may use what it was granted, and only
 /// what it was granted.
+///
+/// Every walk over a closure's modules passes such a row by: it has no source
+/// to visit, no cycle to join, and no evaluation to wait on.
 pub const CAPABILITY_IMPORT_SOURCE: u32 = u32::MAX;
 
 /// One name a module exports.

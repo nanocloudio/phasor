@@ -23,11 +23,14 @@
 //! # The grammar
 //!
 //! ```text
-//! specifier := scheme ":" interface
+//! interface := scheme ":" path
 //! scheme    := [a-z] [a-z0-9-]*
-//! interface := [a-z0-9] [a-z0-9/._@-]*
+//! path      := [a-z0-9] [a-z0-9/._@-]*
 //! member    := [A-Za-z] [A-Za-z0-9]*
 //! ```
+//!
+//! The interface is the whole of that production, scheme included, which is
+//! what the digest covers.
 //!
 //! Anything else is refused. A requirement that cannot be read is not a
 //! requirement that is absent: every failure here refuses the image, because
@@ -182,7 +185,12 @@ pub fn is_capability(specifier: &[u16]) -> bool {
 
 /// Copy an ASCII run into a fixed field, refusing anything the grammar does
 /// not admit and anything longer than the field.
-fn take(units: &[u16], out: &mut [u8], start: usize, admits: impl Fn(usize, u8) -> bool) -> Option<usize> {
+fn take(
+    units: &[u16],
+    out: &mut [u8],
+    start: usize,
+    admits: impl Fn(usize, u8) -> bool,
+) -> Option<usize> {
     let mut length = 0usize;
     let mut index = start;
     while index < units.len() {
@@ -246,7 +254,11 @@ fn read_one(specifier: &[u16], member: &[u16]) -> Result<Requirement, Refusal> {
     // capabilities.
     let Some(interface_length) = take(specifier, &mut requirement.interface, 0, |at, byte| {
         if at < colon {
-            return if at == 0 { scheme_start(byte) } else { scheme_body(byte) };
+            return if at == 0 {
+                scheme_start(byte)
+            } else {
+                scheme_body(byte)
+            };
         }
         if at == colon {
             return byte == b':';
@@ -292,7 +304,10 @@ pub fn requirements(unit: &Unit<'_>, out: &mut [Requirement]) -> Result<usize, R
         let Some(slot) = out.get_mut(written) else {
             return Err(Refusal::TooMany);
         };
-        let requirement = read_one(written_specifier, member.get(..member_length).unwrap_or(&[]))?;
+        let requirement = read_one(
+            written_specifier,
+            member.get(..member_length).unwrap_or(&[]),
+        )?;
         *slot = requirement;
         written += 1;
     }

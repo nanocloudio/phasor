@@ -70,6 +70,14 @@ direction    = "input"
 content_type = "OctetStream"
 buffer_size  = 16384
 
+# Completion frames from the HTTP adapter, each followed by its bytes.
+[[ports]]
+name         = "http_reply"
+index        = 8
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
 # Values, printed lines, prompts, and failures in words.
 [[ports]]
 name         = "stdout"
@@ -120,6 +128,14 @@ buffer_size  = 32768
 [[ports]]
 name         = "net_call"
 index        = 6
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# Call frames for the HTTP binding, each followed by its payload.
+[[ports]]
+name         = "http_call"
+index        = 7
 direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 16384

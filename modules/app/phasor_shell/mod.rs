@@ -8,8 +8,9 @@
 //! runaway loop ends as `fuel-exhausted` here exactly as it would deployed.
 //!
 //! Nothing is ambient. The realm starts bare: no clock, no randomness, no
-//! filesystem, no network. `--grant clock` and `--grant entropy` admit the
-//! two standard bindings, each answered by the adapter the shell's graph
+//! storage, no filesystem, no network. Each `--grant` admits one interface —
+//! `clock`, `entropy`, `store`, `fs`, or `net` — as a namespace of the
+//! members that interface declares, answered by the adapter the shell's graph
 //! wires directly to a port of its own, and the shell says what it granted.
 //! `print` is the one host function the shell installs, because standard
 //! output is the shell's authority to give.
@@ -43,10 +44,10 @@ mod arena;
 mod bigint;
 #[path = "../../common/binding.rs"]
 mod binding;
-#[path = "../../common/capability.rs"]
-mod capability;
 #[path = "../../common/bytecode.rs"]
 mod bytecode;
+#[path = "../../common/capability.rs"]
+mod capability;
 #[path = "../../common/diagnostic.rs"]
 mod diagnostic;
 #[path = "../../common/digest.rs"]
@@ -215,7 +216,7 @@ const TRACE: u64 = 0x5041_5348_4f52_0002;
 /// The interfaces a person may grant. Each is a port pair on this module and
 /// an adapter the graph wires to it, and each carries members: the bindings
 /// the deployment admits, one per operation the interface offers.
-const MAX_GRANTS: usize = 5;
+const MAX_GRANTS: usize = 6;
 /// Bindings across every granted interface.
 const MAX_BINDINGS: usize = 16;
 /// Members one interface may carry.
@@ -225,6 +226,7 @@ const GRANT_ENTROPY: u8 = 2;
 const GRANT_STORE: u8 = 3;
 const GRANT_FS: u8 = 4;
 const GRANT_NET: u8 = 5;
+const GRANT_HTTP: u8 = 6;
 const PENDING_COUNT: usize = 16;
 const IN_FLIGHT_MAX: u32 = 8;
 /// Resources a program may hold open at once.
@@ -287,6 +289,15 @@ fn members(kind: u8) -> ([Member; MAX_MEMBERS], usize) {
             out[0] = Member::new(*b"random\0\0", 6, binding::Class::Async, 0);
             1
         }
+        GRANT_HTTP => {
+            out[0] = Member::new(*b"send\0\0\0\0", 4, binding::Class::Async, 0);
+            out[1] = Member::new(*b"status\0\0", 6, binding::Class::Async, 1);
+            out[2] = Member::new(*b"headers\0", 7, binding::Class::Async, 2);
+            out[3] = Member::new(*b"read\0\0\0\0", 4, binding::Class::Async, 3);
+            out[4] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 4);
+            out[5] = Member::new(*b"origin\0\0", 6, binding::Class::Async, 5);
+            6
+        }
         GRANT_NET => {
             out[0] = Member::new(*b"connect\0", 7, binding::Class::Async, 0);
             out[1] = Member::new(*b"send\0\0\0\0", 4, binding::Class::Async, 1);
@@ -338,11 +349,12 @@ usage:\n\
   phasor help            this text\n\
 \n\
 options:\n\
-  --grant clock          admit clock.now(): the time, read with no call\n\
+  --grant clock          admit clock.now/sleep: the time, and being told later\n\
   --grant entropy        admit entropy.random(): a promise of a random number\n\
   --grant store          admit store.read/write/list/delete/open/readAt\n\
   --grant fs             admit fs.read/write/open/readAt/close/size\n\
   --grant net            admit net.connect/send/receive/close/endpoint\n\
+  --grant http           admit http.send/status/headers/read/close/origin\n\
   --steps <n>            instructions one input may run, up to the ceiling\n\
   --bare                 leave out the standard surface the graph offers\n\
 \n\
@@ -386,6 +398,7 @@ struct State {
     store_reply: i32,
     fs_reply: i32,
     net_reply: i32,
+    http_reply: i32,
     surface_in: i32,
     exit_out: i32,
     clock_call: i32,
@@ -393,6 +406,7 @@ struct State {
     store_call: i32,
     fs_call: i32,
     net_call: i32,
+    http_call: i32,
 
     mode: u8,
     phase: u8,
@@ -764,7 +778,7 @@ fn read_argv(state: &mut State) -> Parsed {
                 let Some(kind) = next.and_then(grant_of) else {
                     emit(
                         &mut state.out,
-                        b"phasor: --grant takes clock, entropy, store, fs, or net\n",
+                        b"phasor: --grant takes clock, entropy, store, fs, net, or http\n",
                     );
                     return Parsed::Refused;
                 };
@@ -831,6 +845,7 @@ fn interface_id(kind: u8) -> ([u8; capability::MAX_INTERFACE], usize) {
         GRANT_CLOCK => (*b"wasi:clocks/wall-clock\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 22),
         GRANT_ENTROPY => (*b"wasi:random/random\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 18),
         GRANT_FS => (*b"wasi:filesystem/types\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 21),
+        GRANT_HTTP => (*b"wasi:http/outgoing-handler\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 26),
         GRANT_NET => (*b"wasi:sockets/tcp\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16),
         GRANT_STORE => (*b"phasor:store/keyvalue\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 21),
         _ => ([0; capability::MAX_INTERFACE], 0),
@@ -847,6 +862,7 @@ fn grant_name(kind: u8) -> ([u8; 8], usize) {
         GRANT_STORE => (*b"store\0\0\0", 5),
         GRANT_FS => (*b"fs\0\0\0\0\0\0", 2),
         GRANT_NET => (*b"net\0\0\0\0\0", 3),
+        GRANT_HTTP => (*b"http\0\0\0\0", 4),
         _ => ([0; 8], 0),
     }
 }
@@ -859,6 +875,7 @@ fn grant_of(word: &[u8]) -> Option<u8> {
         b"store" => Some(GRANT_STORE),
         b"fs" => Some(GRANT_FS),
         b"net" => Some(GRANT_NET),
+        b"http" => Some(GRANT_HTTP),
         _ => None,
     }
 }
@@ -1144,7 +1161,7 @@ fn advance(state: &mut State) -> Advance {
     };
 
     // One binding per member of each granted interface, named by the digest
-    // of `interface.member`, which is what an image states it requires.
+    // of `<interface>#<member>`, which is what an image states it requires.
     let mut admitted = [Binding::EMPTY; MAX_BINDINGS];
     let mut count = 0usize;
     let mut grant = 0usize;
@@ -1159,9 +1176,9 @@ fn advance(state: &mut State) -> Advance {
                 break;
             };
             // The binding's identity is the interface's identifier and the
-            // member's name. It is computed by the same function an image's
-            // stated requirement is, because two implementations of one name
-            // is how the two ends came to disagree about it.
+            // member's name, computed by the same function an image's stated
+            // requirement is: two implementations of one name are two names,
+            // and a grant would never match the requirement it answers.
             let (id, id_length) = interface_id(kind);
             *slot = Binding {
                 name: capability::name_of(id.get(..id_length).unwrap_or(&[]), member.name()),
@@ -1567,6 +1584,7 @@ fn ports_of(state: &State, kind: u8) -> (i32, i32) {
         GRANT_STORE => (state.store_call, state.store_reply),
         GRANT_FS => (state.fs_call, state.fs_reply),
         GRANT_NET => (state.net_call, state.net_reply),
+        GRANT_HTTP => (state.http_call, state.http_reply),
         _ => (-1, -1),
     }
 }
@@ -1867,6 +1885,7 @@ entry! {
         fs_reply = 5,
         surface_in = 6,
         net_reply = 7,
+        http_reply = 8,
     }
     outputs {
         exit_out = 1,
@@ -1875,6 +1894,7 @@ entry! {
         store_call = 4,
         fs_call = 5,
         net_call = 6,
+        http_call = 7,
     }
 }
 

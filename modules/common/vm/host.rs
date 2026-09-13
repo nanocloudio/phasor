@@ -64,8 +64,8 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     }
 
     /// Make an admitted binding reachable as a member of a namespace object,
-    /// which is how an image's `phasor:` import is answered: the interface is
-    /// one object, its methods are the bindings the deployment granted.
+    /// which is how an image's capability import is answered: the interface
+    /// is one object, its methods are the bindings the deployment granted.
     ///
     /// A namespace is an ordinary object with ordinary properties. Nothing
     /// about it is privileged: it is reachable because it was granted, and
@@ -257,9 +257,9 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         }
     }
 
-    /// A string cell from UTF-8 bytes, which is how a payload reaches a
-    /// program. Malformed bytes are not a program error: the provider's
-    /// answer is its own, and the replacement character says what arrived.
+    /// A string cell holding a payload's bytes, one unit a byte, which is how
+    /// a payload reaches a program. No byte is a program error and none is
+    /// interpreted: what the provider answered is what the string holds.
     pub(super) fn payload_string(&mut self, bytes: &[u8]) -> Result<Value, Completion> {
         // One byte, one unit. A payload is bytes, and the string a program
         // receives is those bytes exactly — not a reading of them. Decoding
@@ -287,7 +287,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         Ok(Value::string(handle))
     }
 
-    /// Append a block of units to what has been decoded so far.
+    /// Append a block of units to the string built so far.
     fn join_units(&mut self, left: Option<Handle>, units: &[u16]) -> Result<Handle, Completion> {
         let block = string::create(self.heap, units).map_err(|_| Completion::HEAP_EXHAUSTED)?;
         match left {

@@ -40,6 +40,24 @@ modules:
       # stack goes. Without it the endpoint is its address and port, which
       # is honest but is not a name a certificate or a virtual host knows.
       authority: "localhost:8080"
+  # HTTP is Wave's, not this project's. The adapter turns a granted call into
+  # one exchange record and the answer back into a head and a stream; what
+  # protocol carried it, and which version, is the provider's business and
+  # reaches no program. One origin, named here, for the same reason the
+  # stream adapter names one endpoint.
+  - name: phasor_http
+    params:
+      # What the origin is called. A program may write this in a URL; one
+      # naming anywhere else is refused rather than answered by here.
+      authority: "localhost:8080"
+  - name: http
+    variant: exchange
+    params:
+      mode: 1              # client
+      protocol: 0          # HTTP/1.1
+      host_ip: 2130706433  # 127.0.0.1
+      port: 8080
+      authority: "localhost:8080"
   - name: phasor_fs
     params:
       writable: yes
@@ -75,6 +93,21 @@ wiring:
     to: linux_net.net_in
   - from: linux_net.net_out
     to: phasor_net.net_in
+  - from: phasor_shell.http_call
+    to: phasor_http.request_in
+  - from: phasor_http.reply_out
+    to: phasor_shell.http_reply
+  # The request as a record, and the response as a head then a body.
+  - from: phasor_http.publish_out
+    to: http.publish_in
+  - from: http.reply_out
+    to: phasor_http.reply_in
+  - from: http.file_ctrl
+    to: phasor_http.body_in
+  - from: http.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: http.net_in
   - from: phasor_shell.fs_call
     to: phasor_fs.request_in
   - from: phasor_fs.reply_out

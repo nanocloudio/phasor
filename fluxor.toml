@@ -9,6 +9,10 @@ version = "0.0.1"
 # store. Phasor does not vendor Fluxor and does not publish a sibling runtime.
 [dependencies]
 fluxor = "0.0.1"
+# HTTP is Wave's. This project speaks the exchange surface to it and owns no
+# protocol of its own: what version carried a request, and how its body was
+# framed, is the provider's business and reaches no program.
+wave = "0.0.1"
 
 [ci]
 targets = ["rp2350", "bcm2712", "wasm"]

@@ -507,10 +507,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .and_then(|imports| imports.get((base + import) as usize))
                 .copied();
             if let Some((source, slot)) = row {
-                // A capability row names a binding the deployment granted, not a
-                // module of the closure. Every walk over the closure passes it by:
-                // it has no source to visit, no cycle to join and no evaluation to
-                // wait on.
+                // A capability has no source to visit: not a module.
                 if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
                     import += 1;
                     continue;
@@ -559,10 +556,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .and_then(|imports| imports.get((base + import) as usize))
                 .copied();
             if let Some((source, slot)) = row {
-                // A capability row names a binding the deployment granted, not a
-                // module of the closure. Every walk over the closure passes it by:
-                // it has no source to visit, no cycle to join and no evaluation to
-                // wait on.
+                // A capability has no source to visit: not a module.
                 if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
                     import += 1;
                     continue;
@@ -734,10 +728,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .and_then(|imports| imports.get((base + import) as usize))
                 .copied();
             if let Some((source, slot)) = row {
-                // A capability row names a binding the deployment granted, not a
-                // module of the closure. Every walk over the closure passes it by:
-                // it has no source to visit, no cycle to join and no evaluation to
-                // wait on.
+                // A capability has no source to visit: not a module.
                 if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
                     import += 1;
                     continue;
@@ -794,10 +785,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     .and_then(|imports| imports.get((base + import) as usize))
                     .copied();
                 if let Some((source, slot)) = row {
-                    // A capability row names a binding the deployment granted, not a
-                    // module of the closure. Every walk over the closure passes it by:
-                    // it has no source to visit, no cycle to join and no evaluation to
-                    // wait on.
+                    // A capability has no source to visit: not a module.
                     if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
                         import += 1;
                         continue;
@@ -1312,10 +1300,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 .and_then(|imports| imports.get((base + import) as usize))
                 .copied();
             if let Some((source, _)) = row {
-                // A capability row names a binding the deployment granted, not a
-                // module of the closure. Every walk over the closure passes it by:
-                // it has no source to visit, no cycle to join and no evaluation to
-                // wait on.
+                // A capability has no source to visit: not a module.
                 if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
                     import += 1;
                     continue;

@@ -25,3 +25,10 @@ buffer_size  = 16
 
 [observability]
 exempt = "conformance fixture; its verdict stream and exit port are the recorded evidence"
+
+[build]
+# The oracle links the whole engine plus the harness, and at the default
+# opt-level its image sits within a kilobyte of the megabyte the loader
+# admits. Building this one for size rather than speed buys back the room:
+# it runs a suite, so its throughput is not what anything waits on.
+opt_level = "s"

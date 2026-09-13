@@ -77,13 +77,15 @@ target; it is not a Cargo crate and not a runtime of its own.
   each is served, in-flight calls, the records that cross with their payload
   lengths, and the generation-checked handles a provider's resources come
   back as.
-- `facade.rs` holds the standard surface as JavaScript source: console,
-  text encoding, base64, events, abort, timers, and structured clone. A host
-  compiles it and runs it in the realm before the program, so it is a
-  program rather than engine code and takes no privilege of its own.
+- `facade.rs` holds the standard surface as JavaScript source: console, text
+  encoding, base64, URLs, events, abort, timers, structured clone, and — where
+  the bindings they need were granted — `fetch` and `WebSocket`. A host
+  compiles it and runs it in the realm before the program, so it is a program
+  rather than engine code and takes no privilege of its own.
 - `capability.rs` reads what an image says it requires: every import whose
-  specifier carries the `phasor:` scheme, which a deployment checks against
-  what it granted before anything runs.
+  specifier carries a scheme, held to the capability grammar and named by the
+  digest of `<interface>#<member>`, which a deployment checks against what it
+  granted before anything runs.
 - `source.rs` holds source limits, UTF-8 decoding, and the line table that maps
   a byte offset to a line and column.
 - `numeric.rs` converts numeric literals to binary64 with correct rounding,

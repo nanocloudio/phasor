@@ -64,12 +64,20 @@ phasor --grant fs -e 'fs.read("README.md").then(t => t.length)'
 phasor --grant fs -e 'fs.write("note.txt", "written by a program")'
 ```
 
-The network is one endpoint and the deployment names it, so `--grant net`
-brings `fetch` and `fetch` goes where the graph said:
+HTTP is its own grant, because the protocol is its own provider's. `--grant
+http` brings `fetch`, and it goes to the origin the graph wired:
 
 ```sh
-phasor --grant net -e 'fetch("/hello.txt").then(r => r.text())'
-phasor --grant net -e 'fetch("/data.json").then(r => r.json()).then(v => v.n)'
+phasor --grant http -e 'fetch("/hello.txt").then(r => r.text())'
+phasor --grant http -e 'fetch("/data.json").then(r => r.json()).then(v => v.n)'
+```
+
+The connection is a separate grant and a lower one. `--grant net` gives bytes
+to that endpoint and nothing that reads them, which is what `WebSocket` is
+built on:
+
+```sh
+phasor --grant net -e 'net.endpoint()'
 ```
 
 `connect` takes no arguments because there is nothing for a program to

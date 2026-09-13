@@ -1,0 +1,45 @@
+version          = "0.0.1"
+hardware_targets = ["bcm2712"]
+
+# Call frames a router or a shell forwarded, each followed by its payload.
+[[ports]]
+name         = "request_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# The head of a response: an exchange `Reply` carrying the status and the
+# header block, which arrives before the body it describes.
+[[ports]]
+name         = "reply_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# The body, in length-framed chunks ended by a zero-length one.
+[[ports]]
+name         = "body_in"
+index        = 2
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# Completion frames, each followed by the bytes it answers with.
+[[ports]]
+name         = "reply_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# The request, as an exchange `Publish`. Where it goes is the graph's to say:
+# this adapter names no host and opens no socket.
+[[ports]]
+name         = "publish_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+[observability]
+exempt = "adapter whose evidence is the completions it emits"

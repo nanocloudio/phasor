@@ -156,7 +156,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             return Err(Completion::Terminated(Termination::NotImplemented));
         };
         let input = subject_units.get(..subject_length).unwrap_or(&[]);
-        let mut matcher = crate::regexp::Matcher { choices, undo };
+        let mut matcher = crate::regexp::Matcher {
+            choices,
+            undo,
+            halted: false,
+        };
         // The match spends the task's own fuel, so what it may spend is what
         // the task has left, up to the ceiling one match is allowed.
         let budget = u32::try_from(self.fuel.min(u64::from(REGEXP_FUEL))).unwrap_or(REGEXP_FUEL);
@@ -169,6 +173,13 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             if let Some(slots) = crate::regexp::run(&program, input, at, &mut matcher, &mut fuel) {
                 self.fuel = self.fuel.saturating_sub(u64::from(budget - fuel));
                 return Ok(Some(slots));
+            }
+            // The match did not fail: it was never decided. Saying "no match"
+            // here would answer a question nobody could answer, and a program
+            // reading that answer has no way to tell it from the truth.
+            if matcher.halted {
+                self.fuel = self.fuel.saturating_sub(u64::from(budget - fuel));
+                return Err(Completion::Terminated(Termination::FuelExhausted));
             }
             if sticky {
                 self.fuel = self.fuel.saturating_sub(u64::from(budget - fuel));

@@ -20,9 +20,8 @@ The scheme is part of the identity and not decoration: `wasi:sockets/tcp` is
 the published interface, and a `phasor:sockets/tcp` would be this project's
 own, and they are not the same capability. The whole of the name is therefore
 `digest("wasi:sockets/tcp#connect")`, and both ends compute it with one
-function —
-`capability::name_of` — because two implementations of one name is how they
-came to disagree about it.
+function, `capability::name_of`: two implementations of one name are two
+names.
 
 An image states what it requires through an import carrying a scheme, and the
 deployment checks each requirement against what it granted before anything
@@ -39,11 +38,14 @@ capability it could not then reach would answer the requirement with the very
 ### The grammar
 
 ```text
-specifier := scheme ":" interface
+interface := scheme ":" path
 scheme    := [a-z] [a-z0-9-]*
-interface := [a-z0-9] [a-z0-9/._@-]*
+path      := [a-z0-9] [a-z0-9/._@-]*
 member    := [A-Za-z] [A-Za-z0-9]*
 ```
+
+The interface is the whole of that production, scheme included, which is what
+the digest covers. A member is at most 32 bytes.
 
 A specifier carrying a scheme is a capability, whatever the scheme is: that is
 the shape rather than a list, so no scheme is privileged and `wasi:` is read
@@ -87,7 +89,7 @@ reason anybody chose.
 | Interface | Member | Class | Adapter | What it grants |
 |---|---|---|---|---|
 | `wasi:clocks/wall-clock` | `now` | snapshot | `phasor_time` | The time, in milliseconds, as of the task boundary |
-| `wasi:clocks/monotonic-clock` | `sleep` | async | `phasor_time` | Being told later, which is what a timer is built on |
+| | `sleep` | async | | Being told later, which is what a timer is built on |
 | `wasi:random/random` | `random` | async | `phasor_entropy` | A number the platform's own source produced |
 | `wasi:filesystem/types` | `read` | async | `phasor_fs` | The bytes of a file under the root |
 | | `write` | async | | Bytes into a file under the root, created if absent |
@@ -101,6 +103,11 @@ reason anybody chose.
 | | `delete` | async | | Removing a key |
 | | `open` | async | | A handle over an entry |
 | | `readAt` | async | | Bytes through a handle |
+| `wasi:http/outgoing-handler` | `send` | async | `phasor_http` | A request performed against the wired origin, answered with a handle over the response |
+| | `status` | async | | The response's status, once there is one |
+| | `headers` | async | | The response's header block |
+| | `read` | async | | Bytes of the body through the handle; nothing when it is whole |
+| | `close` | async | | Releasing the response |
 | `wasi:sockets/tcp` | `connect` | async | `phasor_net` | A handle over a connection to the one wired endpoint |
 | | `send` | async | | Bytes onto a connection |
 | | `receive` | async | | Bytes off a connection, up to a length |
@@ -108,7 +115,7 @@ reason anybody chose.
 | | `endpoint` | async | | What the deployment called the endpoint it wired |
 
 The shell names each interface by a short namespace a program calls it
-through: `clock`, `entropy`, `fs`, `store`, `net`. That name is the
+through: `clock`, `entropy`, `fs`, `store`, `net`, `http`. That name is the
 JavaScript surface and has nothing to do with admission; the identifier
 above is what the deployment grants and what the digest covers.
 
@@ -130,6 +137,17 @@ can reach.
 job. Bytes travel behind the fixed frame in both directions, and a provider
 that answers with a resource answers with a handle the issuing binding
 checks.
+
+An adapter reading the network stack's outbound lane shares it. The lane
+carries every connection the graph has open, whoever opened it, and a copy
+reaches every adapter wired to it — so an adapter takes only what it asked
+for, and passes over the rest without keeping it. The rule matters more than
+it sounds: an adapter that adopts a connection it did not open buffers a
+stream nothing will ever read, and once that buffer is full it stops taking
+from the lane at all, which stops it for the module the connection actually
+belongs to. One adapter's tidiness is another's liveness. `tests/e2e/http.sh`
+holds this with a response large enough to fill a buffer, run on a graph that
+wires a second adapter to the same lane.
 
 ## What a payload is
 
@@ -163,10 +181,9 @@ such byte exists. A call with no arguments carries no payload at all.
 
 ## Where the façade lives
 
-A façade is a module of the closure, linked ahead of the program. Nothing
-new was needed for that: the isolate already runs linked closures, so a
-deployment compiles its surface, links it first, and the program imports from
-it. `tests/e2e/closure.sh` proves it end to end.
+A façade is a module of the closure, linked ahead of the program. The isolate
+runs linked closures, so a deployment compiles its surface, links it first,
+and the program imports from it. `tests/e2e/closure.sh` proves it end to end.
 
 The shell runs scripts rather than closures and so has nowhere to link one.
 It reads the surface over a port instead: `phasor_surface` writes the source
@@ -205,7 +222,7 @@ build the graph at all.
 
 ### The ledger
 
-Four things are tolerated today so that anything works at all. Each is named,
+Four things are tolerated so that anything works at all. Each is named,
 each is held by `tests/e2e/tls.sh`, and each has the one change that deletes
 it — not a setting that hides it.
 
@@ -225,6 +242,17 @@ Until all four are gone, `ca_dns` does not mean the same thing on every
 target, and anything relying on it says which target it means.
 
 ## What is not here
+
+HTTP is a capability of its own, and the protocol is not this project's. A
+granted call crosses one seam as a record and the answer comes back as a head
+and then a stream, so what version carried it and how the body was framed
+reaches no program — and a deployment that wants HTTP/2 wires a provider that
+has it rather than waiting for the surface to grow one. `fetch` is the surface
+over that binding and owns no framing at all.
+
+A response is a resource: `send` answers a handle, the status and the headers
+are read from it, and the body is read through it in pieces exactly as a file
+is. That is what makes a response unbounded — nothing holds all of one.
 
 The network interface is one endpoint, and the deployment names it: the graph
 gives `phasor_net` an address, a port, and optionally an authority — the name

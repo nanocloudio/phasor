@@ -67,7 +67,8 @@ printf '40 + 2' | fluxor run examples/addition/linux.yaml
 
 The engine as a command is the `phasor` applet: a script on standard input,
 `-e` for an expression, `-i` for a REPL over one realm, and `--grant` for the
-clock and entropy bindings, which are the only authority a program can have.
+clock, entropy, store, filesystem and network bindings, which are the only
+authority a program can have.
 
 ```sh
 fluxor install packaging/cli/workload.toml --link ~/.cargo/bin

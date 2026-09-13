@@ -1,8 +1,8 @@
 //! Host bindings: the typed seam between a program and a capability.
 //!
 //! A program reaches the outside only through a binding the deployment
-//! admitted. A binding names what it is, how it is served, and
-//! how many calls may be outstanding at once. The engine holds no provider
+//! admitted. A binding names what it is, how it is served, and how many calls
+//! may be outstanding at once. The engine holds no provider
 //! address, no credential, and no transport: it produces a call record and
 //! consumes a completion record, and something else moves them.
 //!

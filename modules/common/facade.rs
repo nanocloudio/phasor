@@ -16,8 +16,7 @@
 
 /// The façade's source. A host compiles it once and runs it in the realm
 /// before the program, so what a program sees is already there.
-pub const SOURCE: &[u8] =
-    br##"// The standard surface a program finds before it runs, as a program itself.
+pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it runs, as a program itself.
 //
 // Everything here is a pure function of its arguments and the heap, or it
 // goes through a capability the deployment granted. Nothing reaches the
@@ -519,14 +518,21 @@ pub const SOURCE: &[u8] =
   G.__textToBytes = textToBytes;
 
   // ---- fetch --------------------------------------------------------
-  // HTTP over the one connection the deployment wired. There is no resolver
-  // and no address here: `net.connect()` goes where the graph said, so a URL
-  // whose host is not that endpoint is refused rather than quietly retargeted.
-  if (typeof net === "object" && net && typeof net.connect === "function") {
+  // HTTP over the binding a deployment granted. What protocol carried the
+  // request, which version it negotiated and how the body was framed on the
+  // wire are the provider's business and reach nothing here: this composes a
+  // request, hands it over, and reads the response back through the handle it
+  // was answered with.
+  //
+  // The response is a resource, so its body has no length this has to know in
+  // advance and no buffer here has to hold all of one.
+  if (typeof http === "object" && http && typeof http.send === "function") {
     G.Headers = class Headers {
       constructor(init) {
         this._pairs = [];
-        if (init && typeof init === "object") {
+        if (init instanceof G.Headers) {
+          init.forEach((value, name) => this.append(name, value));
+        } else if (init && typeof init === "object") {
           const keys = Object.keys(init);
           for (let i = 0; i < keys.length; i++) this.set(keys[i], init[keys[i]]);
         }
@@ -552,19 +558,42 @@ pub const SOURCE: &[u8] =
       }
     };
 
+    // The header block a response came with, as fields rather than bytes.
+    function parseFields(block) {
+      const headers = new G.Headers();
+      const lines = block.split("\r\n");
+      for (let i = 0; i < lines.length; i++) {
+        const at = lines[i].indexOf(":");
+        if (at > 0) headers.set(lines[i].substring(0, at), lines[i].substring(at + 1).trim());
+      }
+      return headers;
+    }
+
+    // Read the whole body through the handle. Each read answers what is
+    // there; nothing answers that the body is done, which is the one thing a
+    // reader cannot infer from a pause.
+    function drain(handle, held) {
+      return http.read(handle, 8192).then(function (chunk) {
+        if (chunk.length === 0) return held;
+        return drain(handle, held + chunk);
+      });
+    }
+
     G.Response = class Response {
       constructor(body, options) {
         const settings = options === undefined ? {} : options;
         this._body = body === undefined ? "" : String(body);
         this.status = settings.status === undefined ? 200 : settings.status;
         this.statusText = settings.statusText === undefined ? "" : String(settings.statusText);
-        this.headers = new G.Headers(settings.headers);
+        this.headers = settings.headers instanceof G.Headers
+          ? settings.headers
+          : new G.Headers(settings.headers);
         this.ok = this.status >= 200 && this.status < 300;
         this.url = settings.url === undefined ? "" : String(settings.url);
         this.bodyUsed = false;
       }
-      // `_body` holds bytes. Reading it as text is a decode, and a body
-      // that is not text keeps its bytes.
+      // `_body` holds bytes. Reading it as text is a decode, and a body that
+      // is not text keeps its bytes.
       text() { this.bodyUsed = true; return Promise.resolve(G.__bytesToText(this._body)); }
       json() {
         const body = this._body;
@@ -581,76 +610,50 @@ pub const SOURCE: &[u8] =
       }
     };
 
-    // Read until the message is whole: the headers say how long the body is,
-    // and a connection that closes ends a body that said nothing.
-    function drain(handle, text) {
-      return net.receive(handle, 8192).then(function (chunk) {
-        const grown = text + chunk;
-        const split = grown.indexOf("\r\n\r\n");
-        if (split < 0) {
-          if (chunk.length === 0) return grown;
-          return drain(handle, grown);
-        }
-        const head = grown.substring(0, split);
-        const body = grown.substring(split + 4);
-        const declared = /content-length:\s*(\d+)/i.exec(head);
-        if (declared !== null && body.length >= parseInt(declared[1], 10)) return grown;
-        if (chunk.length === 0) return grown;
-        return drain(handle, grown);
-      });
-    }
-
     G.fetch = function fetch(resource, options) {
       const settings = options === undefined ? {} : options;
-      return net.endpoint().then(function (endpoint) {
-        let path = String(resource);
-        let host = endpoint;
-        if (path.indexOf("://") >= 0) {
-          const target = new G.URL(path);
-          host = target.host;
-          path = target.pathname + (target.search === undefined ? "" : target.search);
-          if (host !== endpoint) {
-            throw new TypeError("fetch: " + host + " is not the granted endpoint " + endpoint);
-          }
+      let path = String(resource);
+      let named = null;
+      // A deployment wires one origin. A URL naming another is refused rather
+      // than sent to the one that was wired: answering it would hand a
+      // program one origin's response while it believed it was reading
+      // another's, which is worse than not answering at all.
+      if (path.indexOf("://") >= 0) {
+        const target = new G.URL(path);
+        named = target.host;
+        path = target.pathname + (target.search === undefined ? "" : target.search);
+      }
+      if (path.length === 0 || path[0] !== "/") path = "/" + path;
+      const method = settings.method === undefined ? "GET" : String(settings.method).toUpperCase();
+      const body = settings.body === undefined ? "" : G.__textToBytes(String(settings.body));
+      let block = "";
+      if (settings.headers) {
+        new G.Headers(settings.headers).forEach(function (value, name) {
+          block += name + ": " + value + "\r\n";
+        });
+      }
+      let handle = null;
+      return http.origin().then(function (origin) {
+        if (named !== null && named !== origin) {
+          throw new TypeError(
+            "fetch: " + named + " is not the granted origin " + origin);
         }
-        if (path.length === 0 || path[0] !== "/") path = "/" + path;
-        const method = settings.method === undefined ? "GET" : String(settings.method);
-        const body =
-          settings.body === undefined ? "" : G.__textToBytes(String(settings.body));
-        let request = method + " " + path + " HTTP/1.1\r\nHost: " + endpoint + "\r\n";
-        request += "Connection: close\r\n";
-        if (settings.headers) {
-          const supplied = new G.Headers(settings.headers);
-          supplied.forEach(function (value, name) { request += name + ": " + value + "\r\n"; });
-        }
-        if (body.length > 0) request += "Content-Length: " + body.length + "\r\n";
-        request += "\r\n" + body;
-        return net.connect().then(function (handle) {
-          return net
-            .send(handle, request)
-            .then(function () { return drain(handle, ""); })
-            .then(function (message) {
-              return net.close(handle).then(function () { return message; });
+        return http.send(method, path, block, body);
+      }).then(function (opened) {
+        handle = opened;
+        return http.status(handle);
+      }).then(function (status) {
+        return http.headers(handle).then(function (block) {
+          return drain(handle, "").then(function (body) {
+            return http.close(handle).then(function () {
+              return new G.Response(body, {
+                status: status,
+                headers: parseFields(G.__bytesToText(block)),
+                url: String(resource),
+              });
             });
+          });
         });
-      }).then(function (message) {
-        const split = message.indexOf("\r\n\r\n");
-        const head = split < 0 ? message : message.substring(0, split);
-        const body = split < 0 ? "" : message.substring(split + 4);
-        const lines = head.split("\r\n");
-        const status = /HTTP\/1\.[01]\s+(\d+)\s*(.*)/.exec(lines[0]);
-        const headers = new G.Headers();
-        for (let i = 1; i < lines.length; i++) {
-          const at = lines[i].indexOf(":");
-          if (at > 0) headers.set(lines[i].substring(0, at), lines[i].substring(at + 1).trim());
-        }
-        const response = new G.Response(body, {
-          status: status === null ? 0 : parseInt(status[1], 10),
-          statusText: status === null ? "" : status[2],
-          url: String(resource),
-        });
-        headers.forEach(function (value, name) { response.headers.set(name, value); });
-        return response;
       });
     };
   }

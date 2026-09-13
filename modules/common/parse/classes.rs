@@ -238,12 +238,18 @@ impl<'s, 't, 'a, 'k> Parser<'s, 't, 'a, 'k> {
                 .node(key)
                 .copied()
                 .unwrap_or(Node::new(NodeKind::Null, 0, 0));
+            // Compared inside the option rather than against `Some(b"...")`:
+            // the latter needs a `&[u8]` built into a constant, which is a
+            // pointer in a static, which is a relocation a loaded module
+            // never gets. The optimizer folds it away at some levels and not
+            // at others, and a segfault that depends on the optimizer is not
+            // a thing to leave in the source.
             if node.third == property_key::IDENTIFIER
                 && self
                     .lexer
                     .source()
                     .get(node.first as usize..node.second as usize)
-                    == Some(b"constructor")
+                    .is_some_and(|name| name == b"constructor")
             {
                 kind = class_member::CONSTRUCTOR;
             }
