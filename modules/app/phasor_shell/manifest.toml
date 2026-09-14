@@ -78,6 +78,14 @@ direction    = "input"
 content_type = "OctetStream"
 buffer_size  = 16384
 
+# Completion frames from the WebSocket adapter, each followed by its bytes.
+[[ports]]
+name         = "ws_reply"
+index        = 9
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
 # Values, printed lines, prompts, and failures in words.
 [[ports]]
 name         = "stdout"
@@ -136,6 +144,14 @@ buffer_size  = 16384
 [[ports]]
 name         = "http_call"
 index        = 7
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# Call frames for the WebSocket binding, each followed by its payload.
+[[ports]]
+name         = "ws_call"
+index        = 8
 direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 16384

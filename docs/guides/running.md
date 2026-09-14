@@ -73,8 +73,7 @@ phasor --grant http -e 'fetch("/data.json").then(r => r.json()).then(v => v.n)'
 ```
 
 The connection is a separate grant and a lower one. `--grant net` gives bytes
-to that endpoint and nothing that reads them, which is what `WebSocket` is
-built on:
+to that endpoint and nothing that reads them:
 
 ```sh
 phasor --grant net -e 'net.endpoint()'
@@ -90,18 +89,21 @@ Without the grant there is no `net` and no `fetch` either: the surface
 defines it over the binding, so a program that was granted nothing finds
 nothing.
 
-A WebSocket is a request that changes protocol, so it needs the same
-connection and, because a client must mask what it sends, the randomness to
-mask with:
+A WebSocket is its own grant, because it is its own protocol: the upgrade,
+the accept it verifies, the masking and the frame codec are the provider's,
+and the surface keeps only the shape the language promises.
 
 ```sh
-phasor --grant net --grant entropy -e '
+phasor --grant websocket -e '
 new Promise(done => {
   const ws = new WebSocket("/chat");
   ws.addEventListener("open", () => ws.send("hello"));
   ws.addEventListener("message", e => { ws.close(); done(e.data); });
 })'
 ```
+
+The origin is the deployment's here too: a `ws://` URL naming another host is
+refused rather than answered by the one that was wired.
 
 Granting the clock also brings timers, because being told later is what the
 clock's `sleep` is:

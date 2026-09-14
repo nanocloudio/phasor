@@ -61,6 +61,20 @@ modules:
   - name: phasor_fs
     params:
       writable: yes
+  # A WebSocket is RFC 6455, and RFC 6455 is Wave's. This adapter turns a
+  # granted call into an open, a frame, or a close; the upgrade and the
+  # accept it verifies happen in the provider, which reaches the same
+  # endpoint the HTTP one does.
+  - name: phasor_ws
+    params:
+      # What the endpoint is called, so a URL naming another host is refused
+      # rather than quietly answered by this one.
+      authority: "localhost:8080"
+  - name: websocket
+    params:
+      # 127.0.0.1:8080, the endpoint the graph names and no program can.
+      endpoint: "7f000001901f"
+      host: "localhost:8080"
 
 wiring:
   - from: cli_in.args_out
@@ -108,6 +122,31 @@ wiring:
     to: linux_net.net_in
   - from: linux_net.net_out
     to: http.net_in
+  - from: phasor_shell.ws_call
+    to: phasor_ws.request_in
+  - from: phasor_ws.reply_out
+    to: phasor_shell.ws_reply
+  # Opens and frames to the provider; what became of a link, and the messages
+  # it carried, back.
+  - from: phasor_ws.open_out
+    to: websocket.open_in
+  # A non-zero `buffer_group` puts a channel in mailbox mode, where a write
+  # is one whole envelope and a read takes one whole envelope. A `WsFrame` is
+  # an envelope, and the default byte FIFO would hand a reader part of one --
+  # a length that is not there. Distinct groups for the two directions:
+  # sharing one would alias their buffers.
+  - from: phasor_ws.frames_out
+    to: websocket.ws_in
+    buffer_group: 5
+  - from: websocket.event_out
+    to: phasor_ws.event_in
+  - from: websocket.ws_out
+    to: phasor_ws.frames_in
+    buffer_group: 6
+  - from: websocket.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: websocket.net_in
   - from: phasor_shell.fs_call
     to: phasor_fs.request_in
   - from: phasor_fs.reply_out

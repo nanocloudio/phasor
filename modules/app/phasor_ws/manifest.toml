@@ -1,0 +1,56 @@
+version          = "0.0.1"
+hardware_targets = ["bcm2712"]
+
+# Call frames a router or a shell forwarded, each followed by its payload.
+[[ports]]
+name         = "request_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# What became of a link: `[conn: u8][event: u8][code: u16 LE]`, which is the
+# provider's record and not this adapter's invention.
+[[ports]]
+name         = "event_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 1024
+
+# Messages that arrived, as `WsFrame`. The envelope is Fluxor's, so which
+# link a message came from and whether it was text or binary are read from
+# the contract rather than from anything agreed here.
+[[ports]]
+name         = "frames_in"
+index        = 2
+direction    = "input"
+content_type = "WsFrame"
+buffer_size  = 16384
+
+# Completion frames, each followed by the bytes it answers with.
+[[ports]]
+name         = "reply_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# `[conn: u8][path…]` — open that link on that resource. Where the endpoint
+# is stays the graph's to say: this adapter names no host and opens no socket.
+[[ports]]
+name         = "open_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+max_record   = 129
+buffer_size  = 1024
+
+# Messages to send, as `WsFrame`.
+[[ports]]
+name         = "frames_out"
+index        = 2
+direction    = "output"
+content_type = "WsFrame"
+buffer_size  = 16384
+
+[observability]
+exempt = "adapter whose evidence is the completions it emits"

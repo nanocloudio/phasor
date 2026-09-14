@@ -216,7 +216,7 @@ const TRACE: u64 = 0x5041_5348_4f52_0002;
 /// The interfaces a person may grant. Each is a port pair on this module and
 /// an adapter the graph wires to it, and each carries members: the bindings
 /// the deployment admits, one per operation the interface offers.
-const MAX_GRANTS: usize = 6;
+const MAX_GRANTS: usize = 7;
 /// Bindings across every granted interface.
 const MAX_BINDINGS: usize = 16;
 /// Members one interface may carry.
@@ -227,6 +227,7 @@ const GRANT_STORE: u8 = 3;
 const GRANT_FS: u8 = 4;
 const GRANT_NET: u8 = 5;
 const GRANT_HTTP: u8 = 6;
+const GRANT_WS: u8 = 7;
 const PENDING_COUNT: usize = 16;
 const IN_FLIGHT_MAX: u32 = 8;
 /// Resources a program may hold open at once.
@@ -297,6 +298,14 @@ fn members(kind: u8) -> ([Member; MAX_MEMBERS], usize) {
             out[4] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 4);
             out[5] = Member::new(*b"origin\0\0", 6, binding::Class::Async, 5);
             6
+        }
+        GRANT_WS => {
+            out[0] = Member::new(*b"open\0\0\0\0", 4, binding::Class::Async, 0);
+            out[1] = Member::new(*b"send\0\0\0\0", 4, binding::Class::Async, 1);
+            out[2] = Member::new(*b"receive\0", 7, binding::Class::Async, 2);
+            out[3] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 3);
+            out[4] = Member::new(*b"origin\0\0", 6, binding::Class::Async, 4);
+            5
         }
         GRANT_NET => {
             out[0] = Member::new(*b"connect\0", 7, binding::Class::Async, 0);
@@ -399,6 +408,7 @@ struct State {
     fs_reply: i32,
     net_reply: i32,
     http_reply: i32,
+    ws_reply: i32,
     surface_in: i32,
     exit_out: i32,
     clock_call: i32,
@@ -407,6 +417,7 @@ struct State {
     fs_call: i32,
     net_call: i32,
     http_call: i32,
+    ws_call: i32,
 
     mode: u8,
     phase: u8,
@@ -846,24 +857,29 @@ fn interface_id(kind: u8) -> ([u8; capability::MAX_INTERFACE], usize) {
         GRANT_ENTROPY => (*b"wasi:random/random\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 18),
         GRANT_FS => (*b"wasi:filesystem/types\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 21),
         GRANT_HTTP => (*b"wasi:http/outgoing-handler\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 26),
+        GRANT_WS => (*b"phasor:net/websocket\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20),
         GRANT_NET => (*b"wasi:sockets/tcp\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16),
         GRANT_STORE => (*b"phasor:store/keyvalue\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 21),
         _ => ([0; capability::MAX_INTERFACE], 0),
     }
 }
 
+/// The longest name a program calls an interface by.
+const GRANT_NAME_MAX: usize = 16;
+
 /// The name a program calls an interface by, which is the namespace it finds
 /// in the realm. Held inline: a match returning borrowed literals becomes a
 /// switch table of pointers, and a module image takes no relocations for one.
-fn grant_name(kind: u8) -> ([u8; 8], usize) {
+fn grant_name(kind: u8) -> ([u8; GRANT_NAME_MAX], usize) {
     match kind {
-        GRANT_CLOCK => (*b"clock\0\0\0", 5),
-        GRANT_ENTROPY => (*b"entropy\0", 7),
-        GRANT_STORE => (*b"store\0\0\0", 5),
-        GRANT_FS => (*b"fs\0\0\0\0\0\0", 2),
-        GRANT_NET => (*b"net\0\0\0\0\0", 3),
-        GRANT_HTTP => (*b"http\0\0\0\0", 4),
-        _ => ([0; 8], 0),
+        GRANT_CLOCK => (*b"clock\0\0\0\0\0\0\0\0\0\0\0", 5),
+        GRANT_ENTROPY => (*b"entropy\0\0\0\0\0\0\0\0\0", 7),
+        GRANT_STORE => (*b"store\0\0\0\0\0\0\0\0\0\0\0", 5),
+        GRANT_FS => (*b"fs\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 2),
+        GRANT_NET => (*b"net\0\0\0\0\0\0\0\0\0\0\0\0\0", 3),
+        GRANT_HTTP => (*b"http\0\0\0\0\0\0\0\0\0\0\0\0", 4),
+        GRANT_WS => (*b"websocket\0\0\0\0\0\0\0", 9),
+        _ => ([0; GRANT_NAME_MAX], 0),
     }
 }
 
@@ -876,6 +892,7 @@ fn grant_of(word: &[u8]) -> Option<u8> {
         b"fs" => Some(GRANT_FS),
         b"net" => Some(GRANT_NET),
         b"http" => Some(GRANT_HTTP),
+        b"websocket" => Some(GRANT_WS),
         _ => None,
     }
 }
@@ -1585,6 +1602,7 @@ fn ports_of(state: &State, kind: u8) -> (i32, i32) {
         GRANT_FS => (state.fs_call, state.fs_reply),
         GRANT_NET => (state.net_call, state.net_reply),
         GRANT_HTTP => (state.http_call, state.http_reply),
+        GRANT_WS => (state.ws_call, state.ws_reply),
         _ => (-1, -1),
     }
 }
@@ -1886,6 +1904,7 @@ entry! {
         surface_in = 6,
         net_reply = 7,
         http_reply = 8,
+        ws_reply = 9,
     }
     outputs {
         exit_out = 1,
@@ -1895,6 +1914,7 @@ entry! {
         fs_call = 5,
         net_call = 6,
         http_call = 7,
+        ws_call = 8,
     }
 }
 

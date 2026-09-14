@@ -659,277 +659,99 @@ pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it
   }
 
   // ---- WebSocket -------------------------------------------------------
-  // RFC 6455 over the same connection `fetch` uses. It needs no capability
-  // of its own: a WebSocket is an HTTP request that changes protocol, and
-  // the protocol above it is frames this file writes and reads. Masking is
-  // required of a client and must be unpredictable, so it needs randomness
-  // the deployment granted -- without `entropy` there is no WebSocket, for
-  // the same reason there is no `fetch` without `net`.
-  if (typeof net === "object" && net && typeof entropy === "object" && entropy) {
-    // SHA-1 over a byte string. Present only to check the server's
-    // `Sec-WebSocket-Accept`, which is the one part of the handshake that
-    // proves the peer read the key rather than echoing a constant.
-    function sha1(bytes) {
-      const h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-      const total = bytes.length;
-      let padded = bytes + String.fromCharCode(0x80);
-      while (padded.length % 64 !== 56) padded += String.fromCharCode(0);
-      const bits = total * 8;
-      for (let i = 7; i >= 0; i--) {
-        padded += String.fromCharCode(Math.floor(bits / Math.pow(2, i * 8)) & 0xFF);
-      }
-      const w = new Array(80);
-      for (let at = 0; at < padded.length; at += 64) {
-        for (let i = 0; i < 16; i++) {
-          w[i] = (padded.charCodeAt(at + i * 4) << 24)
-            | (padded.charCodeAt(at + i * 4 + 1) << 16)
-            | (padded.charCodeAt(at + i * 4 + 2) << 8)
-            | padded.charCodeAt(at + i * 4 + 3);
-        }
-        for (let i = 16; i < 80; i++) {
-          const v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
-          w[i] = (v << 1) | (v >>> 31);
-        }
-        let [a, b, c, d, e] = h;
-        for (let i = 0; i < 80; i++) {
-          let f;
-          let k;
-          if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
-          else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
-          else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-          else { f = b ^ c ^ d; k = 0xCA62C1D6; }
-          const t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) | 0;
-          e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;
-        }
-        h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0;
-        h[3] = (h[3] + d) | 0; h[4] = (h[4] + e) | 0;
-      }
-      let out = "";
-      for (let i = 0; i < 5; i++) {
-        out += String.fromCharCode((h[i] >>> 24) & 0xFF, (h[i] >>> 16) & 0xFF,
-          (h[i] >>> 8) & 0xFF, h[i] & 0xFF);
-      }
-      return out;
-    }
-
-    const ACCEPT_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-    // Four bytes from the granted source. A mask a peer can predict is no
-    // mask at all, so this is a call and not a counter.
-    function maskKey() {
-      return entropy.random().then(function (value) {
-        let held = Math.abs(Math.floor(value));
-        let out = "";
-        for (let i = 0; i < 4; i++) {
-          out += String.fromCharCode(held & 0xFF);
-          held = Math.floor(held / 256);
-        }
-        return out;
-      });
-    }
-
-    function frame(opcode, payload, mask) {
-      let head = String.fromCharCode(0x80 | opcode);
-      const length = payload.length;
-      if (length < 126) head += String.fromCharCode(0x80 | length);
-      else if (length < 65536) {
-        head += String.fromCharCode(0x80 | 126, (length >> 8) & 0xFF, length & 0xFF);
-      } else {
-        head += String.fromCharCode(0x80 | 127, 0, 0, 0, 0,
-          (length >>> 24) & 0xFF, (length >>> 16) & 0xFF,
-          (length >>> 8) & 0xFF, length & 0xFF);
-      }
-      let masked = "";
-      for (let i = 0; i < length; i++) {
-        masked += String.fromCharCode(payload.charCodeAt(i) ^ mask.charCodeAt(i % 4));
-      }
-      return head + mask + masked;
-    }
-
-    // One frame off the front of `buffer`, or nothing when it is not all
-    // here yet. A server never masks, which RFC 6455 requires and this
-    // checks rather than assumes.
-    function unframe(buffer) {
-      if (buffer.length < 2) return null;
-      const first = buffer.charCodeAt(0);
-      const second = buffer.charCodeAt(1);
-      if ((second & 0x80) !== 0) return { fault: "masked frame from server" };
-      let length = second & 0x7F;
-      let at = 2;
-      if (length === 126) {
-        if (buffer.length < 4) return null;
-        length = (buffer.charCodeAt(2) << 8) | buffer.charCodeAt(3);
-        at = 4;
-      } else if (length === 127) {
-        if (buffer.length < 10) return null;
-        length = 0;
-        for (let i = 2; i < 10; i++) length = length * 256 + buffer.charCodeAt(i);
-        at = 10;
-      }
-      if (buffer.length < at + length) return null;
-      return {
-        fin: (first & 0x80) !== 0,
-        opcode: first & 0x0F,
-        payload: buffer.substring(at, at + length),
-        rest: buffer.substring(at + length),
-      };
-    }
-
+  // RFC 6455, served rather than written here. The upgrade, the accept it
+  // verifies, the masking and the frame codec belong to the provider the
+  // deployment wired: one implementation for every consumer on the platform,
+  // instead of a second one in JavaScript paying for the SHA-1 of every
+  // handshake out of the program's own fuel.
+  //
+  // What is left here is the shape the language promises -- an EventTarget
+  // that opens, carries messages, and closes -- over four calls.
+  if (typeof websocket === "object" && websocket) {
     G.WebSocket = class WebSocket extends G.EventTarget {
       constructor(url) {
         super();
         this.url = String(url);
         this.readyState = 0;
         this.bufferedAmount = 0;
+        this.binaryType = "blob";
         this._handle = null;
-        this._buffer = "";
-        this._fragments = "";
-        this._fragmentOpcode = 0;
         const socket = this;
-        net.endpoint().then(function (endpoint) {
-          let path = socket.url;
-          const scheme = /^wss?:\/\//i.exec(path);
-          if (scheme !== null) {
-            const rest = path.substring(scheme[0].length);
-            const cut = rest.indexOf("/");
-            const host = cut < 0 ? rest : rest.substring(0, cut);
-            if (host !== endpoint) {
-              throw new TypeError(
-                "WebSocket: " + host + " is not the granted endpoint " + endpoint);
-            }
-            path = cut < 0 ? "/" : rest.substring(cut);
+        // The origin is the deployment's and the resource is the program's,
+        // which is the same split `fetch` makes. A URL naming another host is
+        // refused, because the alternative is handing a program one origin's
+        // stream while it believes it reached another.
+        let path = this.url;
+        let named = null;
+        const scheme = /^wss?:\/\//i.exec(path);
+        if (scheme !== null) {
+          const rest = path.substring(scheme[0].length);
+          const cut = rest.indexOf("/");
+          named = cut < 0 ? rest : rest.substring(0, cut);
+          path = cut < 0 ? "/" : rest.substring(cut);
+        }
+        if (path.length === 0 || path[0] !== "/") path = "/" + path;
+        websocket.origin().then(function (origin) {
+          if (named !== null && named !== origin) {
+            throw new TypeError(
+              "WebSocket: " + named + " is not the granted origin " + origin);
           }
-          if (path.length === 0 || path[0] !== "/") path = "/" + path;
-          return maskKey().then(function (a) {
-            return maskKey().then(function (b) {
-              return maskKey().then(function (c) {
-                return maskKey().then(function (d) {
-                  const nonce = G.btoa(a + b + c + d);
-                  const request = "GET " + path + " HTTP/1.1\r\n"
-                    + "Host: " + endpoint + "\r\n"
-                    + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                    + "Sec-WebSocket-Key: " + nonce + "\r\n"
-                    + "Sec-WebSocket-Version: 13\r\n\r\n";
-                  return net.connect().then(function (handle) {
-                    socket._handle = handle;
-                    return net.send(handle, request).then(function () {
-                      return socket._handshake(nonce);
-                    });
-                  });
-                });
-              });
-            });
-          });
-        }).then(undefined, function (error) { socket._fail(error); });
-      }
-
-      // Read until the response head is whole, then hold the server to the
-      // accept it must have computed from the key.
-      _handshake(nonce) {
-        const socket = this;
-        return net.receive(socket._handle, 4096).then(function (chunk) {
-          if (chunk.length === 0) throw new Error("WebSocket: closed during handshake");
-          socket._buffer += chunk;
-          const split = socket._buffer.indexOf("\r\n\r\n");
-          if (split < 0) return socket._handshake(nonce);
-          const head = socket._buffer.substring(0, split);
-          socket._buffer = socket._buffer.substring(split + 4);
-          if (!/^HTTP\/1\.1\s+101/.test(head)) {
-            throw new Error("WebSocket: not upgraded: " + head.split("\r\n")[0]);
-          }
-          const offered = /sec-websocket-accept:\s*(\S+)/i.exec(head);
-          const wanted = G.btoa(sha1(nonce + ACCEPT_MAGIC));
-          if (offered === null || offered[1] !== wanted) {
-            throw new Error("WebSocket: the accept does not answer the key");
-          }
+          return websocket.open(path);
+        }).then(function (handle) {
+          socket._handle = handle;
           socket.readyState = 1;
-          socket.dispatchEvent(new G.Event("open"));
+          socket.dispatchEvent({ type: "open" });
           socket._pump();
-          return undefined;
+        }, function (error) {
+          socket._fail(error);
         });
       }
 
+      // One read outstanding at a time: the provider holds the next message
+      // until this one is taken, so nothing is lost by not asking for two.
       _pump() {
         const socket = this;
-        if (socket.readyState > 2) return;
-        net.receive(socket._handle, 8192).then(function (chunk) {
-          if (chunk.length === 0) { socket._shut(1006, ""); return; }
-          socket._buffer += chunk;
-          while (true) {
-            const taken = unframe(socket._buffer);
-            if (taken === null) break;
-            if (taken.fault !== undefined) { socket._fail(new Error(taken.fault)); return; }
-            socket._buffer = taken.rest;
-            socket._take(taken);
-          }
+        if (socket.readyState > 1 || socket._handle === null) return;
+        websocket.receive(socket._handle).then(function (chunk) {
+          const opcode = chunk.charCodeAt(0);
+          const body = chunk.substring(1);
+          if (opcode === 8) { socket._ended(1000, ""); return; }
+          socket.dispatchEvent({
+            type: "message",
+            data: opcode === 2 ? G.__textToBytes(body) : G.__bytesToText(body),
+          });
           socket._pump();
         }, function (error) { socket._fail(error); });
       }
 
-      _take(held) {
-        const socket = this;
-        if (held.opcode === 8) {
-          let code = 1005;
-          if (held.payload.length >= 2) {
-            code = (held.payload.charCodeAt(0) << 8) | held.payload.charCodeAt(1);
-          }
-          socket._shut(code, G.__bytesToText(held.payload.substring(2)));
-          return;
-        }
-        if (held.opcode === 9) { socket._write(10, held.payload); return; }
-        if (held.opcode === 10) return;
-        if (held.opcode === 0) socket._fragments += held.payload;
-        else { socket._fragmentOpcode = held.opcode; socket._fragments = held.payload; }
-        if (!held.fin) return;
-        const whole = socket._fragments;
-        socket._fragments = "";
-        const event = new G.Event("message");
-        event.data = socket._fragmentOpcode === 2 ? whole : G.__bytesToText(whole);
-        socket.dispatchEvent(event);
-      }
-
-      _write(opcode, payload) {
-        const socket = this;
-        return maskKey().then(function (mask) {
-          return net.send(socket._handle, frame(opcode, payload, mask));
-        });
-      }
-
       send(data) {
         if (this.readyState !== 1) throw new Error("WebSocket: not open");
-        return this._write(1, G.__textToBytes(String(data)));
+        const binary = typeof data !== "string";
+        const body = binary ? G.__bytesToText(data) : G.__textToBytes(data);
+        return void websocket.send(this._handle, binary ? 2 : 1, body)
+          .then(undefined, () => {});
       }
 
-      close(code, reason) {
+      close() {
         if (this.readyState > 1) return;
         this.readyState = 2;
-        const shut = code === undefined ? 1000 : code;
-        let payload = String.fromCharCode((shut >> 8) & 0xFF, shut & 0xFF);
-        if (reason !== undefined) payload += G.__textToBytes(String(reason));
         const socket = this;
-        this._write(8, payload).then(function () { socket._shut(shut, reason); },
-          function () { socket._shut(shut, reason); });
+        if (this._handle === null) { this._ended(1000, ""); return; }
+        websocket.close(this._handle).then(function () {
+          socket._ended(1000, "");
+        }, function () { socket._ended(1006, ""); });
       }
 
-      _shut(code, reason) {
+      _ended(code, reason) {
         if (this.readyState === 3) return;
         this.readyState = 3;
-        const socket = this;
-        const done = function () {
-          const event = new G.Event("close");
-          event.code = code;
-          event.reason = reason === undefined ? "" : reason;
-          socket.dispatchEvent(event);
-        };
-        if (this._handle === null) { done(); return; }
-        net.close(this._handle).then(done, done);
+        this.dispatchEvent({ type: "close", code: code, reason: reason, wasClean: code === 1000 });
       }
 
       _fail(error) {
-        const event = new G.Event("error");
-        event.error = error;
-        this.dispatchEvent(event);
-        this._shut(1006, String(error));
+        if (this.readyState === 3) return;
+        this.dispatchEvent({ type: "error", error: error });
+        this._ended(1006, "");
       }
     };
     G.WebSocket.CONNECTING = 0;

@@ -113,9 +113,23 @@ reason anybody chose.
 | | `receive` | async | | Bytes off a connection, up to a length |
 | | `close` | async | | Ending a connection |
 | | `endpoint` | async | | What the deployment called the endpoint it wired |
+| `phasor:net/websocket` | `open` | async | `phasor_ws` | A handle over a WebSocket to a resource on the wired origin |
+| | `send` | async | | One message, as text or as binary |
+| | `receive` | async | | The next message, led by its opcode; a close opcode when there will be no more |
+| | `close` | async | | Ending a link |
+| | `origin` | async | | What the deployment called the origin it wired |
+
+`phasor:net/websocket` carries no WASI name because WASI has none for it. The
+protocol itself is not here at all: the upgrade, the accept it verifies, the
+masking and the frame codec belong to the provider a deployment wires, which
+is where one implementation serves every consumer on the platform instead of
+a second one in JavaScript spending the program's own fuel on the SHA-1 of
+every handshake. A message crosses led by its RFC 6455 opcode, so text and
+binary stay distinguishable and a reader learns that a link has ended in the
+same answer it was waiting on.
 
 The shell names each interface by a short namespace a program calls it
-through: `clock`, `entropy`, `fs`, `store`, `net`, `http`. That name is the
+through: `clock`, `entropy`, `fs`, `store`, `net`, `http`, `websocket`. That name is the
 JavaScript surface and has nothing to do with admission; the identifier
 above is what the deployment grants and what the digest covers.
 
