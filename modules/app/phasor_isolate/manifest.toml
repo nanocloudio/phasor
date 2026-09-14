@@ -10,13 +10,14 @@ direction    = "input"
 content_type = "OctetStream"
 buffer_size  = 65536
 
-# Completion frames answering the calls this isolate made.
+# Completion frames answering the calls this isolate made, each followed by
+# the bytes it answers with.
 [[ports]]
 name         = "completion_in"
 index        = 1
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = 512
+buffer_size  = 8192
 
 # Task control: cancellation, the deadline, and the reported time, as small
 # fixed records. A graph that wires nothing here runs tasks to their budgets.
@@ -34,13 +35,14 @@ content_type = "OctetStream"
 buffer_size  = 256
 
 # Call frames the program produced: a binding index, a correlation identifier,
-# a trace context, and the digest of the payload. No address, no credential.
+# a trace context, and the digest and length of the payload, each frame
+# followed by the payload's own bytes. No address, no credential.
 [[ports]]
 name         = "call_out"
 index        = 1
 direction    = "output"
 content_type = "OctetStream"
-buffer_size  = 512
+buffer_size  = 8192
 
 # Why a run produced no value: a termination, a rejection, or an image that
 # could not be admitted. Numbers, not words.

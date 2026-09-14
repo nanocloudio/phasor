@@ -74,10 +74,16 @@ mod promise;
 mod realm;
 #[path = "../../common/regexp.rs"]
 mod regexp;
+#[path = "../../common/register.rs"]
+mod register;
 #[path = "../../common/softfloat.rs"]
 mod softfloat;
 #[path = "../../common/string.rs"]
 mod string;
+#[path = "../../common/text.rs"]
+mod text;
+#[path = "../../common/trace.rs"]
+mod trace;
 #[path = "../../common/unicode_id.rs"]
 mod unicode_id;
 #[path = "../../common/value.rs"]
@@ -110,6 +116,12 @@ const RESULT_CAPACITY: usize = 128;
 // Sized for the application-class targets this fmod declares: a program that
 // holds a few thousand properties is ordinary, and refusing it would be a
 // policy choice no deployment asked for.
+//
+// NOT the bound on how large a response body a program can turn into a
+// string: that stalls around 15 KiB against `phasor_http`'s 32 KiB body, and
+// doubling this changed nothing at all. What costs is the number of
+// allocations the decode makes, not the bytes it holds -- see
+// `bytesToText` in `modules/common/facade.rs`.
 const ARENA_BYTES: usize = 256 * 1024;
 const SLOT_COUNT: usize = 8192;
 const WORKLIST: usize = 2048;
@@ -131,13 +143,45 @@ const JOB_COUNT: usize = 32;
 const BINDING_COUNT: usize = MAX_BINDINGS;
 const PENDING_COUNT: usize = 4;
 const IN_FLIGHT_MAX: u32 = 4;
+/// Bytes of payload one call or one completion may carry behind its frame.
+/// The arguments a program passes cross as bytes, and the bytes a provider
+/// answers with come back the same way; a call whose arguments do not fit is
+/// refused by the machine, and an answer longer than this is not taken.
+const PAYLOAD_BYTES: usize = 8 * 1024;
+/// Resources a program may hold open at once. A provider that answers with a
+/// resource answers with a handle, and a handle is an index and a generation
+/// held here: an isolate with nowhere to hold one could be granted `open` and
+/// would have to refuse every call to it.
+const RESOURCE_COUNT: usize = 16;
 /// Roots a collection stages before it starts: the registers in use, the
 /// frames, the interned handles, and the realm all fit with room over.
 const ROOT_COUNT: usize = 8192;
 /// Cells or bytes one collection slice works through.
 const COLLECTION_SLICE: u32 = 512;
 /// Free arena below which the isolate collects rather than waiting to fail.
-const COLLECTION_HEADROOM: u32 = (ARENA_BYTES / 4) as u32;
+///
+/// A sixteenth, not the quarter this was. A quarter of a 256 KiB arena is
+/// 64 KiB of headroom, which a script-scope loop refills every ~1,700
+/// iterations, and every refill is a FULL collection charged to the same
+/// budget as instructions (`collect_now` says so outright). On
+/// `for(let i=0;i<N;i++)s+=i` that made garbage collection 94% of the
+/// metered cost: 187 of the 200 fuel per iteration, against 13 for the
+/// bytecode the loop actually is.
+///
+/// Measured on linux at 4,000 iterations: a quarter costs 200.1 fuel per
+/// iteration, a sixteenth 134.0. Past that it stops helping and slightly
+/// reverses -- a sixty-fourth is 139.9 and a two-hundred-and-fifty-sixth
+/// 141.4 -- because each collection then starts from a fuller heap and
+/// reclaims proportionally less. So a sixteenth is where the curve bottoms
+/// out, not a guess at "smaller is better".
+///
+/// Headroom is the smaller lever. The larger one is where a binding lives:
+/// script-scope bindings sit in a context and allocate per iteration where
+/// function locals sit in registers and do not, so the same loop inside a
+/// function costs 17.0 fuel per iteration against 198.0 at script scope. A
+/// direct `eval` may introduce a nearer binding at run time, which is what
+/// `LdaShadowable` and `dynamic_names` in the lowerer are for.
+const COLLECTION_HEADROOM: u32 = (ARENA_BYTES / 16) as u32;
 const VERIFIER_CAPACITY: usize = 16 * 1024;
 /// Instructions one image may run here when the graph names no other number.
 /// A budget is what makes a run answerable rather than open-ended, so it is a
@@ -152,6 +196,15 @@ const JOB_SLICE: u32 = 16;
 /// hold a task open forever, and a deployment that knows its providers says
 /// how long waiting is reasonable.
 const WAIT_LIMIT: u32 = 5_000;
+
+/// Default for `empty_wait`: steps a hung-up empty image stream is given
+/// before it is taken at its word.
+///
+/// Small on purpose, and the same value `phasor_compile` uses. Every real
+/// producer writes within a few steps of the graph settling, so this is
+/// imperceptible; it exists only to outlast a channel that reports hung-up
+/// before its producer has written, which bcm2712 does.
+const EMPTY_WAIT_STEPS: u32 = 64;
 /// One control record: a kind, three bytes of padding, and a value.
 /// Kind 1 asks the task to stop at its next safe point; kind 2 sets the
 /// deadline, in the host's own time units; kind 3 reports the current time in
@@ -162,8 +215,10 @@ const CONTROL_FRAME: usize = 12;
 const MAX_MODULES: usize = 16;
 /// Bindings one image may state it requires.
 const MAX_REQUIREMENTS: usize = 32;
-/// The granted names a graph may name, as text.
-const GRANTS_BYTES: usize = 1024;
+/// The granted names a graph may name, as text. The register states the
+/// bound, because the router holds the same text under it and the two must
+/// agree byte for byte.
+use register::GRANTS_BYTES;
 /// Bindings this isolate may admit: the general `host` call, and one for each
 /// capability a deployment granted.
 const MAX_BINDINGS: usize = 17;
@@ -233,9 +288,47 @@ fn admitted_bindings(state: &State) -> ([Binding; MAX_BINDINGS], usize) {
         in_flight: 0,
         class: binding::Class::Async,
         snapshot: 0.0,
+        // The isolate's own host binding: its own scope, shared with
+        // nothing.
+        scope: 0,
     };
     let mut count = 1usize;
-    each_grant(state, |name| {
+    // One scope per granted INTERFACE, not per member. A handle is opened by
+    // one member and used by its siblings — `send` answers a response that
+    // `status`, `headers`, `read` and `close` all read — so a scope per
+    // member makes every one of those unresolvable, and a program can make
+    // exactly one request before everything after the first call fails.
+    // Scope 0 is the host binding above, so the first interface is 1.
+    //
+    // Looked up rather than counted, because a grant list is text a
+    // deployment wrote and nothing makes an interface's members adjacent in
+    // it. Two runs of `http` separated by `clock` are one capability.
+    let mut seen = [crate::digest::Digest([0u8; 32]); MAX_BINDINGS];
+    let mut seen_count = 0usize;
+    each_grant(state, |interface, name| {
+        let mark = crate::digest::digest(interface);
+        let mut scope = 0u32;
+        let mut at = 0usize;
+        while at < seen_count {
+            if seen.get(at).copied() == Some(mark) {
+                scope = u32::try_from(at + 1).unwrap_or(u32::MAX);
+                break;
+            }
+            at += 1;
+        }
+        if scope == 0 {
+            if let Some(slot) = seen.get_mut(seen_count) {
+                *slot = mark;
+                seen_count += 1;
+                scope = u32::try_from(seen_count).unwrap_or(u32::MAX);
+            } else {
+                // No room to record another interface. Giving it a scope
+                // that already belongs to one would let handles cross, so
+                // it gets one that matches nothing and its handles resolve
+                // nowhere: a refusal, not a leak.
+                scope = u32::MAX;
+            }
+        }
         if let Some(slot) = out.get_mut(count) {
             *slot = Binding {
                 name,
@@ -243,6 +336,7 @@ fn admitted_bindings(state: &State) -> ([Binding; MAX_BINDINGS], usize) {
                 in_flight: 0,
                 class: binding::Class::Async,
                 snapshot: 0.0,
+                scope,
             };
             count += 1;
         }
@@ -255,30 +349,11 @@ fn admitted_bindings(state: &State) -> ([Binding; MAX_BINDINGS], usize) {
 /// The graph states them as text and this digests each in turn, so the name an
 /// image requires and the name a deployment grants are computed by one
 /// function over one form. A grant this cannot read is not a grant.
-fn each_grant(state: &State, mut visit: impl FnMut(crate::digest::Digest)) {
+fn each_grant(state: &State, mut visit: impl FnMut(&[u8], crate::digest::Digest)) {
     let names = state.grants.get(..state.grants_length).unwrap_or(&[]);
-    let mut at = 0usize;
-    while at < names.len() {
-        let mut end = at;
-        while end < names.len() && names.get(end).copied().unwrap_or(b',') != b',' {
-            end += 1;
-        }
-        let entry = trimmed(names.get(at..end).unwrap_or(&[]));
-        if !entry.is_empty() {
-            let mut cut = 0usize;
-            while cut < entry.len() && entry.get(cut).copied().unwrap_or(0) != capability::SEPARATOR
-            {
-                cut += 1;
-            }
-            if cut < entry.len() {
-                visit(capability::name_of(
-                    entry.get(..cut).unwrap_or(&[]),
-                    entry.get(cut + 1..).unwrap_or(&[]),
-                ));
-            }
-        }
-        at = end + 1;
-    }
+    register::grants(names, |interface, member| {
+        visit(interface, capability::name_of(interface, member));
+    });
 }
 
 /// The binding that serves a capability, by the name both ends compute.
@@ -318,11 +393,17 @@ const UNDO_COUNT: usize = 256;
 const SUBJECT_UNITS: usize = 1024;
 #[repr(C)]
 struct Wire {
-    calls: [u8; CALL_FRAME * PENDING_COUNT],
+    /// Call frames staged to leave, each followed by its payload.
+    calls: [u8; CALL_FRAME * PENDING_COUNT + PAYLOAD_BYTES],
     staged: usize,
     written: usize,
     completion: [u8; COMPLETION_FRAME],
     filled: usize,
+    /// The bytes behind the completion frame, once the frame is whole.
+    payload: [u8; PAYLOAD_BYTES],
+    payload_filled: usize,
+    payload_length: usize,
+    frame_ready: bool,
     ready: bool,
     /// Steps this isolate has waited with a call outstanding and nothing to do.
     waited: u32,
@@ -331,6 +412,14 @@ struct Wire {
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    /// Whether this module has told the scheduler its outputs are
+    /// meaningful. Fluxor gates a module until every forward upstream has
+    /// signalled `StepOutcome::Ready` (3 from a PIC module), and a module
+    /// that never signals it holds its whole downstream dark for the life of
+    /// the graph. Nothing on linux or wasm enforces the gate, so this was
+    /// invisible until the first bare-metal run, where the front end and the
+    /// isolate were never stepped at all.
+    announced: bool,
     image_in: i32,
     completion_in: i32,
     result_out: i32,
@@ -378,6 +467,10 @@ struct State {
     descriptors: [Binding; BINDING_COUNT],
     pending: [Pending; PENDING_COUNT],
     outbox: [CallRecord; PENDING_COUNT],
+    /// Where the machine stages the arguments of the calls in its outbox.
+    call_payloads: [u8; PAYLOAD_BYTES],
+    /// The resources providers opened for this task, addressed by handle.
+    resources: [binding::Resource; RESOURCE_COUNT],
     verifier_state: [i32; VERIFIER_CAPACITY],
     wire: Wire,
     realm: Realm,
@@ -411,6 +504,15 @@ struct State {
     has_diagnostic: bool,
     diagnostic_written: usize,
     phase: u8,
+    /// Steps a hung-up EMPTY image stream is read as "not yet" before it is
+    /// read as an empty image. See the wait in `module_step`.
+    empty_wait: u32,
+    /// How many of those steps have passed.
+    empty_waited: u32,
+    /// Emit one `[iso]` line every `trace` steps; 0 is silent.
+    trace: u32,
+    /// Steps taken, which the step histogram cannot report.
+    trace_steps: u32,
 }
 
 /// Admit the staged image and start the task, saving the machine's state.
@@ -564,7 +666,9 @@ fn start(state: &mut State) -> bool {
         import_count,
         admitted.get(..admitted_count).unwrap_or(&[]),
     );
-    let storage = agent_storage!(state);
+    let mut storage = agent_storage!(state);
+    storage.payloads = Some(&mut state.call_payloads);
+    storage.resources = Some(&mut state.resources);
     let started = agent::fresh(
         units.get(..count).unwrap_or(&[]),
         storage,
@@ -660,7 +764,9 @@ fn advance(state: &mut State) -> Advance {
         import_count,
         &[],
     );
-    let storage = agent_storage!(state);
+    let mut storage = agent_storage!(state);
+    storage.payloads = Some(&mut state.call_payloads);
+    storage.resources = Some(&mut state.resources);
     let realm = state.realm;
     let saves = state.saves;
     let count = if linked { module_count as usize } else { 1 };
@@ -694,8 +800,12 @@ fn advance(state: &mut State) -> Advance {
             if state.wire.ready {
                 state.wire.ready = false;
                 state.wire.filled = 0;
+                let length = state.wire.payload_length;
+                state.wire.payload_length = 0;
+                state.wire.payload_filled = 0;
                 if let Some(record) = CompletionRecord::decode(&state.wire.completion) {
-                    let _ = machine.apply_completion(&record);
+                    let payload = state.wire.payload.get(..length).unwrap_or(&[]);
+                    let _ = machine.apply_completion_with(&record, payload);
                     state.completions_applied = state.completions_applied.saturating_add(1);
                     progressed = true;
                 }
@@ -835,22 +945,41 @@ fn advance(state: &mut State) -> Advance {
 
             // Whatever calls the program made leave as frames; the machine forgets them
             // once they are staged, so a record is carried exactly once.
-            if outcome == Advance::Running && state.call_out >= 0 {
+            // Each frame is followed by the arguments it names, so a record and its
+            // bytes are carried together or not at all: when the port side has no
+            // room for all of them, they wait for the next step, whole.
+            if outcome == Advance::Running && state.call_out >= 0 && !machine.calls().is_empty() {
                 let staged = state.wire.staged;
-                let mut at = staged;
+                let payloads = machine.call_payloads();
+                let mut needed = 0usize;
                 for record in machine.calls() {
-                    let frame = record.encode();
-                    let Some(slot) = state.wire.calls.get_mut(at..at + CALL_FRAME) else {
-                        break;
-                    };
-                    slot.copy_from_slice(&frame);
-                    at += CALL_FRAME;
+                    needed += CALL_FRAME + record.payload_length as usize;
                 }
-                if at != staged {
+                if staged + needed <= state.wire.calls.len() {
+                    let mut at = staged;
+                    let mut payload_at = 0usize;
+                    let mut count = 0u32;
+                    for record in machine.calls() {
+                        let length = record.payload_length as usize;
+                        let frame = record.encode();
+                        let (Some(slot), Some(payload)) = (
+                            state.wire.calls.get_mut(at..at + CALL_FRAME),
+                            payloads.get(payload_at..payload_at + length),
+                        ) else {
+                            break;
+                        };
+                        slot.copy_from_slice(&frame);
+                        at += CALL_FRAME;
+                        if let Some(slot) = state.wire.calls.get_mut(at..at + length) {
+                            slot.copy_from_slice(payload);
+                        }
+                        at += length;
+                        payload_at += length;
+                        count += 1;
+                    }
                     state.wire.staged = at;
                     machine.take_calls();
-                    let staged_now = u32::try_from((at - staged) / CALL_FRAME).unwrap_or(0);
-                    state.calls_made = state.calls_made.saturating_add(staged_now);
+                    state.calls_made = state.calls_made.saturating_add(count);
                     progressed = true;
                 }
             }
@@ -1059,6 +1188,68 @@ define_params! {
                 }
             }
         };
+
+    4, trace, u32, 0
+        => |s, d, len| { s.trace = p_u32(d, len, 0, 0); };
+
+    5, empty_wait, u32, EMPTY_WAIT_STEPS
+        => |s, d, len| { s.empty_wait = p_u32(d, len, 0, EMPTY_WAIT_STEPS); };
+}
+
+/// Say where this module got to, once every `trace` steps.
+///
+/// The step counter is in the line because the scheduler's histogram cannot
+/// supply it: the kernel records a step's time only in the `Continue` arm, so
+/// a step that returned `Ready`, `Burst`, `Done` or an error never reaches
+/// `MON_HIST`, and a module that stops appearing there cannot be told apart
+/// from one that stopped returning `Continue`. This line is emitted from
+/// every step regardless of what the step returns, so the two are
+/// distinguishable — which on a board with no console and one log channel is
+/// the difference between a diagnosis and a guess.
+fn say(state: &mut State, syscalls: &SyscallTable) {
+    if state.trace == 0 {
+        return;
+    }
+    state.trace_steps = state.trace_steps.saturating_add(1);
+    // Every step from the moment an image is staged, whatever the rate asks
+    // for, and the rate only while there is nothing to run.
+    //
+    // This module completes a whole program in ONE advance call: a
+    // 60,000-iteration loop retired 6.6M instructions in a single step on
+    // bcm2712, and lowering the `steps` budget did not spread it across
+    // more. So there is no mid-flight to sample -- the only honest window is
+    // the one that brackets that single step, and a rate of one line per N
+    // steps would pad it with up to N idle steps on each side and charge the
+    // engine for time it spent waiting.
+    //
+    // `image_length > 0` while still in phase 0 is the staging step, which
+    // is the last one before execution. Tracing from there gives a tight
+    // bracket without putting a line on the wire for every step of a wait
+    // that can be tens of thousands of them.
+    let close_to_work = state.phase == 1 || state.image_length > 0;
+    if !close_to_work && !state.trace_steps.is_multiple_of(state.trace) {
+        return;
+    }
+    // The board's own microsecond clock, so a rate can be computed from
+    // WITHIN one run: two consecutive lines give a fuel delta and a time
+    // delta, and their quotient is throughput measured mid-flight. That
+    // needs no second workload size and no subtraction of process start,
+    // module instantiation or graph teardown -- the costs the Linux load
+    // lane has to cancel by running two sizes and taking the difference.
+    // SAFETY: the table is the loader's, live for the module's lifetime,
+    // and the call takes no argument.
+    let now = unsafe { dev_micros(syscalls) };
+    let mut line = trace::Line::<128>::new();
+    line.text(b"[iso] step=").number(state.trace_steps);
+    line.text(b" phase=").number(u32::from(state.phase));
+    line.text(b" img=")
+        .number(u32::try_from(state.image_length).unwrap_or(u32::MAX));
+    line.text(b" fuel=")
+        .number(u32::try_from(state.fuel_spent).unwrap_or(u32::MAX));
+    line.text(b" calls=").number(state.calls_made);
+    line.text(b" us=")
+        .number(u32::try_from(now).unwrap_or(u32::MAX));
+    trace::write(syscalls, line.bytes());
 }
 
 /// Take the graph's parameters, or the defaults where it gave none.
@@ -1235,19 +1426,6 @@ fn granted(state: &State, want: crate::digest::Digest) -> bool {
     binding_of(state, want).is_some()
 }
 
-/// A grant with the spaces a graph may have written around it taken off.
-fn trimmed(entry: &[u8]) -> &[u8] {
-    let mut start = 0usize;
-    while start < entry.len() && matches!(entry.get(start).copied(), Some(b' ') | Some(b'\t')) {
-        start += 1;
-    }
-    let mut end = entry.len();
-    while end > start && matches!(entry.get(end - 1).copied(), Some(b' ') | Some(b'\t')) {
-        end -= 1;
-    }
-    entry.get(start..end).unwrap_or(&[])
-}
-
 /// Stage the whole image before admitting it: a partial image is not an image,
 /// and its digest would not be the one that was compiled.
 fn stage_image(state: &mut State, syscalls: &SyscallTable) -> bool {
@@ -1277,12 +1455,32 @@ fn pull_completion(state: &mut State, syscalls: &SyscallTable) {
     if state.wire.ready {
         return;
     }
-    if wire::take_frame(
-        syscalls,
-        state.completion_in,
-        &mut state.wire.completion,
-        &mut state.wire.filled,
-    ) {
+    if !state.wire.frame_ready
+        && wire::take_frame(
+            syscalls,
+            state.completion_in,
+            &mut state.wire.completion,
+            &mut state.wire.filled,
+        )
+    {
+        state.wire.frame_ready = true;
+        state.wire.payload_filled = 0;
+        state.wire.payload_length = CompletionRecord::decode(&state.wire.completion)
+            .map_or(0, |record| record.answer.payload_length() as usize)
+            .min(PAYLOAD_BYTES);
+    }
+    // The bytes follow their frame: until every one of them is here, the
+    // answer has not arrived.
+    if state.wire.frame_ready
+        && wire::take_payload(
+            syscalls,
+            state.completion_in,
+            &mut state.wire.payload,
+            &mut state.wire.payload_filled,
+            state.wire.payload_length,
+        )
+    {
+        state.wire.frame_ready = false;
         state.wire.ready = true;
     }
 }
@@ -1302,6 +1500,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    say(state, syscalls);
+    announce_ready!(state);
 
     if state.phase == 3 {
         return 1;
@@ -1324,8 +1524,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         if state.image_length == 0 {
-            // The stream ended with nothing in it: whatever was to produce an
-            // image said why on its own port, and there is nothing to run.
+            // Zero bytes is not an image, and a hang-up on an empty stream is
+            // not always an image that ended -- it can be one that has not
+            // arrived.
+            //
+            // `stage_stream` answers `Complete` on `POLL_HUP`, and on bcm2712
+            // a channel reports hung-up before its producer has ever written
+            // to it. Retiring here would take a not-yet-written port for a
+            // finished empty program -- and would hang up this module's own
+            // ports, retiring whatever waits on its result.
+            //
+            // The wait is bounded for the same reason the compiler's is: a
+            // graph that really does hand the isolate an empty image must
+            // get an outcome rather than a hang.
+            if state.empty_waited < state.empty_wait {
+                state.empty_waited = state.empty_waited.saturating_add(1);
+                return 0;
+            }
             state.phase = 2;
             return 0;
         }

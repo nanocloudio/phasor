@@ -2,7 +2,7 @@
 //!
 //! The protocol is not this project's. A deployment that wants a program to
 //! hold a WebSocket wires this adapter behind the router and a provider that
-//! speaks RFC 6455 in front of it; what crosses here is which link, which
+//! speaks it in front of them both; what crosses here is which link, which
 //! message, and what became of it. The upgrade, the accept it verifies, the
 //! masking and the frame codec all live in the provider, where one
 //! implementation serves every consumer on the platform -- rather than in
@@ -53,13 +53,19 @@ mod value;
 mod wire;
 
 use abi::contracts::net::ws_frame as wsf;
+
+// The records that drive the provider, and the number of links it carries,
+// are fluxor's `ws_control` contract, already carried by the `abi` mount
+// above. Every connector that performs an open reads the same definition,
+// so neither end can believe in a link the other does not have.
+use abi::contracts::net::ws_control as wire_ws;
 use binding::{
     Answer, CallRecord, Cause, CompletionRecord, Disposition, CALL_FRAME, COMPLETION_FRAME,
 };
 
-/// Links this adapter may hold at once. The provider carries the same number,
-/// and a mismatch either way is a link one end can name and the other cannot.
-const LINKS: usize = 4;
+/// Links this adapter may hold at once, which is the provider's own count:
+/// both ends read it from the record core, so a mismatch is not expressible.
+const LINKS: usize = wire_ws::WS_LINKS;
 /// Bytes one call or completion may carry.
 const PAYLOAD_BYTES: usize = 8 * 1024;
 /// The largest message either direction. The provider's own ceiling: a longer
@@ -86,16 +92,7 @@ const METHOD_ORIGIN: u32 = 4;
 /// The longest authority the graph may name the origin by.
 const AUTHORITY_BYTES: usize = 64;
 
-/// What the provider says became of a link: `[conn][event][code: u16 LE]`.
-/// The provider's record, restated here because a consumer of it must read
-/// it and the two projects share no source -- the one place this seam is not
-/// carried by a contract Fluxor owns.
-const EVENT_LEN: usize = 4;
-const EVENT_OPEN: u8 = 1;
-const EVENT_CLOSED: u8 = 2;
-const EVENT_FAILED: u8 = 3;
-
-/// The RFC 6455 opcodes that reach a program. A close arrives as one, because
+/// The WebSocket opcodes that reach a program. A close arrives as one, because
 /// a reader waiting for a message has no other way to learn there will not be
 /// another.
 const OPCODE_TEXT: u8 = 1;
@@ -156,6 +153,7 @@ impl Held {
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     request_in: i32,
     reply_out: i32,
     event_in: i32,
@@ -182,7 +180,7 @@ struct State {
     frame_staged: usize,
     frame_written: usize,
 
-    event: [u8; EVENT_LEN],
+    event: [u8; wire_ws::event::LEN],
     event_filled: usize,
 
     /// One envelope read from `frames_in` and not yet given to its link.
@@ -307,17 +305,15 @@ fn hold(state: &mut State, record: &CallRecord, slot: usize) -> bool {
     true
 }
 
-/// Stage `[conn][path]` for the provider.
+/// Stage an open for the provider, composed by the core that owns it.
 fn stage_open(state: &mut State, slot: usize, path: &[u8]) -> bool {
     let at = state.open_staged;
-    let total = 1 + path.len();
-    let Some(room) = state.opens.get_mut(at..at + total) else {
+    let Some(room) = state.opens.get_mut(at..) else {
         return false;
     };
-    room[0] = slot as u8;
-    if !copy_into(room.get_mut(1..).unwrap_or(&mut []), path) {
+    let Some(total) = wire_ws::write_open(slot as u8, path, room) else {
         return false;
-    }
+    };
     state.open_staged = at + total;
     true
 }
@@ -403,7 +399,7 @@ fn settle(state: &mut State, slot: usize, event: u8) {
             continue;
         }
         match (held.method, event) {
-            (METHOD_OPEN, EVENT_OPEN) => {
+            (METHOD_OPEN, wire_ws::event::OPEN) => {
                 state.held[index] = Held::EMPTY;
                 let (request, trace) = (held.request, held.trace);
                 fulfil(state, request, trace, Answer::Resource(slot as u64), &[]);
@@ -425,21 +421,17 @@ fn settle(state: &mut State, slot: usize, event: u8) {
 }
 
 fn apply_event(state: &mut State, record: &[u8]) {
-    let Some(&slot) = record.first() else {
+    // Read by the core, which also refuses a link neither end carries.
+    let Some((slot, event, _code)) = wire_ws::parse_event(record) else {
         return;
     };
-    let slot = slot as usize;
-    if slot >= LINKS {
-        return;
-    }
-    let event = record.get(1).copied().unwrap_or(0);
     match event {
-        EVENT_OPEN => {
+        wire_ws::event::OPEN => {
             if let Some(link) = state.links.get_mut(slot) {
                 link.open = true;
             }
         }
-        EVENT_CLOSED | EVENT_FAILED => {
+        wire_ws::event::CLOSED | wire_ws::event::FAILED => {
             if let Some(link) = state.links.get_mut(slot) {
                 link.closed = true;
                 link.open = false;
@@ -460,7 +452,9 @@ fn apply_frame(state: &mut State, frame: &[u8]) {
     }
     let length = (wsf::payload_len(frame) as usize).min(MESSAGE_BYTES);
     let opcode = wsf::opcode(frame);
-    let body = frame.get(wsf::FRAME_HDR..wsf::FRAME_HDR + length).unwrap_or(&[]);
+    let body = frame
+        .get(wsf::FRAME_HDR..wsf::FRAME_HDR + length)
+        .unwrap_or(&[]);
     if let Some(link) = state.links.get_mut(slot) {
         if link.message_ready {
             // Admitted only when the link had room, so this cannot happen
@@ -596,7 +590,9 @@ define_params! {
 
     1, authority, str, 0
         => |s, d, len| {
-            let taken = if len > AUTHORITY_BYTES { AUTHORITY_BYTES } else { len };
+            // A prefix of an authority is a different host; one that does not
+            // fit is dropped rather than clipped.
+            let taken = if len > AUTHORITY_BYTES { 0 } else { len };
             s.authority_length = taken;
             if taken > 0 {
                 // SAFETY: the params reader hands a pointer valid for `len`
@@ -642,6 +638,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
     // SAFETY: stored by `module_new` and checked non-null above.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
     if state.phase == 1 {
         return 1;
     }

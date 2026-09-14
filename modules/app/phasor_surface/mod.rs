@@ -41,6 +41,14 @@ mod wire;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    /// Whether this module has told the scheduler its outputs are
+    /// meaningful. Fluxor gates a module until every forward upstream has
+    /// signalled `StepOutcome::Ready` (3 from a PIC module), and a module
+    /// that never signals it holds its whole downstream dark for the life of
+    /// the graph. Nothing on linux or wasm enforces the gate, so this was
+    /// invisible until the first bare-metal run, where the front end and the
+    /// isolate were never stepped at all.
+    announced: bool,
     source_out: i32,
     /// How much of the source has left.
     written: usize,
@@ -69,6 +77,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
     if state.phase == 1 {
         return 1;
     }

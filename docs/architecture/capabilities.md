@@ -103,6 +103,26 @@ program that was granted one reads `clock.now()` and gets a number, not a
 promise, and the value is the one the adapter supplied for that task. A
 synchronous language operation still never waits on a channel.
 
+## 2c. A binding at one end, a method at the other
+
+An isolate numbers its bindings: the general `host` call first, then one per
+grant in the order the deployment stated them. An adapter numbers its
+operations: the members of the interface it serves, in the order the register
+lists them. Neither can be derived from the other, because a deployment may
+grant any subset of an interface in any order.
+
+The router holds the mapping, and holds it as data rather than as knowledge:
+it is told the interface the adapter behind it serves and the same grant list
+the isolate was given. A call arrives on a binding index, the router finds the
+grant at that position, and forwards the call under the method the register
+gives that member. A binding whose grant names another interface is refused
+there, because nothing behind that router could answer it, and a caller told
+so is better off than one left waiting.
+
+This is the only place the two numberings meet. The isolate never learns a
+method number and the adapter never learns a binding index, so neither can
+come to depend on the other's ordering.
+
 ## 3. Completions
 
 A host answers a call by its correlation identifier, saying whether the provider

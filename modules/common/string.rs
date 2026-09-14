@@ -312,6 +312,173 @@ pub fn convert_case(heap: &mut Heap<'_>, handle: Handle, upper: bool) -> Result<
     Ok(target)
 }
 
+/// UTF-8 bytes (one per code unit, as a network payload arrives) decoded
+/// into text, and text encoded back the same way.
+///
+/// These exist because doing it in JavaScript cannot be made cheap: a string
+/// built with `out += ch` reallocates the whole result per character, so
+/// decoding n bytes churns O(n^2) and a page-sized body exhausts the arena
+/// long before it is read. Segmenting the appends only lowers the constant.
+/// Here the answer is sized first and then filled in place, so one string is
+/// allocated however long the input is.
+///
+/// The source is a byte string: each unit is one byte of the payload, and a
+/// unit above 0xFF is not a byte and makes the input malformed at that
+/// position, which decodes to U+FFFD exactly as a bad sequence does.
+pub fn decode_utf8(heap: &mut Heap<'_>, handle: Handle) -> Result<Handle, HeapError> {
+    let count = length(heap, handle)?;
+    let units = utf8_scan(heap, handle, count, None)?;
+    let target = allocate_units(heap, units)?;
+    utf8_scan(heap, handle, count, Some(target))?;
+    Ok(target)
+}
+
+/// Count the units a decode produces, or write them into `out`. One walk
+/// serves both so the two can never disagree about the length.
+fn utf8_scan(
+    heap: &mut Heap<'_>,
+    handle: Handle,
+    count: u32,
+    out: Option<Handle>,
+) -> Result<u32, HeapError> {
+    let mut written = 0u32;
+    let mut at = 0u32;
+    while at < count {
+        let first = unit_at(heap, handle, at)?.unwrap_or(0);
+        let width = match first {
+            0x00..=0x7F => 1u32,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            // A continuation byte with nothing to continue, or a unit that
+            // is not a byte at all.
+            _ => 0,
+        };
+        if width == 0 {
+            // An invalid lead: one replacement, and carry on at the next
+            // byte, which may well start a valid sequence.
+            if let Some(target) = out {
+                write_wide_unit(heap, target, written, 0xFFFD)?;
+            }
+            written += 1;
+            at += 1;
+            continue;
+        }
+        if at + width > count {
+            // A sequence cut off by the end of the input is ONE replacement
+            // for the whole remainder, not one per leftover byte: the bytes
+            // that are there are a prefix of a single code point.
+            if let Some(target) = out {
+                write_wide_unit(heap, target, written, 0xFFFD)?;
+            }
+            written += 1;
+            break;
+        }
+        let mut point = u32::from(match width {
+            1 => first,
+            2 => first & 0x1F,
+            3 => first & 0x0F,
+            _ => first & 0x07,
+        });
+        let mut index = 1u32;
+        while index < width {
+            let continuation = unit_at(heap, handle, at + index)?.unwrap_or(0);
+            point = (point << 6) | u32::from(continuation & 0x3F);
+            index += 1;
+        }
+        at += width;
+        if point > 0xFFFF {
+            let adjusted = point - 0x10000;
+            if let Some(target) = out {
+                let high = 0xD800 + u16::try_from(adjusted >> 10).unwrap_or(0);
+                let low = 0xDC00 + u16::try_from(adjusted & 0x3FF).unwrap_or(0);
+                write_wide_unit(heap, target, written, high)?;
+                write_wide_unit(heap, target, written + 1, low)?;
+            }
+            written += 2;
+        } else {
+            if let Some(target) = out {
+                write_wide_unit(
+                    heap,
+                    target,
+                    written,
+                    u16::try_from(point).unwrap_or(0xFFFD),
+                )?;
+            }
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// Text encoded as UTF-8, one byte per unit of the answer.
+pub fn encode_utf8(heap: &mut Heap<'_>, handle: Handle) -> Result<Handle, HeapError> {
+    let count = length(heap, handle)?;
+    let bytes = utf8_emit(heap, handle, count, None)?;
+    let target = allocate_units(heap, bytes)?;
+    utf8_emit(heap, handle, count, Some(target))?;
+    Ok(target)
+}
+
+fn utf8_emit(
+    heap: &mut Heap<'_>,
+    handle: Handle,
+    count: u32,
+    out: Option<Handle>,
+) -> Result<u32, HeapError> {
+    let mut written = 0u32;
+    let mut at = 0u32;
+    while at < count {
+        let unit = unit_at(heap, handle, at)?.unwrap_or(0);
+        let mut point = u32::from(unit);
+        at += 1;
+        // A surrogate pair is one code point; a lone surrogate is left as it
+        // is and encodes to three bytes, which is what the JavaScript
+        // implementation this replaces did.
+        if (0xD800..0xDC00).contains(&unit) && at < count {
+            let low = unit_at(heap, handle, at)?.unwrap_or(0);
+            if (0xDC00..0xE000).contains(&low) {
+                point = 0x10000 + ((point - 0xD800) << 10) + (u32::from(low) - 0xDC00);
+                at += 1;
+            }
+        }
+        let mut encoded = [0u16; 4];
+        let width = if point < 0x80 {
+            encoded[0] = u16::try_from(point).unwrap_or(0);
+            1
+        } else if point < 0x800 {
+            encoded[0] = u16::try_from(0xC0 | (point >> 6)).unwrap_or(0);
+            encoded[1] = u16::try_from(0x80 | (point & 0x3F)).unwrap_or(0);
+            2
+        } else if point < 0x10000 {
+            encoded[0] = u16::try_from(0xE0 | (point >> 12)).unwrap_or(0);
+            encoded[1] = u16::try_from(0x80 | ((point >> 6) & 0x3F)).unwrap_or(0);
+            encoded[2] = u16::try_from(0x80 | (point & 0x3F)).unwrap_or(0);
+            3
+        } else {
+            encoded[0] = u16::try_from(0xF0 | (point >> 18)).unwrap_or(0);
+            encoded[1] = u16::try_from(0x80 | ((point >> 12) & 0x3F)).unwrap_or(0);
+            encoded[2] = u16::try_from(0x80 | ((point >> 6) & 0x3F)).unwrap_or(0);
+            encoded[3] = u16::try_from(0x80 | (point & 0x3F)).unwrap_or(0);
+            4
+        };
+        if let Some(target) = out {
+            let mut index = 0usize;
+            while index < width {
+                write_wide_unit(
+                    heap,
+                    target,
+                    written + u32::try_from(index).unwrap_or(0),
+                    encoded[index],
+                )?;
+                index += 1;
+            }
+        }
+        written += u32::try_from(width).unwrap_or(0);
+    }
+    Ok(written)
+}
+
 /// Whether a code unit is white space or a line terminator, which is what
 /// trimming removes.
 pub const fn is_trimmable(unit: u16) -> bool {

@@ -89,6 +89,7 @@ impl Sleeper {
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     request_in: i32,
     reply_out: i32,
     request: [u8; CALL_FRAME],
@@ -155,7 +156,23 @@ fn hold(state: &mut State, record: &CallRecord, delay: u64, syscalls: &SyscallTa
     true
 }
 
-/// The digits a payload carries, which is how a delay arrives.
+/// The delay a call names, read out of its argument frame.
+///
+/// A call's arguments cross length-prefixed — `count: u16 LE`, then each
+/// field as `length: u32 LE` and its bytes — and a delay is the first field,
+/// as the digits the number reads as. Reading the payload as bare digits
+/// instead finds the frame's own count byte where a digit should be, takes
+/// the delay for zero, and answers every wait at once: `sleep` returns
+/// immediately and a program's timers all fire in the same instant.
+fn delay_of(payload: &[u8]) -> u64 {
+    let mut fields: [&[u8]; 1] = [&[]];
+    if wire::fields(payload, &mut fields) == 0 {
+        return 0;
+    }
+    digits(fields[0])
+}
+
+/// The number a run of ASCII digits reads as.
 fn digits(bytes: &[u8]) -> u64 {
     let mut value = 0u64;
     for &byte in bytes {
@@ -221,6 +238,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
     if state.phase == 1 {
         return 1;
     }
@@ -254,7 +272,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if let Some(record) = CallRecord::decode(&state.request) {
                 // A wait is held rather than answered; everything else is
                 // answered from a sample taken now.
-                let delay = digits(state.payload.get(..state.payload_length).unwrap_or(&[]));
+                let delay = delay_of(state.payload.get(..state.payload_length).unwrap_or(&[]));
                 let held = record.binding == METHOD_SLEEP
                     && delay > 0
                     && hold(state, &record, delay, syscalls);

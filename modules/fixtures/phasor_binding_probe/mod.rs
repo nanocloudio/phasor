@@ -54,6 +54,8 @@ mod heap;
 mod job;
 #[path = "../../common/lex.rs"]
 mod lex;
+#[path = "../../common/register.rs"]
+mod register;
 #[path = "../../common/lower.rs"]
 #[macro_use]
 mod lower;
@@ -115,7 +117,7 @@ use string::Atoms;
 use value::{Handle, Value};
 use vm::{Completion, Frame, Vm};
 
-const CASE_COUNT: u16 = 34;
+const CASE_COUNT: u16 = 36;
 const FUEL: u32 = 400_000;
 /// The trace every call the probe makes belongs to.
 const TRACE: u64 = 0x5041_5348_4f52_0001;
@@ -250,6 +252,7 @@ fn with_binding(
         in_flight: 0,
         class: binding::Class::Async,
         snapshot: 0.0,
+        scope: 0,
     });
     let Ok(admitted) = admitted else {
         return false;
@@ -331,6 +334,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 in_flight: 0,
                 class: binding::Class::Async,
                 snapshot: 0.0,
+                scope: 0,
             });
             index == Ok(0) && bindings.admitted() == 1
         }
@@ -350,6 +354,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 in_flight: 0,
                 class: binding::Class::Async,
                 snapshot: 0.0,
+                scope: 0,
             }) else {
                 return false;
             };
@@ -372,6 +377,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 in_flight: 0,
                 class: binding::Class::Async,
                 snapshot: 0.0,
+                scope: 0,
             }) else {
                 return false;
             };
@@ -684,8 +690,11 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 && !capability::is_capability(&[0x70, 0x68])
         }
 
-        // A resource a provider opened comes back as a handle: an index and a
-        // generation, meaningful only to the binding that issued it.
+        // A resource a provider opened comes back as a handle: an index and
+        // a generation, meaningful only inside the capability that issued
+        // it. Here the second binding is not admitted at all, which is the
+        // weakest form of "not mine"; cases 34 and 35 hold the two that
+        // matter.
         24 => {
             let mut descriptors = [Binding::EMPTY; 2];
             let mut pending = [Pending::EMPTY; 2];
@@ -698,6 +707,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 in_flight: 0,
                 class: binding::Class::Async,
                 snapshot: 0.0,
+                scope: 0,
             });
             let Ok(index) = admitted else {
                 return false;
@@ -721,6 +731,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
                 in_flight: 0,
                 class: binding::Class::Async,
                 snapshot: 0.0,
+                scope: 0,
             });
             let Ok(index) = admitted else {
                 return false;
@@ -837,6 +848,95 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
             |_, stated| stated == Err(capability::Refusal::Unreadable),
         ),
 
+        // A handle is shared by every member of the capability that issued
+        // it. `http#send` answers a response and `http#status`,
+        // `http#headers`, `http#read` and `http#close` all read it, so a
+        // handle scoped to the MEMBER resolves nowhere and the program can
+        // make exactly one request per run before everything after `send`
+        // fails. That is the bug this case exists to keep fixed.
+        34 => {
+            let mut descriptors = [Binding::EMPTY; 2];
+            let mut pending = [Pending::EMPTY; 2];
+            let mut resources = [binding::Resource::EMPTY; 2];
+            let mut bindings = Bindings::new(&mut descriptors, &mut pending);
+            bindings.attach_resources(&mut resources);
+            let Ok(send) = bindings.admit(Binding {
+                name: digest::digest(b"http.send"),
+                in_flight_max: 1,
+                in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
+                scope: 9,
+            }) else {
+                return false;
+            };
+            let Ok(read) = bindings.admit(Binding {
+                name: digest::digest(b"http.read"),
+                in_flight_max: 1,
+                in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
+                scope: 9,
+            }) else {
+                return false;
+            };
+            let Ok(handle) = bindings.open(send, 0x5A) else {
+                return false;
+            };
+            // Opened by one member, read by another, and released by a
+            // third reading of the same scope.
+            bindings.resolve(read, handle) == Ok(0x5A)
+                && bindings.resolve(send, handle) == Ok(0x5A)
+                && bindings.release(read, handle) == Ok(0x5A)
+                && bindings.resolve(send, handle) == Err(CallError::StaleHandle)
+        }
+
+        // The capability is still the boundary. A handle issued under one
+        // grant is as stale as a released one when a member of ANOTHER
+        // grant presents it — including when that member is admitted, live,
+        // and asking about a slot that exists.
+        35 => {
+            let mut descriptors = [Binding::EMPTY; 2];
+            let mut pending = [Pending::EMPTY; 2];
+            let mut resources = [binding::Resource::EMPTY; 2];
+            let mut bindings = Bindings::new(&mut descriptors, &mut pending);
+            bindings.attach_resources(&mut resources);
+            let Ok(http) = bindings.admit(Binding {
+                name: digest::digest(b"http.send"),
+                in_flight_max: 1,
+                in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
+                scope: 9,
+            }) else {
+                return false;
+            };
+            let Ok(store) = bindings.admit(Binding {
+                name: digest::digest(b"store.open"),
+                in_flight_max: 1,
+                in_flight: 0,
+                class: binding::Class::Async,
+                snapshot: 0.0,
+                scope: 4,
+            }) else {
+                return false;
+            };
+            let Ok(theirs) = bindings.open(http, 0x5A) else {
+                return false;
+            };
+            // The other capability holds a handle of its own, so the table
+            // is not empty and the refusal is about scope rather than about
+            // there being nothing to find.
+            let Ok(mine) = bindings.open(store, 0x1B) else {
+                return false;
+            };
+            bindings.resolve(store, theirs) == Err(CallError::StaleHandle)
+                && bindings.resolve(http, mine) == Err(CallError::StaleHandle)
+                && bindings.release(store, theirs) == Err(CallError::StaleHandle)
+                && bindings.resolve(http, theirs) == Ok(0x5A)
+                && bindings.resolve(store, mine) == Ok(0x1B)
+        }
+
         _ => true,
     }
 }
@@ -874,6 +974,7 @@ fn requires(
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     report_out: i32,
     exit_out: i32,
     storage: Storage,
@@ -902,6 +1003,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
     probe::step(
         &mut state.progress,
         syscalls,

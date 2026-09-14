@@ -169,3 +169,25 @@ macro_rules! entry {
         }
     };
 }
+
+/// Signal `StepOutcome::Ready` once, on the first step, and return.
+///
+/// Told once, before any work: from here the module's outputs mean something.
+/// Fluxor gates a module until every one of its forward upstreams has
+/// signalled Ready, so a module that never signals holds everything
+/// downstream of it dark for the life of the graph — on a real board that
+/// looks like an engine that never runs, not like a missing signal. The
+/// flag is a `bool` field named `announced` on the module's state, which
+/// `module_new` zeroes with the rest of the block.
+///
+/// This belongs at the top of `module_step`, after the null and port checks
+/// and before any work.
+#[allow(unused_macros, reason = "consumed by the fmods that include this file")]
+macro_rules! announce_ready {
+    ($state:expr) => {
+        if !$state.announced {
+            $state.announced = true;
+            return 3;
+        }
+    };
+}

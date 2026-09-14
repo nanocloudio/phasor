@@ -1029,6 +1029,10 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             object::prototype(self.heap, callee.as_handle()).map_err(|_| Completion::MALFORMED)?;
         let list = self.register(frame, operands[0]);
         let length = self.length_of(list)?;
+        // Refused rather than trimmed, for the reason `apply` gives.
+        if (length as usize) > MAX_ARGUMENTS {
+            return Err(self.throw_error_of(ErrorKind::Range));
+        }
         let mut values = [Value::UNDEFINED; MAX_ARGUMENTS];
         let count = (length as usize).min(values.len());
         let mut index = 0usize;

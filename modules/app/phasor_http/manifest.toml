@@ -1,5 +1,9 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712"]
+# `wasm` joined `bcm2712` when the browser became a provider: the browser serves HTTP as `fetch`, and `wasm_browser_http` takes this
+# adapter's own `publish_out` records on `publish_in`,
+# so nothing here is target-conditional and the wasm graph is the Linux
+# one with a different module named in one place.
+hardware_targets = ["bcm2712", "wasm"]
 
 # Call frames a router or a shell forwarded, each followed by its payload.
 [[ports]]
@@ -32,8 +36,12 @@ direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 16384
 
-# The request, as an exchange `Publish`. Where it goes is the graph's to say:
-# this adapter names no host and opens no socket.
+# The request, as an exchange `Publish`, on the leg its scheme picked. Where
+# either leg goes is the graph's to say: this adapter names no host and opens
+# no socket. `publish_out` carries `https`, and the graph wires it through a
+# transport that authenticates the authority; `plain_out` carries `http`
+# straight to the socket. A scheme whose leg the graph left unwired is
+# refused rather than sent down the other one.
 [[ports]]
 name         = "publish_out"
 index        = 1
@@ -41,5 +49,20 @@ direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 16384
 
+[[ports]]
+name         = "plain_out"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
 [observability]
 exempt = "adapter whose evidence is the completions it emits"
+
+[build]
+# Nothing set: the wasm build, where this adapter's size matters (60 KB
+# against `phasor_ws`'s 20 KB, and `examples/wasm/http.yaml` once came out
+# 15,690 bytes over the kernel's 1,048,544-byte blob placeholder), already
+# builds at rustc's `z`, and `opt_level` governs the PIC targets, where
+# building for size leaves the slice copies' length checks as panic paths
+# a module image cannot link.

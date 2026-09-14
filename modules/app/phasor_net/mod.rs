@@ -1,21 +1,25 @@
 //! A stream connection, as a capability rather than a network.
 //!
-//! An isolate has no network. A deployment that wants a program to reach one
-//! endpoint wires this adapter behind the router and names that endpoint in
-//! the graph; the program reaches it only through the binding it was granted,
-//! and only that endpoint. A program cannot name an address at all: `connect`
-//! takes nothing, because where it goes is the deployment's to decide and not
-//! the program's to ask. A deployment that wants two endpoints wires two
-//! adapters, and each is granted separately.
+//! An isolate has no network. A deployment that wants a program to open a
+//! connection wires this adapter behind the router, and the program reaches
+//! the network only through the binding it was granted. `connect` names an
+//! authority, `host[:port]`, or names nothing and takes the one the graph's
+//! `authority` parameter holds. The name is one fact: it goes down to the
+//! stack in the connect record itself, the stack resolves it, and whatever
+//! sits between — `tls`, say — reads the same bytes for what it verifies.
 //!
-//! That is the whole of the confinement, and it is simple on purpose. There
-//! is no resolver here, so there is no name a program could steer; there is
-//! no address in a payload, so there is nothing to validate; and the
-//! endpoint is visible in the graph, where a deployment can read it.
+//! The confinement is `origins`: the deployment's comma-separated allow-list
+//! of authorities a program may name. One outside it is refused here, and
+//! nothing is dialled. Empty is no policy, which is what an applet granted
+//! `net` means. The graph's own `authority` is admitted by being the
+//! graph's; the list is for what the program writes.
 //!
-//! Bytes cross as payloads, and a connection crosses as a handle the engine
-//! checks. What this module holds — the connection identifier the stack gave
-//! it, the buffered bytes, the pending calls — never crosses at all.
+//! There is no resolver here, and no address arithmetic: an authority is
+//! parsed by the stream contract's own reader, so what this module admits is
+//! exactly what a provider can dial. Bytes cross as payloads, and a
+//! connection crosses as a handle the engine checks. What this module holds
+//! — the connection identifier the stack gave it, the buffered bytes, the
+//! pending calls — never crosses at all.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -75,8 +79,11 @@ const COMMAND_BYTES: usize = 4 * (proto::FRAME_HDR + proto::MAX_CMD_DATA);
 const NET_FRAME: usize = 16 * 1024;
 /// Calls held until the stack answers.
 const PENDING: usize = 8;
-/// The longest authority the graph may name the endpoint by.
-const AUTHORITY_BYTES: usize = 64;
+/// The longest authority a connection may be opened to: a name the stream
+/// contract carries, with its port.
+const AUTHORITY_BYTES: usize = proto::MAX_NAME_LEN + 8;
+/// Bytes the comma-separated `origins` allow-list may hold.
+const ORIGINS_BYTES: usize = 512;
 
 /// The methods the interface offers.
 const METHOD_CONNECT: u32 = 0;
@@ -134,6 +141,7 @@ impl Held {
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     request_in: i32,
     reply_out: i32,
     net_out: i32,
@@ -161,16 +169,23 @@ struct State {
     held: [Held; PENDING],
     answered: u64,
 
-    /// The endpoint this adapter reaches, which the graph names and the
-    /// program cannot. Held as the address and port the stack takes.
-    address: u32,
-    port: u32,
-    /// What that endpoint answers to, when the deployment says. An address
-    /// is where to go; a name is what the far end is called, and a program
-    /// naming a URL has only the latter. Empty means the graph named none,
-    /// and the endpoint is then its address and port.
+    /// The authority a `connect` that names none goes to, `host[:port]`.
+    /// Empty means the graph named none, and a program must.
     authority: [u8; AUTHORITY_BYTES],
     authority_len: usize,
+    /// The authorities a program may name, comma-separated. Empty is no
+    /// policy.
+    origins: [u8; ORIGINS_BYTES],
+    origins_len: usize,
+    /// The authority the last connection was opened to, which is what
+    /// `endpoint` answers once one has been. Before that it answers the
+    /// graph's.
+    endpoint: [u8; AUTHORITY_BYTES],
+    endpoint_len: usize,
+    /// The authority of the dial in flight, taken into `endpoint` when the
+    /// stack answers it.
+    dialled: [u8; AUTHORITY_BYTES],
+    dialled_len: usize,
     /// Connections this adapter will open before it refuses.
     quota: u32,
     phase: u8,
@@ -179,15 +194,15 @@ struct State {
 define_params! {
     State;
 
-    1, address, u32, 2130706433
-        => |s, d, len| { s.address = p_u32(d, len, 0, 2130706433); };
-    2, port, u32, 80
-        => |s, d, len| { s.port = p_u32(d, len, 0, 80); };
+    // 1, 2: retired.
     3, quota, u32, 0
         => |s, d, len| { s.quota = p_u32(d, len, 0, 0); };
     4, authority, str, 0
         => |s, d, len| {
-            let taken = if len > AUTHORITY_BYTES { AUTHORITY_BYTES } else { len };
+            // A prefix of an authority is a different host, so one that does
+            // not fit is dropped and every dial that would have used it is
+            // refused as malformed.
+            let taken = if len > AUTHORITY_BYTES { 0 } else { len };
             s.authority_len = taken;
             if taken > 0 {
                 // SAFETY: the params reader hands a pointer valid for `len`
@@ -198,6 +213,56 @@ define_params! {
                 }
             }
         };
+    5, origins, str, 0
+        => |s, d, len| {
+            // Held whole or not at all, and never as nothing: an empty list
+            // is no policy, so a list too long to store becomes one empty
+            // entry, which no authority equals.
+            if len > ORIGINS_BYTES {
+                s.origins[0] = b',';
+                s.origins_len = 1;
+                return;
+            }
+            let taken = len;
+            s.origins_len = taken;
+            if taken > 0 {
+                // SAFETY: as above.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(d, s.origins.as_mut_ptr(), taken);
+                }
+            }
+        };
+}
+
+/// Whether two authorities are the same one. A host is case-insensitive
+/// and a port is digits, so an ASCII fold is the whole comparison.
+fn same_authority(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// Whether the allow-list admits `authority`. An empty list is no policy;
+/// otherwise the authority must be one of its comma-separated entries,
+/// with the space a hand-written list may put after a comma ignored.
+fn granted(list: &[u8], authority: &[u8]) -> bool {
+    if list.is_empty() {
+        return true;
+    }
+    list.split(|&c| c == b',').any(|entry| {
+        let mut entry = entry;
+        while let Some((&first, rest)) = entry.split_first() {
+            if first != b' ' {
+                break;
+            }
+            entry = rest;
+        }
+        while let Some((&last, rest)) = entry.split_last() {
+            if last != b' ' {
+                break;
+            }
+            entry = rest;
+        }
+        !entry.is_empty() && same_authority(entry, authority)
+    })
 }
 
 /// Take the graph's parameters, or the defaults where it gave none.
@@ -384,7 +449,7 @@ fn serve_receives(state: &mut State) {
 }
 
 /// Answer one call, or hold it until the stack can.
-fn serve(state: &mut State, record: &CallRecord) {
+fn serve(state: &mut State, sys: &SyscallTable, record: &CallRecord) {
     if state.quota != 0
         && record.binding == METHOD_CONNECT
         && state.answered >= u64::from(state.quota)
@@ -405,7 +470,10 @@ fn serve(state: &mut State, record: &CallRecord) {
     // does not have the fields this method takes is refused here instead of
     // being read as though it did.
     let shape = match record.binding {
-        METHOD_CONNECT | METHOD_ENDPOINT => (0, 0),
+        METHOD_ENDPOINT => (0, 0),
+        // The authority is the caller's to leave out, in which case the
+        // graph's stands.
+        METHOD_CONNECT => (0, 1),
         METHOD_CLOSE => (1, 1),
         // The length a read may answer with is the caller's to leave out.
         METHOD_RECEIVE => (1, 2),
@@ -421,36 +489,19 @@ fn serve(state: &mut State, record: &CallRecord) {
 
     match record.binding {
         METHOD_ENDPOINT => {
-            // What the graph wired, so a façade can tell whether a name it
-            // was given is the one this capability reaches — and so a
-            // request carries an authority the far end recognises. A named
-            // endpoint answers by its name; an unnamed one by its address.
+            // Where the last connection went, by the name it was opened to;
+            // before any has been, where a `connect` naming nothing would
+            // go. A façade reads it to say what a program reached.
+            let (source, at) = if state.endpoint_len > 0 {
+                (&state.endpoint, state.endpoint_len.min(AUTHORITY_BYTES))
+            } else {
+                (&state.authority, state.authority_len.min(AUTHORITY_BYTES))
+            };
             let mut text = [0u8; AUTHORITY_BYTES];
-            let mut at = 0usize;
-            if state.authority_len > 0 {
-                at = state.authority_len.min(text.len());
-                copy_into(
-                    text.get_mut(..at).unwrap_or(&mut []),
-                    state.authority.get(..at).unwrap_or(&[]),
-                );
-                fulfil(
-                    state,
-                    record.request,
-                    record.trace,
-                    Answer::Payload(u32::try_from(at).unwrap_or(0)),
-                    text.get(..at).unwrap_or(&[]),
-                );
-                return;
-            }
-            let octets = state.address.to_be_bytes();
-            for (index, octet) in octets.iter().enumerate() {
-                if index > 0 {
-                    at += text::put_ascii(text.get_mut(at..).unwrap_or(&mut []), b".");
-                }
-                at += text::put_u32(text.get_mut(at..).unwrap_or(&mut []), u32::from(*octet));
-            }
-            at += text::put_ascii(text.get_mut(at..).unwrap_or(&mut []), b":");
-            at += text::put_u32(text.get_mut(at..).unwrap_or(&mut []), state.port);
+            copy_into(
+                text.get_mut(..at).unwrap_or(&mut []),
+                source.get(..at).unwrap_or(&[]),
+            );
             fulfil(
                 state,
                 record.request,
@@ -464,16 +515,74 @@ fn serve(state: &mut State, record: &CallRecord) {
                 refuse(state, record.request, record.trace, Cause::Busy);
                 return;
             }
-            let mut payload = [0u8; 8];
-            payload[0] = proto::SOCK_TYPE_STREAM;
-            payload[1..5].copy_from_slice(&state.address.to_le_bytes());
-            let port = u16::try_from(state.port).unwrap_or(80);
-            payload[5..7].copy_from_slice(&port.to_le_bytes());
-            if !command(state, proto::CMD_CONNECT, &payload[..7])
-                || !hold(state, record, usize::MAX, 0)
+            // The authority: the program's when it named one, checked
+            // against the allow-list; the graph's otherwise, admitted by
+            // being the graph's.
+            let named = taken > 0 && !first.is_empty();
+            let mut authority = [0u8; AUTHORITY_BYTES];
+            let authority_len = if named {
+                first.len()
+            } else {
+                state.authority_len.min(AUTHORITY_BYTES)
+            };
+            if authority_len == 0
+                || authority_len > AUTHORITY_BYTES
+                || !copy_into(
+                    authority.get_mut(..authority_len).unwrap_or(&mut []),
+                    if named {
+                        first
+                    } else {
+                        state.authority.get(..authority_len).unwrap_or(&[])
+                    },
+                )
+            {
+                refuse(state, record.request, record.trace, Cause::Malformed);
+                return;
+            }
+            let authority = authority.get(..authority_len).unwrap_or(&[]);
+            // A raw connection has no protocol, so no default port: the
+            // authority names one or the call is malformed.
+            let Some((target, Some(port))) = proto::Target::parse(authority) else {
+                refuse(state, record.request, record.trace, Cause::Malformed);
+                return;
+            };
+            let origins_len = state.origins_len.min(ORIGINS_BYTES);
+            if named && !granted(state.origins.get(..origins_len).unwrap_or(&[]), authority) {
+                refuse(state, record.request, record.trace, Cause::Denied);
+                return;
+            }
+            // The dial carries this adapter's tag, so its answer can be
+            // told from every other consumer's on a shared lane.
+            //
+            // SAFETY: `sys` is the table the loader handed this module,
+            // live for its lifetime.
+            let tag = unsafe { dev_requester_tag(sys) };
+            let mut payload = [0u8; proto::CONNECT_TO_MAX];
+            let length = proto::write_connect_to(
+                &mut payload,
+                proto::SOCK_TYPE_STREAM,
+                port,
+                &target,
+                Some(tag),
+            );
+            if length == 0 {
+                refuse(state, record.request, record.trace, Cause::Malformed);
+                return;
+            }
+            if !command(
+                state,
+                proto::CMD_CONNECT_TO,
+                payload.get(..length).unwrap_or(&[]),
+            ) || !hold(state, record, usize::MAX, 0)
             {
                 refuse(state, record.request, record.trace, Cause::Busy);
+                return;
             }
+            copy_into(
+                state.dialled.get_mut(..authority_len).unwrap_or(&mut []),
+                authority,
+            );
+            state.dialled_len = authority_len;
         }
         METHOD_SEND => {
             let Some(slot) = digits(first).filter(|slot| *slot < CONNECTIONS) else {
@@ -584,19 +693,29 @@ fn room_for(state: &State, frame: &[u8]) -> bool {
     }
 }
 
-fn apply(state: &mut State, kind: u8, payload: &[u8]) {
+fn apply(state: &mut State, sys: &SyscallTable, kind: u8, payload: &[u8]) {
+    // The stack's outbound lane is shared: every adapter wired to it sees
+    // every connection opened on it, including ones opened by another module
+    // entirely. An answer to a dial carries the dialler's tag, and one that
+    // carries another module's is not this adapter's to act on. An untagged
+    // answer is taken as addressed to whoever is waiting.
+    //
+    // SAFETY: `sys` is the table the loader handed this module, live for
+    // its lifetime.
+    let mine = unsafe { dev_requester_tag(sys) };
     match kind {
         proto::MSG_CONNECTED => {
             if payload.len() < proto::CONN_ID_LEN {
                 return;
             }
-            // The stack's outbound lane is shared: every adapter wired to it
-            // sees every connection opened on it, including ones opened by
-            // another module entirely. A connection this adapter did not ask
-            // for is not its own, and adopting it is worse than untidy —
-            // nothing here will ever read that stream, so its buffer fills,
-            // and a full buffer stops the whole lane for the module the
-            // connection does belong to.
+            let (_, tag) = proto::connected_parts(payload);
+            if tag != proto::REQUESTER_TAG_NONE && tag != mine {
+                return;
+            }
+            // A connection this adapter did not ask for is not its own, and
+            // adopting it is worse than untidy — nothing here will ever read
+            // that stream, so its buffer fills, and a full buffer stops the
+            // whole lane for the module the connection does belong to.
             let mut index = 0usize;
             let waiting = loop {
                 if index >= PENDING {
@@ -620,7 +739,19 @@ fn apply(state: &mut State, kind: u8, payload: &[u8]) {
                 live: true,
             };
             // The call that asked for a connection is answered with a handle
-            // over this slot; the stack's own identifier stays here.
+            // over this slot; the stack's own identifier stays here, and the
+            // authority it was opened to becomes what `endpoint` answers.
+            let dialled_len = state.dialled_len.min(AUTHORITY_BYTES);
+            let mut dialled = [0u8; AUTHORITY_BYTES];
+            copy_into(
+                dialled.get_mut(..dialled_len).unwrap_or(&mut []),
+                state.dialled.get(..dialled_len).unwrap_or(&[]),
+            );
+            copy_into(
+                state.endpoint.get_mut(..dialled_len).unwrap_or(&mut []),
+                dialled.get(..dialled_len).unwrap_or(&[]),
+            );
+            state.endpoint_len = dialled_len;
             let held = state.held[waiting];
             state.held[waiting] = Held::EMPTY;
             fulfil(
@@ -676,6 +807,13 @@ fn apply(state: &mut State, kind: u8, payload: &[u8]) {
             }
         }
         proto::MSG_ERROR => {
+            if payload.len() < proto::CONN_ID_LEN + 1 {
+                return;
+            }
+            let (_, _, tag) = proto::error_parts(payload);
+            if tag != proto::REQUESTER_TAG_NONE && tag != mine {
+                return;
+            }
             // Whatever was waiting is told, rather than left waiting.
             let mut index = 0usize;
             while index < PENDING {
@@ -714,6 +852,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
     if state.phase == 1 {
         return 1;
     }
@@ -762,7 +901,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 payload.get_mut(..length).unwrap_or(&mut []),
                 state.net_frame.get(proto::FRAME_HDR..total).unwrap_or(&[]),
             );
-            apply(state, kind, payload.get(..length).unwrap_or(&[]));
+            apply(state, syscalls, kind, payload.get(..length).unwrap_or(&[]));
             // What is left moves down over the frame just taken, in place:
             // a second buffer of this size does not belong on the stack.
             let rest = state.net_filled - total;
@@ -805,7 +944,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         {
             state.frame_ready = false;
             if let Some(record) = CallRecord::decode(&state.request) {
-                serve(state, &record);
+                serve(state, syscalls, &record);
             }
             state.payload_filled = 0;
             state.payload_length = 0;

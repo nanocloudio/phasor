@@ -108,6 +108,12 @@ pub(super) fn build_number_intrinsics(
         Entry::Method(b"encodeURIComponent", native::ENCODE_URI_COMPONENT),
         Entry::Method(b"decodeURI", native::DECODE_URI),
         Entry::Method(b"decodeURIComponent", native::DECODE_URI_COMPONENT),
+        // The UTF-8 codecs the facade's TextEncoder/TextDecoder sit on.
+        // Native because the JavaScript form cannot be made cheap: a string
+        // built a character at a time reallocates the whole result each
+        // time, so a page-sized body exhausts the arena before it is read.
+        Entry::Method(b"__decodeUtf8", native::DECODE_UTF8),
+        Entry::Method(b"__encodeUtf8", native::ENCODE_UTF8),
     ];
     install(heap, atoms, global, function_prototype, &entries)?;
     Ok(())

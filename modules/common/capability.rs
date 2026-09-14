@@ -41,20 +41,12 @@ use crate::digest::Digest;
 
 use crate::bytecode::Unit;
 
-/// What separates an interface from its member in the name both ends digest.
-/// Excluded from both parts by the grammar, so the join is unambiguous.
-pub const SEPARATOR: u8 = b'#';
-
-/// The longest interface, member, and import specifier this reads. A name
-/// longer than it is refused rather than truncated: two capabilities sharing
-/// a prefix must not share an identity.
-///
-/// Sixty-four rather than thirty-two because a versioned WASI name reaches
-/// the smaller figure exactly -- `wasi:http/outgoing-handler@0.2.0` is
-/// thirty-two characters -- and a bound a real name sits on is a bound that
-/// refuses the next one for no reason anybody chose.
-pub const MAX_INTERFACE: usize = 64;
-pub const MAX_MEMBER: usize = 32;
+/// The separator and the lengths a name is held under live in `register.rs`,
+/// with the table of interfaces they describe. They are re-stated here
+/// because this file is where the grammar that excludes the separator from
+/// both parts is written, and one definition of a name's shape is what makes
+/// the join injective.
+pub use crate::register::{MAX_INTERFACE, MAX_MEMBER, SEPARATOR};
 /// The longest import specifier or name this reads.
 ///
 /// Generous for a module specifier, which in a closure is a short name or a

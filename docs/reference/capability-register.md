@@ -79,6 +79,27 @@ modules:
 that line, which is what lets one image be admitted by the second and refused
 by the first.
 
+Being admitted is not yet being served. A grant makes the isolate admit a
+binding, numbered by its position in that list, with the general `host` call
+first; an adapter knows its operations by method number instead, which is the
+column below. `phasor_host_router` is where the one becomes the other, so a
+graph tells it the interface the adapter behind it serves and the same grant
+list, in the same order:
+
+```yaml
+  - name: phasor_host_router
+    params:
+      interface: phasor:store/keyvalue
+      grants: "phasor:store/keyvalue#write, phasor:store/keyvalue#read"
+```
+
+A call on any binding that list does not name is refused at the router rather
+than forwarded, because nothing behind it could answer. A graph that states no
+grants there routes the general `host` call alone, which is what every
+composition in `examples/capabilities/` but `store.yaml` does.
+`tests/e2e/closure.sh` runs one closure against a graph that serves the
+grant and against one that does not.
+
 An interface name may be up to 64 bytes. A versioned WASI name reaches half of
 that exactly -- `wasi:http/outgoing-handler@0.2.0` is thirty-two characters --
 and a bound that a real name sits on is one that refuses the next name for no
@@ -86,52 +107,53 @@ reason anybody chose.
 
 ## The interfaces
 
-| Interface | Member | Class | Adapter | What it grants |
-|---|---|---|---|---|
-| `wasi:clocks/wall-clock` | `now` | snapshot | `phasor_time` | The time, in milliseconds, as of the task boundary |
-| | `sleep` | async | | Being told later, which is what a timer is built on |
-| `wasi:random/random` | `random` | async | `phasor_entropy` | A number the platform's own source produced |
-| `wasi:filesystem/types` | `read` | async | `phasor_fs` | The bytes of a file under the root |
-| | `write` | async | | Bytes into a file under the root, created if absent |
-| | `open` | async | | A handle over a file under the root |
-| | `readAt` | async | | Bytes through a handle, continuing where it left off |
-| | `close` | async | | Releasing a handle |
-| | `size` | async | | A file's length in bytes |
-| `phasor:store/keyvalue` | `read` | async | `phasor_store` | The bytes held under a key |
-| | `write` | async | | Bytes under a key, within the store's capacity |
-| | `list` | async | | The keys the store holds |
-| | `delete` | async | | Removing a key |
-| | `open` | async | | A handle over an entry |
-| | `readAt` | async | | Bytes through a handle |
-| `wasi:http/outgoing-handler` | `send` | async | `phasor_http` | A request performed against the wired origin, answered with a handle over the response |
-| | `status` | async | | The response's status, once there is one |
-| | `headers` | async | | The response's header block |
-| | `read` | async | | Bytes of the body through the handle; nothing when it is whole |
-| | `close` | async | | Releasing the response |
-| `wasi:sockets/tcp` | `connect` | async | `phasor_net` | A handle over a connection to the one wired endpoint |
-| | `send` | async | | Bytes onto a connection |
-| | `receive` | async | | Bytes off a connection, up to a length |
-| | `close` | async | | Ending a connection |
-| | `endpoint` | async | | What the deployment called the endpoint it wired |
-| `phasor:net/websocket` | `open` | async | `phasor_ws` | A handle over a WebSocket to a resource on the wired origin |
-| | `send` | async | | One message, as text or as binary |
-| | `receive` | async | | The next message, led by its opcode; a close opcode when there will be no more |
-| | `close` | async | | Ending a link |
-| | `origin` | async | | What the deployment called the origin it wired |
+| Interface | Member | Method | Class | Adapter | What it grants |
+|---|---|---|---|---|---|
+| `wasi:clocks/wall-clock` | `now` | 0 | snapshot | `phasor_time` | The time, in milliseconds, as of the task boundary |
+| | `sleep` | 1 | async | | Being told later, which is what a timer is built on |
+| `wasi:random/random` | `random` | 0 | async | `phasor_entropy` | A number the platform's own source produced |
+| `wasi:filesystem/types` | `read` | 0 | async | `phasor_fs` | The bytes of a file under the root |
+| | `write` | 1 | async | | Bytes into a file under the root, created if absent |
+| | `open` | 4 | async | | A handle over a file under the root |
+| | `readAt` | 5 | async | | Bytes through a handle, continuing where it left off |
+| | `close` | 6 | async | | Releasing a handle |
+| | `size` | 7 | async | | A file's length in bytes |
+| `phasor:store/keyvalue` | `read` | 0 | async | `phasor_store` | The bytes held under a key |
+| | `write` | 1 | async | | Bytes under a key |
+| | `list` | 2 | async | | The keys this program holds, NUL-separated |
+| | `delete` | 3 | async | | Removing a key |
+| | `open` | 4 | async | | A handle over an entry |
+| | `readAt` | 5 | async | | Bytes through a handle, continuing where it left off |
+| `wasi:http/outgoing-handler` | `send` | 0 | async | `phasor_http` | A request performed against the authority it names, under the `origins` policy, answered with a handle over the response |
+| | `status` | 1 | async | | The response's status, once there is one |
+| | `headers` | 2 | async | | The response's header block |
+| | `read` | 3 | async | | Bytes of the body through the handle; nothing when it is whole |
+| | `close` | 4 | async | | Releasing the response |
+| | `origins` | 5 | async | | The authorities the deployment granted, comma-separated; empty when it granted them all |
+| `wasi:sockets/tcp` | `connect` | 0 | async | `phasor_net` | A handle over a connection to the authority it names, under the `origins` policy, or to the graph's when it names none |
+| | `send` | 1 | async | | Bytes onto a connection |
+| | `receive` | 2 | async | | Bytes off a connection, up to a length |
+| | `close` | 3 | async | | Ending a connection |
+| | `endpoint` | 4 | async | | The authority the last connection was opened to; the graph's before any was |
+| `phasor:net/websocket` | `open` | 0 | async | `phasor_ws` | A handle over a WebSocket to a resource on the wired origin |
+| | `send` | 1 | async | | One message, as text or as binary |
+| | `receive` | 2 | async | | The next message, led by its opcode; a close opcode when there will be no more |
+| | `close` | 3 | async | | Ending a link |
+| | `origin` | 4 | async | | What the deployment called the origin it wired |
 
 `phasor:net/websocket` carries no WASI name because WASI has none for it. The
 protocol itself is not here at all: the upgrade, the accept it verifies, the
 masking and the frame codec belong to the provider a deployment wires, which
 is where one implementation serves every consumer on the platform instead of
 a second one in JavaScript spending the program's own fuel on the SHA-1 of
-every handshake. A message crosses led by its RFC 6455 opcode, so text and
+every handshake. A message crosses led by its WebSocket opcode, so text and
 binary stay distinguishable and a reader learns that a link has ended in the
 same answer it was waiting on.
 
 The shell names each interface by a short namespace a program calls it
-through: `clock`, `entropy`, `fs`, `store`, `net`, `http`, `websocket`. That name is the
-JavaScript surface and has nothing to do with admission; the identifier
-above is what the deployment grants and what the digest covers.
+through: `clock`, `entropy`, `fs`, `store`, `net`, `http`, `websocket`. That
+name is the JavaScript surface and has nothing to do with admission; the
+identifier above is what the deployment grants and what the digest covers.
 
 ## How each class is served
 
@@ -147,10 +169,44 @@ cannot tell which graph it is running in. `examples/net/https.yaml` is that
 graph, and what it will trust is stated there rather than anywhere a program
 can reach.
 
+The store is not here. `phasor_store` holds no keys and no bytes: it turns a
+granted call into one operation on Fluxor's `storage.object` and
+`storage.namespace` contracts and answers with what came back. Which provider
+serves those is the deployment's to wire -- the local versioned store, the
+browser's OPFS, or anything else that conforms -- and a program cannot tell
+one from another. A key is a flat name under the prefix the graph gave the
+adapter; the prefix is joined on the way in and stripped on the way out, so
+two programs in one graph reach the same provider and never each other's
+keys, and the separator that would express "outside" is not a character a key
+may contain. With no provider wired, a write is refused rather than kept
+somewhere it would not survive.
+
+A provider may answer a read with "not yet" rather than with bytes or a
+refusal: Fluxor's `EAGAIN`, which the contract says a consumer must treat as
+ask-again and never as absent. The adapter holds the call and asks on its
+next step. No provider on Linux answers that way, so the path is exercised on
+WebAssembly, where both the object and the filesystem providers fetch from
+the host and the first answer for a key or a file is pending by construction.
+`examples/wasm/store.yaml` and `examples/wasm/fs.yaml` are those two, and
+`tests/wasm/run.sh` refuses a pass in which either provider never said "not
+yet".
+
+Holding it is not the same as holding it once. A call the provider defers a
+second time stays held; a whole-file read is retried by re-opening, since the
+descriptor the first attempt used is closed, and the retry runs the member
+that was held rather than whichever one the retry was written for. No new
+call is taken while one is held, which is what keeps a held write's own bytes
+staged for it.
+
 **Asynchronous.** The call returns a promise and completes through a later
 job. Bytes travel behind the fixed frame in both directions, and a provider
 that answers with a resource answers with a handle the issuing binding
 checks.
+
+A handle is held by whatever runs the program: `phasor_isolate` and
+`phasor_shell` each keep a bounded table of them, and a host with no such
+table cannot be granted a member that answers with one -- it would admit the
+grant and then refuse every call to it. Both hold sixteen.
 
 An adapter reading the network stack's outbound lane shares it. The lane
 carries every connection the graph has open, whoever opened it, and a copy
@@ -236,14 +292,20 @@ build the graph at all.
 
 ### The ledger
 
-Four things are tolerated so that anything works at all. Each is named,
-each is held by `tests/e2e/tls.sh`, and each has the one change that deletes
-it — not a setting that hides it.
+These are the limits of the verifier the engine carries, which is what
+decides a chain on a target that offers no `trust` provider. A graph that
+sets `trust: system` asks the platform instead, and reaches whatever the host
+itself would; none of the four apply to it. `packaging/cli/linux.yaml` is
+such a graph.
+
+Four things are tolerated so that anything works at all where the engine
+verifies. Each is named, each is held by `tests/e2e/tls.sh`, and each has the
+one change that deletes it — not a setting that hides it.
 
 | Tolerated | Why | Deleted by |
 |---|---|---|
 | Certificate lifetimes unchecked (`clock_policy: unchecked`) | The silicon reports no `time.wall`, so the validity window is not a check that can run | A target with a trusted clock |
-| No public certificate authority reaches us | Only P-256 and ML-DSA signatures are verified; every well-known issuer signs with something else | P-384 and RSA verification |
+| No public certificate authority reaches us | P-256, P-384, RSA (2048 to 4096 bits, PKCS#1 v1.5 and PSS) and ML-DSA signatures are verified; only one anchor is held | A multi-anchor store to hold the issuers |
 | One trust anchor, so an issuer is pinned rather than a root trusted | The anchor is a single certificate, not a store | A multi-anchor store, with the bundle mounted by the deployment |
 | A privately issued leaf with no extended key usage is refused | The certificate omits `serverAuth` | Reissuing that certificate — this one is the world being wrong, not the code |
 
@@ -253,7 +315,8 @@ clock that line fails, which is the point of writing it down — the gap closes
 loudly rather than being forgotten.
 
 Until all four are gone, `ca_dns` does not mean the same thing on every
-target, and anything relying on it says which target it means.
+target, and anything relying on it says which target it means — and whether
+the engine or the platform is the one deciding.
 
 ## What is not here
 
@@ -268,14 +331,18 @@ A response is a resource: `send` answers a handle, the status and the headers
 are read from it, and the body is read through it in pieces exactly as a file
 is. That is what makes a response unbounded — nothing holds all of one.
 
-The network interface is one endpoint, and the deployment names it: the graph
-gives `phasor_net` an address, a port, and optionally an authority — the name
-that endpoint answers to, which a program may write in a URL and which travels
-as the request's authority. `connect` takes no arguments because there is
-nothing for a program to choose. `fetch` refuses a URL whose
-host is not that endpoint rather than sending it there anyway. There is no
-resolver, no listening socket, and no second endpoint without a second
-adapter. There is no process, environment, or subprocess interface, and no
+The network interface opens a connection to an authority, `host[:port]`, and
+the authority is one fact: the program names it, the adapter admits it under
+its `origins` allow-list and writes it into the connect record, the network
+resolves it, and a transport between them verifies it, because the same bytes
+reach each. `phasor_net`'s `connect` takes the authority, or takes none and
+goes to the one the graph's `authority` parameter holds; `phasor_http`'s
+`send` takes it with the scheme, which picks the leg — `publish_out` for
+`https`, `plain_out` for `http` — and a scheme whose leg the graph did not
+wire is refused rather than carried by the other. `origins` empty is no policy
+at that boundary. There is no resolver in any adapter, no listening socket,
+and no address arithmetic: an authority is parsed by the stream contract's own
+reader. There is no process, environment, or subprocess interface, and no
 interface for spawning another isolate. Each is absent rather than
 half-present: a program finds nothing, and a deployment cannot grant what does
 not exist.

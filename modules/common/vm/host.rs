@@ -97,6 +97,25 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         Ok(())
     }
 
+    /// Supply the wall-clock reading for the task about to run.
+    ///
+    /// Kept on the global, like the logical tick it displaces, because the
+    /// machine is rebuilt between advances and the global is what survives.
+    /// A deployment that granted no clock never calls this, and `Date.now`
+    /// falls back to the tick — which is the capability property, not a
+    /// missing feature: a program given no clock cannot read the hour.
+    pub fn set_wall_clock(&mut self, millis: f64) -> Result<(), Completion> {
+        let key = self.ascii_key(b"\0wall")?;
+        object::define_own_property(
+            self.heap,
+            self.realm.global,
+            key,
+            Descriptor::data(Value::number(millis), attribute::WRITABLE),
+        )
+        .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        Ok(())
+    }
+
     /// Put an empty namespace object on the global under `name`, for the
     /// bindings of one interface to be defined in.
     pub fn define_namespace(&mut self, name: &[u8]) -> Result<Handle, Completion> {

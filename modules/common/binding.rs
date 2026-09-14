@@ -64,6 +64,20 @@ pub struct Binding {
     pub class: Class,
     /// A snapshot binding's value, supplied before the task runs.
     pub snapshot: f64,
+    /// The capability this binding belongs to. Handles are shared within it
+    /// and nowhere else.
+    ///
+    /// A resource is opened by one member of an interface and used by
+    /// others: `http#send` answers a response that `http#status`,
+    /// `http#headers`, `http#read` and `http#close` all read. Scoping a
+    /// handle to the MEMBER that issued it made those calls unresolvable,
+    /// and the raw packed handle crossed to the provider instead — which
+    /// only looked like it worked while the first handle of a run packed to
+    /// zero and a provider's "is this my slot 0" check passed by accident.
+    ///
+    /// The capability is still the boundary: a handle from one grant is as
+    /// stale as a released one when presented to another.
+    pub scope: u32,
 }
 
 impl Binding {
@@ -73,6 +87,7 @@ impl Binding {
         in_flight: 0,
         class: Class::Async,
         snapshot: 0.0,
+        scope: 0,
     };
 }
 
@@ -234,12 +249,13 @@ impl Handle {
     }
 }
 
-/// One slot of the handle table: which binding issued it, what the provider
-/// calls it, and whether it is live.
+/// One slot of the handle table: which capability issued the handle, what
+/// the provider calls it, and whether it is live.
 #[derive(Clone, Copy, Debug)]
 pub struct Resource {
-    /// The binding that issued the handle. A handle is meaningful only to it.
-    pub binding: u32,
+    /// The capability that issued the handle — not the member. Every member
+    /// of that capability may use it, and no other capability may.
+    pub scope: u32,
     /// The provider's own identifier for the resource, opaque here.
     pub token: u64,
     pub generation: u32,
@@ -248,7 +264,7 @@ pub struct Resource {
 
 impl Resource {
     pub const EMPTY: Self = Self {
-        binding: 0,
+        scope: 0,
         token: 0,
         generation: 0,
         live: false,
@@ -323,6 +339,7 @@ impl<'a> Bindings<'a> {
     /// Record a resource a provider opened on `binding`, answering the handle
     /// the program holds it by.
     pub fn open(&mut self, binding: u32, token: u64) -> Result<Handle, CallError> {
+        let scope = self.scope_of(binding).ok_or(CallError::NotAdmitted)?;
         let Some(resources) = self.resources.as_deref_mut() else {
             return Err(CallError::HandlesFull);
         };
@@ -330,7 +347,7 @@ impl<'a> Bindings<'a> {
         while scan < resources.len() {
             let slot = &mut resources[scan];
             if !slot.live {
-                slot.binding = binding;
+                slot.scope = scope;
                 slot.token = token;
                 slot.live = true;
                 return Ok(Handle {
@@ -343,16 +360,26 @@ impl<'a> Bindings<'a> {
         Err(CallError::HandlesFull)
     }
 
-    /// The provider's own identifier for a live handle issued on `binding`.
+    /// The capability a binding belongs to, or `None` when it is not one
+    /// this isolate holds.
+    fn scope_of(&self, binding: u32) -> Option<u32> {
+        self.binding(binding).map(|descriptor| descriptor.scope)
+    }
+
+    /// The provider's own identifier for a live handle, presented on any
+    /// member of the capability that opened it.
     ///
-    /// A handle from another binding is as stale as a released one: a resource
-    /// is reachable only through the capability that opened it.
+    /// A handle from another CAPABILITY is as stale as a released one: a
+    /// resource is reachable only through the capability that opened it.
+    /// Within one capability every member may use it, which is what lets a
+    /// response opened by `send` be read by `status`.
     pub fn resolve(&self, binding: u32, handle: Handle) -> Result<u64, CallError> {
+        let scope = self.scope_of(binding).ok_or(CallError::StaleHandle)?;
         let resources = self.resources.as_deref().ok_or(CallError::StaleHandle)?;
         let slot = resources
             .get(handle.index as usize)
             .ok_or(CallError::StaleHandle)?;
-        if !slot.live || slot.generation != handle.generation || slot.binding != binding {
+        if !slot.live || slot.generation != handle.generation || slot.scope != scope {
             return Err(CallError::StaleHandle);
         }
         Ok(slot.token)

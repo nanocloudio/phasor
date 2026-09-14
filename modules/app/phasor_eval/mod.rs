@@ -31,6 +31,7 @@ const POLL_OUTPUT: u32 = 0x02;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     source_in: i32,
     result_out: i32,
     exit_out: i32,
@@ -125,6 +126,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
 
     if state.phase == 2 {
         return 1;

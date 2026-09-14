@@ -22,6 +22,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     return self.call_value(this, first, &[]);
                 }
                 let length = self.length_of(list)?;
+                // More arguments than a frame can carry is refused, not
+                // trimmed. Silently dropping the tail turns `apply` into a
+                // data-loss primitive: the classic use is building a string
+                // from an array of code units, and a short answer there is
+                // indistinguishable from the input having been short.
+                if (length as usize) > MAX_ARGUMENTS {
+                    return Err(self.throw_error_of(ErrorKind::Range));
+                }
                 let mut values = [Value::UNDEFINED; MAX_ARGUMENTS];
                 let count = (length as usize).min(values.len());
                 let mut index = 0usize;

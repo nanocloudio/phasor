@@ -2307,6 +2307,7 @@ fn execute(
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     input: i32,
     report_out: i32,
     exit_out: i32,
@@ -2564,6 +2565,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
 
     if state.phase == 3 {
         return 1;

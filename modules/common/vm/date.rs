@@ -189,11 +189,29 @@ pub(super) fn put_text(out: &mut [u8], at: &mut usize, text: &[u8]) {
 }
 
 impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
-    /// "Now": a logical instant, absent a clock capability. Each reading
-    /// is one tick after the last, kept on the global so it survives the
-    /// machine's rebuilds — deterministic, monotonic, and telling nothing
-    /// of the world outside but how often it was asked.
+    /// "Now": the wall clock a deployment granted, or — absent one — a
+    /// logical instant, each reading one tick after the last, kept on the
+    /// global so it survives the machine's rebuilds. Deterministic,
+    /// monotonic, and telling nothing of the world outside but how often it
+    /// was asked.
     pub(super) fn date_now(&mut self) -> f64 {
+        // A granted clock is the real one, supplied at the task boundary by
+        // the host. Every reading of "now" goes through here — `Date.now()`,
+        // `new Date()` and `Date()` alike — so they cannot disagree about
+        // what time it is, which they would if only one of them were wired.
+        if let Ok(wall) = self.ascii_key(b"\0wall") {
+            if let Some(descriptor) = object::get_own_property(self.heap, self.realm.global, wall)
+                .ok()
+                .flatten()
+            {
+                if matches!(descriptor.value.tag(), Tag::Number) {
+                    let millis = descriptor.value.as_number();
+                    if millis > 0.0 {
+                        return millis;
+                    }
+                }
+            }
+        }
         let Ok(key) = self.ascii_key(b"\0clock") else {
             return 0.0;
         };

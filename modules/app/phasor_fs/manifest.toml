@@ -1,5 +1,32 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "wasm"]
+
+# wasm is claimed for reading and not for writing. The `fs` contract's wasm
+# provider serves OPEN / READ / CLOSE over the page origin and answers WRITE,
+# SEEK and FSYNC with not-implemented (fluxor `src/platform/wasm/fs.rs`), so a
+# deployment on that target leaves `writable` at its default and grants the
+# read members alone.
+#
+# `size` is not among them there. That provider's STAT answers `OK` where the
+# contract says a provider "MUST ... return the number of bytes written, so a
+# consumer learns the width it actually got rather than assuming the one it
+# asked for" — and it writes the 8-byte shape into the 16 bytes this adapter
+# asks with, which is the other half of the same rule. A consumer cannot read
+# a width nobody reported, so `size_of` refuses it rather than assuming, and
+# the grant is left out of the graph until the provider answers as its own
+# contract requires.
+#
+# Both targets are claimed, because refusing a write is this adapter's stated
+# behaviour when a graph leaves it read-only, on every target — answered here,
+# with `Denied`, before the provider is reached at all. A read-only deployment
+# on a read-only medium is the adapter working rather than falling short, and
+# the graph rather than the manifest is where that is said. A graph that
+# writes `writable: yes` on wasm gets exactly what it asked for and a refusal
+# per call from the provider beneath, which is the honest answer to a graph
+# that asked for something its target cannot do.
+#
+# `examples/wasm/fs.yaml` reads a file and has its write refused, in one
+# program, so both halves of that are held rather than asserted.
 
 # Call frames a router or a shell forwarded, each followed by its payload.
 [[ports]]

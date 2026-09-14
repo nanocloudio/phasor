@@ -16,7 +16,8 @@
 
 /// The façade's source. A host compiles it once and runs it in the realm
 /// before the program, so what a program sees is already there.
-pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it runs, as a program itself.
+pub const SOURCE: &[u8] =
+    br##"// The standard surface a program finds before it runs, as a program itself.
 //
 // Everything here is a pure function of its arguments and the heap, or it
 // goes through a capability the deployment granted. Nothing reaches the
@@ -418,51 +419,42 @@ pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it
     };
     G.clearInterval = function clearInterval(id) { pending.delete(id); };
   }
-  // ---- timers -------------------------------------------------------
-  // A timer is a capability: the deployment's clock holds the wait, and the
-  // callback runs as an ordinary job when it answers. Without that grant
-  // there are no timers at all, rather than timers that never fire.
-  if (typeof clock === "object" && clock && typeof clock.sleep === "function") {
-    const pending = new Map();
-    let next = 1;
-    G.setTimeout = function setTimeout(callback, delay) {
-      if (typeof callback !== "function") throw new TypeError("setTimeout: not a function");
-      const id = next++;
-      const rest = [];
-      for (let i = 2; i < arguments.length; i++) rest.push(arguments[i]);
-      pending.set(id, true);
-      clock.sleep(delay === undefined ? 0 : delay).then(function () {
-        if (!pending.has(id)) return;
-        pending.delete(id);
-        callback.apply(undefined, rest);
-      });
-      return id;
-    };
-    G.clearTimeout = function clearTimeout(id) { pending.delete(id); };
-    G.setInterval = function setInterval(callback, delay) {
-      if (typeof callback !== "function") throw new TypeError("setInterval: not a function");
-      const id = next++;
-      pending.set(id, true);
-      const again = function () {
-        if (!pending.has(id)) return;
-        clock.sleep(delay === undefined ? 0 : delay).then(function () {
-          if (!pending.has(id)) return;
-          callback();
-          again();
-        });
-      };
-      again();
-      return id;
-    };
-    G.clearInterval = function clearInterval(id) { pending.delete(id); };
-  }
 
   // ---- bytes and text --------------------------------------------------
   // A payload crosses as bytes, and a string carrying one is one byte a
   // character. Text is a reading of those bytes rather than what they are,
   // so it is decoded here: the seam does not guess which it was given.
+  // Text is built as bounded segments joined once at the end, not by
+  // appending to one growing string.
+  //
+  // `out += one character` allocates a fresh string of the whole length so
+  // far, so decoding n bytes that way churns O(n^2) bytes through the arena
+  // -- 31 MB for an 8 KB page. In a fixed arena the collector loses that
+  // race, and the failure surfaces nowhere near here: the arena is already
+  // gone by the time the next realm asks for anything, so it is the NEXT
+  // allocation that reports `heap-exhausted`. Capping each segment caps the
+  // churn at `n * SEGMENT_CHARS / 2` and leaves one join at the end.
+  //
+  // Two things that look like improvements are not, both measured: batching
+  // the units and building each segment with one `String.fromCharCode.apply`
+  // call is WORSE (the pieces array and the per-call cost outweigh the saved
+  // appends), and doubling the arena moves nothing. `apply` is also unusable
+  // here for a second reason -- this engine takes only 16 arguments through
+  // it and silently DROPS the rest, so a larger batch decodes a page to a
+  // fraction of itself without any error.
+  const SEGMENT_CHARS = 256;
+
+  // The engine decodes in one allocation: it sizes the answer, allocates it
+  // and fills it in place. The JavaScript below is the fallback for a build
+  // that does not carry the native, and is kept correct rather than removed
+  // -- it is also what the native is checked against.
+  const nativeDecode = typeof G.__decodeUtf8 === "function" ? G.__decodeUtf8 : null;
+  const nativeEncode = typeof G.__encodeUtf8 === "function" ? G.__encodeUtf8 : null;
+
   function bytesToText(bytes) {
-    let out = "";
+    if (nativeDecode !== null) return nativeDecode(bytes);
+    const pieces = [];
+    let seg = "";
     let at = 0;
     while (at < bytes.length) {
       const first = bytes.charCodeAt(at);
@@ -472,24 +464,35 @@ pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it
       else if ((first & 0xE0) === 0xC0) { point = first & 0x1F; width = 2; }
       else if ((first & 0xF0) === 0xE0) { point = first & 0x0F; width = 3; }
       else if ((first & 0xF8) === 0xF0) { point = first & 0x07; width = 4; }
-      else { out += "\uFFFD"; at += 1; continue; }
-      if (at + width > bytes.length) { out += "\uFFFD"; break; }
+      else {
+        seg += "\uFFFD";
+        at += 1;
+        if (seg.length >= SEGMENT_CHARS) { pieces.push(seg); seg = ""; }
+        continue;
+      }
+      if (at + width > bytes.length) { seg += "\uFFFD"; break; }
       for (let i = 1; i < width; i++) {
         point = (point << 6) | (bytes.charCodeAt(at + i) & 0x3F);
       }
       at += width;
       if (point > 0xFFFF) {
         point -= 0x10000;
-        out += String.fromCharCode(0xD800 + (point >> 10), 0xDC00 + (point & 0x3FF));
+        seg += String.fromCharCode(0xD800 + (point >> 10), 0xDC00 + (point & 0x3FF));
       } else {
-        out += String.fromCharCode(point);
+        seg += String.fromCharCode(point);
       }
+      if (seg.length >= SEGMENT_CHARS) { pieces.push(seg); seg = ""; }
     }
-    return out;
+    if (seg.length > 0) pieces.push(seg);
+    return pieces.join("");
   }
 
+  // Segmented for the same reason as `bytesToText`: a request body built one
+  // character at a time costs O(n^2) in arena bytes.
   function textToBytes(text) {
-    let out = "";
+    if (nativeEncode !== null) return nativeEncode(text);
+    const pieces = [];
+    let seg = "";
     for (let i = 0; i < text.length; i++) {
       let point = text.charCodeAt(i);
       if (point >= 0xD800 && point < 0xDC00 && i + 1 < text.length) {
@@ -499,19 +502,21 @@ pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it
           i++;
         }
       }
-      if (point < 0x80) out += String.fromCharCode(point);
+      if (point < 0x80) seg += String.fromCharCode(point);
       else if (point < 0x800) {
-        out += String.fromCharCode(0xC0 | (point >> 6), 0x80 | (point & 0x3F));
+        seg += String.fromCharCode(0xC0 | (point >> 6), 0x80 | (point & 0x3F));
       } else if (point < 0x10000) {
-        out += String.fromCharCode(
+        seg += String.fromCharCode(
           0xE0 | (point >> 12), 0x80 | ((point >> 6) & 0x3F), 0x80 | (point & 0x3F));
       } else {
-        out += String.fromCharCode(
+        seg += String.fromCharCode(
           0xF0 | (point >> 18), 0x80 | ((point >> 12) & 0x3F),
           0x80 | ((point >> 6) & 0x3F), 0x80 | (point & 0x3F));
       }
+      if (seg.length >= SEGMENT_CHARS) { pieces.push(seg); seg = ""; }
     }
-    return out;
+    if (seg.length > 0) pieces.push(seg);
+    return pieces.join("");
   }
 
   G.__bytesToText = bytesToText;
@@ -553,10 +558,41 @@ pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it
         this._pairs.push([key, String(value)]);
       }
       append(name, value) { this._pairs.push([String(name).toLowerCase(), String(value)]); }
+      delete(name) {
+        const key = String(name).toLowerCase();
+        const kept = [];
+        for (let i = 0; i < this._pairs.length; i++) {
+          if (this._pairs[i][0] !== key) kept.push(this._pairs[i]);
+        }
+        this._pairs = kept;
+      }
       forEach(fn) {
         for (let i = 0; i < this._pairs.length; i++) fn(this._pairs[i][1], this._pairs[i][0], this);
       }
+      // Iteration, which `forEach` alone does not give: `for (const [name,
+      // value] of r.headers)` and `[...r.headers]` are how headers are read
+      // in ordinary code, and without `Symbol.iterator` both throw a
+      // TypeError that says nothing about what is missing.
+      entries() { return makeIterator(this._pairs.map((p) => [p[0], p[1]])); }
+      keys() { return makeIterator(this._pairs.map((p) => p[0])); }
+      values() { return makeIterator(this._pairs.map((p) => p[1])); }
+      [Symbol.iterator]() { return this.entries(); }
     };
+
+    // One array-backed iterator, iterable itself so it can be spread or
+    // walked directly the way `headers.entries()` is expected to be.
+    function makeIterator(items) {
+      let at = 0;
+      const it = {
+        next() {
+          return at < items.length
+            ? { value: items[at++], done: false }
+            : { value: undefined, done: true };
+        },
+      };
+      it[Symbol.iterator] = function () { return it; };
+      return it;
+    }
 
     // The header block a response came with, as fields rather than bytes.
     function parseFields(block) {
@@ -613,14 +649,23 @@ pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it
     G.fetch = function fetch(resource, options) {
       const settings = options === undefined ? {} : options;
       let path = String(resource);
-      let named = null;
-      // A deployment wires one origin. A URL naming another is refused rather
-      // than sent to the one that was wired: answering it would hand a
-      // program one origin's response while it believed it was reading
-      // another's, which is worse than not answering at all.
+      // The authority is one fact. What the program wrote is what the
+      // adapter admits, what the provider dials, and what the transport
+      // verifies, because the same bytes travel to each; the policy lives in
+      // the adapter, and this surface only explains its refusals. A bare
+      // path has no authority of its own, so it takes the first origin the
+      // deployment granted -- and without one there is nowhere for it to go.
+      let authority = null;
+      let scheme = "";
       if (path.indexOf("://") >= 0) {
         const target = new G.URL(path);
-        named = target.host;
+        scheme = target.protocol.substring(0, target.protocol.length - 1).toLowerCase();
+        authority = target.host;
+        // A written default port names the same authority as none.
+        if ((scheme === "https" && target.port === "443") ||
+            (scheme === "http" && target.port === "80")) {
+          authority = target.hostname;
+        }
         path = target.pathname + (target.search === undefined ? "" : target.search);
       }
       if (path.length === 0 || path[0] !== "/") path = "/" + path;
@@ -632,13 +677,42 @@ pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it
           block += name + ": " + value + "\r\n";
         });
       }
+      const granted = function (list) {
+        return list.split(",").map(function (s) { return s.trim(); })
+          .filter(function (s) { return s.length > 0; });
+      };
+      const named = authority !== null
+        ? Promise.resolve(authority)
+        : http.origins().then(function (list) {
+            const first = granted(list)[0];
+            if (first === undefined) {
+              throw new TypeError("fetch: a bare path needs a granted origin");
+            }
+            return first;
+          });
       let handle = null;
-      return http.origin().then(function (origin) {
-        if (named !== null && named !== origin) {
-          throw new TypeError(
-            "fetch: " + named + " is not the granted origin " + origin);
-        }
-        return http.send(method, path, block, body);
+      return named.then(function (authority) {
+        // The fulfilled arm is written out rather than left null: this
+        // engine calls whatever it is handed, so a non-function there is a
+        // TypeError on the success path instead of a pass-through.
+        const opened = function (value) { return value; };
+        return http.send(authority, scheme, method, path, block, body).then(opened, function (error) {
+          if (!(error && error.cause === "Denied")) throw error;
+          // The adapter refused. Whether that was the origin policy is
+          // something only its list can say, so it is read to say it.
+          return http.origins().then(function (list) {
+            const wanted = authority.toLowerCase();
+            const origins = granted(list);
+            const listed = origins.some(function (o) { return o.toLowerCase() === wanted; });
+            if (origins.length > 0 && !listed) {
+              throw new TypeError(
+                "fetch: " + authority + " is not a granted origin (granted: " + list + ")");
+            }
+            throw new TypeError(
+              "fetch: the deployment refused " +
+              (scheme === "" ? "" : scheme + "://") + authority);
+          });
+        });
       }).then(function (opened) {
         handle = opened;
         return http.status(handle);
@@ -659,7 +733,7 @@ pub const SOURCE: &[u8] = br##"// The standard surface a program finds before it
   }
 
   // ---- WebSocket -------------------------------------------------------
-  // RFC 6455, served rather than written here. The upgrade, the accept it
+  // The protocol is served rather than written here. The upgrade, the accept it
   // verifies, the masking and the frame codec belong to the provider the
   // deployment wired: one implementation for every consumer on the platform,
   // instead of a second one in JavaScript paying for the SHA-1 of every

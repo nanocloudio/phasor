@@ -33,6 +33,7 @@ const CASE_COUNT: u16 = 8;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     report_out: i32,
     exit_out: i32,
     progress: probe::Progress,
@@ -94,6 +95,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
     // Every byte value is scanned once after the cases, so no input can
     // make the scanner misbehave.
     if state.progress.case >= CASE_COUNT && state.byte <= u16::from(u8::MAX) {

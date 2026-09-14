@@ -1,0 +1,48 @@
+version          = "0.0.1"
+hardware_targets = ["rp2350", "bcm2712", "wasm"]
+
+# A program and the answer it must produce, for a graph that has no standard
+# input to take the one from and no standard output to hold the other to.
+# The source leaves on `source_out` as one stream ending in a hang-up, which
+# is what `phasor_compile` takes; the isolate's result and exit status come
+# back on the two inputs, and the module completes only when they are what
+# the graph said they would be.
+
+[[ports]]
+name         = "source_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 2048
+
+[[ports]]
+name         = "result_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 256
+
+[[ports]]
+name         = "exit_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16
+
+# For a program that is a module: the compiled image comes back here and
+# leaves on `record_out` as one linker record under the `specifier` the
+# graph names, so `phasor_link` can make the closure the isolate runs.
+[[ports]]
+name         = "image_in"
+index        = 2
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 65536
+
+[[ports]]
+name         = "record_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+[observability]
+exempt = "fixture whose evidence is whether it completes"

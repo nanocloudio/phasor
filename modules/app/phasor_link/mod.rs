@@ -43,6 +43,8 @@ mod feature;
 mod link;
 #[path = "../../common/module.rs"]
 mod module;
+#[path = "../../common/register.rs"]
+mod register;
 #[path = "../../common/verify.rs"]
 mod verify;
 #[path = "../../common/wire.rs"]
@@ -67,6 +69,7 @@ const MAX_IMPORTS: usize = 128;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     unit_in: i32,
     closure_out: i32,
     exit_out: i32,
@@ -299,6 +302,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
 
     if state.phase == 3 {
         return 1;

@@ -1116,6 +1116,20 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 let first = arguments.first().copied().unwrap_or(Value::UNDEFINED);
                 self.uri_native(id, first)
             }
+            native::DECODE_UTF8 | native::ENCODE_UTF8 => {
+                let first = arguments.first().copied().unwrap_or(Value::UNDEFINED);
+                let text = self.coerce_to_string(first)?;
+                let handle = text.as_handle();
+                let converted = if id == native::DECODE_UTF8 {
+                    crate::string::decode_utf8(self.heap, handle)
+                } else {
+                    crate::string::encode_utf8(self.heap, handle)
+                };
+                match converted {
+                    Ok(result) => Ok(Value::string(result)),
+                    Err(_) => Err(Completion::HEAP_EXHAUSTED),
+                }
+            }
             native::ARRAY | native::ARRAY_IS_ARRAY..=native::ARRAY_SORT => {
                 self.array_native(id, this, arguments)
             }

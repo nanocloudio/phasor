@@ -42,6 +42,7 @@ const REPORT_CAPACITY: usize = 512;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     result_in: i32,
     diagnostic_in: i32,
     runtime_in: i32,
@@ -131,6 +132,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
     if state.phase == 2 {
         return 1;
     }

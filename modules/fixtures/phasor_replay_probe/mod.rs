@@ -419,6 +419,7 @@ fn run_case(storage: &mut Storage, case: u16) -> bool {
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     report_out: i32,
     exit_out: i32,
     storage: Storage,
@@ -447,6 +448,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
     probe::step(
         &mut state.progress,
         syscalls,

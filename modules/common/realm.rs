@@ -521,6 +521,10 @@ pub mod native {
     pub const DYNAMIC_IMPORT_REJECTED: u32 = 342;
     pub const DYNAMIC_IMPORT_STEP: u32 = 343;
     pub const PROMISE_WITH_RESOLVERS: u32 = 344;
+    /// `__decodeUtf8`: UTF-8 bytes, one per unit, decoded into text.
+    pub const DECODE_UTF8: u32 = 345;
+    /// `__encodeUtf8`: text encoded as UTF-8, one byte per unit.
+    pub const ENCODE_UTF8: u32 = 346;
     pub const OBJECT_PREVENT_EXTENSIONS: u32 = 176;
     pub const OBJECT_IS_EXTENSIBLE: u32 = 177;
     pub const OBJECT_SEAL: u32 = 178;

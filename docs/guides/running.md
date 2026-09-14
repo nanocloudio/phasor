@@ -57,6 +57,20 @@ a promise. `store.open(key)` answers a handle the program passes back to
 `store.readAt`; one it invents is refused. The shell prints what it granted,
 and the graph is `packaging/cli/linux.yaml`.
 
+The store is the deployment's, not the program's. It is served by whatever is
+wired behind Fluxor's `storage.object` contract, which on Linux is the local
+versioned store and opens the directory `FLUXOR_STORE_DIR` names:
+
+```sh
+export FLUXOR_STORE_DIR=~/.local/share/phasor
+phasor --grant store -e 'store.write("k", "kept")'
+phasor --grant store -e 'store.read("k")'          # -> kept, a run later
+```
+
+With none configured a write is refused rather than kept somewhere it would
+not survive, which is the honest answer: the adapter holds nothing itself, so
+there is no second place the bytes could have gone.
+
 Files come from `--grant fs`, and reach only the directory the graph runs in:
 
 ```sh
@@ -65,25 +79,34 @@ phasor --grant fs -e 'fs.write("note.txt", "written by a program")'
 ```
 
 HTTP is its own grant, because the protocol is its own provider's. `--grant
-http` brings `fetch`, and it goes to the origin the graph wired:
+http` brings `fetch`, and it goes to the authority the URL names: the applet
+grants every origin, an `https://` URL goes down the graph's TLS leg and an
+`http://` one down its plain leg.
 
 ```sh
-phasor --grant http -e 'fetch("/hello.txt").then(r => r.text())'
-phasor --grant http -e 'fetch("/data.json").then(r => r.json()).then(v => v.n)'
+phasor --grant http -e 'fetch("http://localhost:8080/hello.txt").then(r => r.text())'
+phasor --grant http -e 'fetch("https://nanocloud.io/").then(r => r.status)'
 ```
+
+A graph that grants only some origins lists them in `phasor_http`'s
+`origins`; a URL naming any other is refused by the adapter before anything
+is dialled, and a bare path goes to the first one granted. The TLS leg asks
+the platform whether a chain is good, so it reaches what the host itself
+would; `fluxor exec --ca <file>` widens that for one run, for a peer chaining
+to some other authority.
 
 The connection is a separate grant and a lower one. `--grant net` gives bytes
-to that endpoint and nothing that reads them:
+to an authority and nothing that reads them:
 
 ```sh
-phasor --grant net -e 'net.endpoint()'
+phasor --grant net -e 'net.connect("localhost:8080").then(h => net.endpoint())'
 ```
 
-`connect` takes no arguments because there is nothing for a program to
-choose, and a URL naming any other host is refused rather than sent to the
-one that was wired. Whether that endpoint is reached over TLS is the graph's
-to say and nothing a program can see: `examples/net/https.yaml` is the same
-shell with Fluxor's `tls` between the adapter and the socket.
+`connect` names `host:port`, or names nothing and goes to the authority the
+graph gave the adapter; `net.endpoint()` answers with whichever it was.
+Whether a connection is reached over TLS is the graph's to say and nothing a
+program can see: `examples/net/https.yaml` is the same shell with Fluxor's
+`tls` between the provider and the socket.
 
 Without the grant there is no `net` and no `fetch` either: the surface
 defines it over the binding, so a program that was granted nothing finds

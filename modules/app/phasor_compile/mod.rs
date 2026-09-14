@@ -55,6 +55,10 @@ mod parse;
 mod softfloat;
 #[path = "../../common/source.rs"]
 mod source;
+#[path = "../../common/text.rs"]
+mod text;
+#[path = "../../common/trace.rs"]
+mod trace;
 #[path = "../../common/unicode_id.rs"]
 mod unicode_id;
 #[path = "../../common/value.rs"]
@@ -104,6 +108,8 @@ define_params! {
 
     1, goal, u8, 0, enum { script=0, module=1 }
         => |s, d, len| { s.goal = p_u8(d, len, 0, 0); };
+    2, empty_wait, u32, EMPTY_WAIT_STEPS
+        => |s, d, len| { s.empty_wait = p_u32(d, len, 0, EMPTY_WAIT_STEPS); };
 }
 
 /// Take the graph's parameters, or the defaults where it gave none.
@@ -118,6 +124,16 @@ unsafe fn apply_params(state: &mut State, params: *const u8, params_len: usize) 
     }
 }
 
+/// Default for `empty_wait`: steps a hung-up empty source is given before it
+/// is taken at its word.
+///
+/// Small on purpose. Every real producer writes within a few steps of the
+/// graph settling, so this is imperceptible to a person at a terminal -- 64
+/// ticks is 6.4 ms at the 100 us tick the CLI graphs use -- and ample on a
+/// board. It exists only to outlast a channel that reports hung-up before
+/// its producer has written, which bcm2712 does.
+const EMPTY_WAIT_STEPS: u32 = 64;
+
 const UNIT_CODE_CAPACITY: usize = 48 * 1024;
 const UNIT_POINT_CAPACITY: usize = 2048;
 const FUNCTION_CAPACITY: usize = 256;
@@ -131,6 +147,19 @@ const EVAL_SITE_CAPACITY: usize = 2048;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    /// Steps a hung-up EMPTY source stream is read as "not yet" before it is
+    /// read as an empty source. See the wait in `module_step`.
+    empty_wait: u32,
+    /// How many of those steps have passed.
+    empty_waited: u32,
+    /// Whether this module has told the scheduler its outputs are
+    /// meaningful. Fluxor gates a module until every forward upstream has
+    /// signalled `StepOutcome::Ready` (3 from a PIC module), and a module
+    /// that never signals it holds its whole downstream dark for the life of
+    /// the graph. Nothing on linux or wasm enforces the gate, so this was
+    /// invisible until the first bare-metal run, where the front end and the
+    /// isolate were never stepped at all.
+    announced: bool,
     source_in: i32,
     image_out: i32,
     exit_out: i32,
@@ -235,6 +264,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
 
     if state.phase == 3 {
         return 1;
@@ -251,6 +281,33 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             &mut state.overflowed,
         );
         if staged != wire::Staged::Complete {
+            return 0;
+        }
+        // Zero bytes is not a program, and a hang-up on an empty stream is
+        // not always a source that ended -- it can be one that has not
+        // spoken yet.
+        //
+        // `stage_stream` answers `Complete` on `POLL_HUP`, and on bcm2712 a
+        // channel reports hung-up before its producer has ever written to
+        // it. Taking that as a whole source made this module compile
+        // nothing, fail, push a diagnostic and retire, within a few steps of
+        // boot -- and a module that retires hangs up its own ports, so the
+        // isolate downstream staged ITS empty stream and retired too. That
+        // cascade is what sixteen rig runs recorded as an engine that never
+        // ran.
+        //
+        // But waiting forever is wrong too: a graph that really does hand a
+        // compiler an empty source -- `phasor` with nothing on standard
+        // input -- must get the failure in words, not a hang. So the wait is
+        // bounded. `empty_wait` steps of a hung-up empty stream are read as
+        // "not yet"; past that it is an empty source and answers as one.
+        //
+        // The default is small because every real producer writes within a
+        // few steps of the graph settling: it is imperceptible to a person
+        // at a terminal and ample on a board. A graph that deliberately
+        // holds its source back longer than that says so.
+        if state.source_length == 0 && state.empty_waited < state.empty_wait {
+            state.empty_waited = state.empty_waited.saturating_add(1);
             return 0;
         }
         state.failed = !compile(state);

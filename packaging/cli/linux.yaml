@@ -25,43 +25,63 @@ modules:
       width: bits53
   - name: phasor_surface
   - name: phasor_store
+    params:
+      # Where this program's keys live inside whatever store the deployment
+      # wired. A program names keys under it and cannot reach outside it.
+      namespace: "phasor/"
   # The filesystem the shell can reach is the directory the graph runs in,
   # and nothing above it. Reading is granted; writing is not, until a
   # deployment says so.
-  # One endpoint, named here rather than by any program: a loopback HTTP
-  # server on port 8080. A deployment that wants another wires another
-  # adapter, and each is granted separately.
+  # The stream adapter. `connect` names an authority, `host:port`, and the
+  # stack resolves it; `connect()` naming nothing takes this one. `origins`
+  # is left unset: `--grant net` admits every authority.
   - name: phasor_net
     params:
-      address: 2130706433
-      port: 8080
-      # What that endpoint is called. A program may write this in a URL and
-      # it travels as the request's authority; the address is where the
-      # stack goes. Without it the endpoint is its address and port, which
-      # is honest but is not a name a certificate or a virtual host knows.
       authority: "localhost:8080"
   # HTTP is Wave's, not this project's. The adapter turns a granted call into
-  # one exchange record and the answer back into a head and a stream; what
-  # protocol carried it, and which version, is the provider's business and
-  # reaches no program. One origin, named here, for the same reason the
-  # stream adapter names one endpoint.
+  # one exchange record naming the authority the program wrote, and the
+  # answer back into a head and a stream; what protocol carried it, and
+  # which version, is the provider's business and reaches no program.
+  # `origins` is left unset: `--grant http` admits every origin.
   - name: phasor_http
-    params:
-      # What the origin is called. A program may write this in a URL; one
-      # naming anywhere else is refused rather than answered by here.
-      authority: "localhost:8080"
-  - name: http
+  # Two open clients, one per leg. Neither names an authority: each dials
+  # the one the record carries. `https://` goes down the TLS leg and
+  # `http://` down the plain one.
+  - name: http_tls
+    type: http
     variant: exchange
     params:
       mode: 1              # client
       protocol: 0          # HTTP/1.1
-      host_ip: 2130706433  # 127.0.0.1
-      port: 8080
-      authority: "localhost:8080"
+  - name: http_plain
+    type: http
+    variant: exchange
+    params:
+      mode: 1              # client
+      protocol: 0          # HTTP/1.1
+  # The TLS leg takes the identity it verifies from each dial it forwards,
+  # and asks the PLATFORM whether the chain is good: `trust: system` is the
+  # `trust` contract (class 0x1D), where the host applies its own policy --
+  # path building, name constraints, EKU, the public root set as the
+  # distribution maintains it -- and answers yes or no. No anchors are baked
+  # in, so this reaches any origin the host itself would, and a root the
+  # distribution withdraws is withdrawn here the same day rather than at the
+  # next package build.
+  #
+  # `--ca <file>` on `fluxor exec` still widens a run for a peer chaining to
+  # some other authority. A target with no such provider -- bare metal, wasm
+  # -- refuses this at compose rather than at the first handshake.
+  - name: tls
+    mode: 0
+    peer_auth: ca_dns
+    trust: system
+    clock_policy: require
+    alpn_h1_only: 1
+    ecdh_bits_per_step: 32
   - name: phasor_fs
     params:
       writable: yes
-  # A WebSocket is RFC 6455, and RFC 6455 is Wave's. This adapter turns a
+  # The WebSocket protocol is Wave's, not this project's. This adapter turns a
   # granted call into an open, a frame, or a close; the upgrade and the
   # accept it verifies happen in the provider, which reaches the same
   # endpoint the HTTP one does.
@@ -72,9 +92,8 @@ modules:
       authority: "localhost:8080"
   - name: websocket
     params:
-      # 127.0.0.1:8080, the endpoint the graph names and no program can.
-      endpoint: "7f000001901f"
-      host: "localhost:8080"
+      # The endpoint the graph names and no program can.
+      authority: "localhost:8080"
 
 wiring:
   - from: cli_in.args_out
@@ -111,17 +130,33 @@ wiring:
     to: phasor_http.request_in
   - from: phasor_http.reply_out
     to: phasor_shell.http_reply
-  # The request as a record, and the response as a head then a body.
+  # The request as a record, and the response as a head then a body. Both
+  # legs answer on the adapter's one reply pair: one request is in flight
+  # at a time, and only the leg it went down has anything to say.
   - from: phasor_http.publish_out
-    to: http.publish_in
-  - from: http.reply_out
+    to: http_tls.publish_in
+  - from: http_tls.reply_out
     to: phasor_http.reply_in
-  - from: http.file_ctrl
+  - from: http_tls.file_ctrl
     to: phasor_http.body_in
-  - from: http.net_out
+  - from: http_tls.net_out
+    to: tls.clear_in
+  - from: tls.clear_out
+    to: http_tls.net_in
+  - from: tls.cipher_out
     to: linux_net.net_in
   - from: linux_net.net_out
-    to: http.net_in
+    to: tls.cipher_in
+  - from: phasor_http.plain_out
+    to: http_plain.publish_in
+  - from: http_plain.reply_out
+    to: phasor_http.reply_in
+  - from: http_plain.file_ctrl
+    to: phasor_http.body_in
+  - from: http_plain.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: http_plain.net_in
   - from: phasor_shell.ws_call
     to: phasor_ws.request_in
   - from: phasor_ws.reply_out

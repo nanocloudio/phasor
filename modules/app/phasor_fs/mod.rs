@@ -61,6 +61,13 @@ const OPEN_FILES: usize = 8;
 /// The operations the interface offers, as the method numbers the engine's
 /// bindings carry. What a call may do is decided by which binding the
 /// deployment granted, not by anything in the payload.
+/// The provider's "not yet". The `fs` contract makes this a consumer MUST:
+/// treat it as ask-again, never as capability absent. A provider whose
+/// backing volume has not finished attaching has no answer to give, and one
+/// that latched a refusal here would run degraded for the life of the process
+/// and look exactly like a volume that genuinely could not do the thing.
+const EAGAIN: i32 = -11;
+
 const METHOD_READ: u32 = 0;
 const METHOD_WRITE: u32 = 1;
 const METHOD_LIST: u32 = 2;
@@ -69,6 +76,85 @@ const METHOD_OPEN: u32 = 4;
 const METHOD_READ_AT: u32 = 5;
 const METHOD_CLOSE: u32 = 6;
 const METHOD_SIZE: u32 = 7;
+
+/// Stage a completion the step itself produced, rather than one `answer`
+/// handed back: a held call is answered later than the call that made it.
+fn stage_completion(state: &mut State, record: CompletionRecord, bytes: &[u8]) {
+    let at = state.staged;
+    let frame = record.encode();
+    if !copy_into(
+        state
+            .replies
+            .get_mut(at..at + COMPLETION_FRAME)
+            .unwrap_or(&mut []),
+        &frame,
+    ) {
+        return;
+    }
+    if !copy_into(
+        state
+            .replies
+            .get_mut(at + COMPLETION_FRAME..at + COMPLETION_FRAME + bytes.len())
+            .unwrap_or(&mut []),
+        bytes,
+    ) {
+        return;
+    }
+    state.staged = at + COMPLETION_FRAME + bytes.len();
+    state.answered = state.answered.saturating_add(1);
+}
+
+/// What a read of the provider produced. Three answers rather than an
+/// `Option`, because "not yet" and "failed" are acted on differently and
+/// collapsing them is the mistake the contract names.
+enum Read {
+    Took(usize),
+    NotYet,
+    Failed,
+}
+
+/// What one whole-file operation did.
+///
+/// A provider's "not yet" is its own answer and not a failure, so it is
+/// carried as one: an operation that says it is held and asked again, where
+/// one that says it failed is refused. Reading the two as one thing is what
+/// the contract forbids, and it is the whole reason this is not an `Option`.
+enum Done {
+    /// An answer, and how many bytes of the output buffer it filled.
+    Answered(Answer, usize),
+    /// The provider has not got what the call needs yet.
+    NotYet,
+    Failed,
+}
+
+/// A call waiting on a provider that answered "not yet".
+#[derive(Clone, Copy)]
+struct Waiting {
+    request: u64,
+    trace: u64,
+    binding: u32,
+    /// The path the call named, re-opened on the retry: a provider that could
+    /// not attach its volume issued no descriptor to keep.
+    path: [u8; PATH_BYTES],
+    path_length: usize,
+    create: bool,
+    /// The slot a `readAt` reads through, or `usize::MAX`.
+    slot: usize,
+    live: bool,
+}
+
+impl Waiting {
+    const EMPTY: Self = Self {
+        request: 0,
+        trace: 0,
+        binding: 0,
+        path: [0; PATH_BYTES],
+        path_length: 0,
+        create: false,
+        slot: usize::MAX,
+        live: false,
+    };
+}
 
 /// One file this adapter holds open on a program's behalf.
 #[derive(Clone, Copy)]
@@ -91,6 +177,7 @@ impl Open {
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     request_in: i32,
     reply_out: i32,
     request: [u8; CALL_FRAME],
@@ -111,6 +198,12 @@ struct State {
     /// the common one, and it is enforced here rather than trusted.
     writable: u8,
     files: [Open; OPEN_FILES],
+    /// A call the provider answered "not yet" to, waiting to be asked again.
+    /// One at a time: the buffer it reads into is the module's only one.
+    waiting: Waiting,
+    /// Set when the call just taken was held rather than answered, so the
+    /// step stages nothing for it.
+    deferred: bool,
     phase: u8,
 }
 
@@ -313,33 +406,68 @@ fn answer(
             // SAFETY: the path is live for its length and the table is the
             // loader's.
             let descriptor = unsafe { provider_open(syscalls, &mut path, path_length, create) };
+            if descriptor == EAGAIN {
+                // The volume has not finished attaching. Ask again next step:
+                // the contract forbids reading this as "cannot".
+                state.waiting = Waiting {
+                    request: record.request,
+                    trace: record.trace,
+                    binding: record.binding,
+                    path,
+                    path_length,
+                    create,
+                    slot: usize::MAX,
+                    live: true,
+                };
+                state.deferred = true;
+                return refuse(record, Cause::None);
+            }
             if descriptor < 0 {
                 return refuse(record, Cause::Unavailable);
             }
-            let outcome = match record.binding {
-                METHOD_OPEN => {
-                    let Some(slot) = state.files.iter().position(|file| !file.live) else {
-                        return close_and_refuse(syscalls, descriptor, record, Cause::Busy);
-                    };
-                    state.files[slot] = Open {
-                        descriptor,
-                        offset: 0,
-                        live: true,
-                    };
-                    // The slot is what the provider calls the resource; what
-                    // the program gets is a handle over it.
-                    return fulfilled(record, Answer::Resource(slot as u64), 0);
-                }
-                METHOD_READ => read_all(syscalls, descriptor, state.chunk as usize, out),
-                METHOD_SIZE => size_of(syscalls, descriptor)
-                    .map(Answer::Number)
-                    .map(|a| (a, 0)),
-                _ => write_all(syscalls, descriptor, rest),
-            };
+            if record.binding == METHOD_OPEN {
+                let Some(slot) = state.files.iter().position(|file| !file.live) else {
+                    return close_and_refuse(syscalls, descriptor, record, Cause::Busy);
+                };
+                state.files[slot] = Open {
+                    descriptor,
+                    offset: 0,
+                    live: true,
+                };
+                // The slot is what the provider calls the resource; what
+                // the program gets is a handle over it.
+                return fulfilled(record, Answer::Resource(slot as u64), 0);
+            }
+            let outcome = whole_file(
+                syscalls,
+                record.binding,
+                descriptor,
+                state.chunk as usize,
+                rest,
+                out,
+            );
             close(syscalls, descriptor);
             match outcome {
-                Some((answer, length)) => fulfilled(record, answer, length),
-                None => refuse(record, Cause::Internal),
+                Done::Answered(answer, length) => fulfilled(record, answer, length),
+                // The provider opened the file and has not got what the call
+                // needs yet. The retry re-opens, because the descriptor this
+                // one held is closed above -- and the call is held rather
+                // than refused, because "not yet" is not "cannot".
+                Done::NotYet => {
+                    state.waiting = Waiting {
+                        request: record.request,
+                        trace: record.trace,
+                        binding: record.binding,
+                        path,
+                        path_length,
+                        create,
+                        slot: usize::MAX,
+                        live: true,
+                    };
+                    state.deferred = true;
+                    refuse(record, Cause::None)
+                }
+                Done::Failed => refuse(record, Cause::Internal),
             }
         }
         METHOD_READ_AT => {
@@ -357,11 +485,27 @@ fn answer(
                 wanted.min(state.chunk as usize),
                 out,
             ) {
-                Some(read) => {
+                Read::Took(read) => {
                     state.files[slot].offset = file.offset.saturating_add(read as u64);
                     fulfilled(record, Answer::Payload(read as u32), read)
                 }
-                None => refuse(record, Cause::Internal),
+                Read::NotYet => {
+                    // The descriptor is the program's and stays open; only the
+                    // answer waits.
+                    state.waiting = Waiting {
+                        request: record.request,
+                        trace: record.trace,
+                        binding: record.binding,
+                        path: [0; PATH_BYTES],
+                        path_length: 0,
+                        create: false,
+                        slot,
+                        live: true,
+                    };
+                    state.deferred = true;
+                    refuse(record, Cause::None)
+                }
+                Read::Failed => refuse(record, Cause::Internal),
             }
         }
         METHOD_CLOSE => {
@@ -409,10 +553,10 @@ fn read_chunk(
     descriptor: i32,
     wanted: usize,
     out: &mut [u8; PAYLOAD_BYTES],
-) -> Option<usize> {
+) -> Read {
     let capacity = wanted.min(PAYLOAD_BYTES);
     if capacity == 0 {
-        return Some(0);
+        return Read::Took(0);
     }
     // SAFETY: `out` is writable for `capacity` bytes and the descriptor is
     // one the provider issued.
@@ -424,10 +568,38 @@ fn read_chunk(
             capacity,
         )
     };
-    if read < 0 {
-        return None;
+    if read == EAGAIN {
+        return Read::NotYet;
     }
-    usize::try_from(read).ok()
+    if read < 0 {
+        return Read::Failed;
+    }
+    match usize::try_from(read) {
+        Ok(n) => Read::Took(n),
+        Err(_) => Read::Failed,
+    }
+}
+
+/// The whole-file operation a binding names, run against a descriptor the
+/// provider has just issued.
+///
+/// The first attempt and the retry go through here, so a call that was held
+/// is asked again as the member it was rather than as whichever member this
+/// happened to be written for.
+fn whole_file(
+    syscalls: &SyscallTable,
+    binding: u32,
+    descriptor: i32,
+    chunk: usize,
+    rest: &[u8],
+    out: &mut [u8; PAYLOAD_BYTES],
+) -> Done {
+    match binding {
+        METHOD_READ => read_all(syscalls, descriptor, chunk, out),
+        METHOD_SIZE => size_of(syscalls, descriptor),
+        METHOD_WRITE => write_all(syscalls, descriptor, rest),
+        _ => Done::Failed,
+    }
 }
 
 /// Read a whole file, up to the chunk the deployment admits.
@@ -436,14 +608,22 @@ fn read_all(
     descriptor: i32,
     chunk: usize,
     out: &mut [u8; PAYLOAD_BYTES],
-) -> Option<(Answer, usize)> {
-    let read = read_chunk(syscalls, descriptor, chunk, out)?;
-    Some((Answer::Payload(u32::try_from(read).ok()?), read))
+) -> Done {
+    match read_chunk(syscalls, descriptor, chunk, out) {
+        Read::Took(read) => match u32::try_from(read) {
+            Ok(length) => Done::Answered(Answer::Payload(length), read),
+            Err(_) => Done::Failed,
+        },
+        // A whole-file read that cannot start yet is retried from the top,
+        // which re-opens: this call owns no descriptor a retry could reuse.
+        Read::NotYet => Done::NotYet,
+        Read::Failed => Done::Failed,
+    }
 }
 
-fn write_all(syscalls: &SyscallTable, descriptor: i32, bytes: &[u8]) -> Option<(Answer, usize)> {
+fn write_all(syscalls: &SyscallTable, descriptor: i32, bytes: &[u8]) -> Done {
     if bytes.is_empty() {
-        return Some((Answer::Number(0.0), 0));
+        return Done::Answered(Answer::Number(0.0), 0);
     }
     let mut buffer = [0u8; PAYLOAD_BYTES];
     let length = bytes.len().min(PAYLOAD_BYTES);
@@ -461,8 +641,11 @@ fn write_all(syscalls: &SyscallTable, descriptor: i32, bytes: &[u8]) -> Option<(
             length,
         )
     };
+    if written == EAGAIN {
+        return Done::NotYet;
+    }
     if written < 0 {
-        return None;
+        return Done::Failed;
     }
     // The bytes are volatile until a fence, which is what the contract says:
     // a program that needs them durable asks for it.
@@ -476,10 +659,10 @@ fn write_all(syscalls: &SyscallTable, descriptor: i32, bytes: &[u8]) -> Option<(
             0,
         );
     }
-    Some((Answer::Number(f64::from(written)), 0))
+    Done::Answered(Answer::Number(f64::from(written)), 0)
 }
 
-fn size_of(syscalls: &SyscallTable, descriptor: i32) -> Option<f64> {
+fn size_of(syscalls: &SyscallTable, descriptor: i32) -> Done {
     let mut stat = [0u8; 16];
     // SAFETY: the buffer is writable for its length and the descriptor is one
     // the provider issued; the contract selects the shape by width.
@@ -491,11 +674,19 @@ fn size_of(syscalls: &SyscallTable, descriptor: i32) -> Option<f64> {
             stat.len(),
         )
     };
-    if written < 8 {
-        return None;
+    if written == EAGAIN {
+        return Done::NotYet;
     }
-    let bytes = <[u8; 8]>::try_from(stat.get(..8)?).ok()?;
-    Some(u64::from_le_bytes(bytes) as f64)
+    if written < 8 {
+        return Done::Failed;
+    }
+    let Some(head) = stat.get(..8) else {
+        return Done::Failed;
+    };
+    let Ok(bytes) = <[u8; 8]>::try_from(head) else {
+        return Done::Failed;
+    };
+    Done::Answered(Answer::Number(u64::from_le_bytes(bytes) as f64), 0)
 }
 
 entry! {
@@ -521,11 +712,97 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
+
+    // A call the provider answered "not yet" to. Asked again before any new
+    // one, because the program is waiting on this and the buffer it reads
+    // into is the module's only one.
+    if state.waiting.live {
+        let held = state.waiting;
+        let mut bytes = [0u8; PAYLOAD_BYTES];
+        let outcome = if held.slot == usize::MAX {
+            // A whole-file call: the retry re-opens, because whatever
+            // descriptor the first attempt had is closed. The write's own
+            // bytes are still the ones this module staged, because no new
+            // call is taken while one is held.
+            let mut path = held.path;
+            // SAFETY: the path is live for its length and the table is the
+            // loader's.
+            let descriptor =
+                unsafe { provider_open(syscalls, &mut path, held.path_length, held.create) };
+            if descriptor == EAGAIN {
+                Done::NotYet
+            } else if descriptor < 0 {
+                Done::Failed
+            } else {
+                let payload = state.payload.get(..state.payload_length).unwrap_or(&[]);
+                let mut parts: [&[u8]; 2] = [&[], &[]];
+                let taken = wire::fields(payload, &mut parts);
+                let rest = if taken > 1 { parts[1] } else { &[][..] };
+                let done = whole_file(
+                    syscalls,
+                    held.binding,
+                    descriptor,
+                    state.chunk as usize,
+                    rest,
+                    &mut bytes,
+                );
+                close(syscalls, descriptor);
+                done
+            }
+        } else {
+            match state.files.get(held.slot).copied().filter(|f| f.live) {
+                None => Done::Failed,
+                Some(file) => {
+                    match read_chunk(syscalls, file.descriptor, state.chunk as usize, &mut bytes) {
+                        Read::NotYet => Done::NotYet,
+                        Read::Failed => Done::Failed,
+                        Read::Took(read) => {
+                            if let Some(slot) = state.files.get_mut(held.slot) {
+                                slot.offset = slot.offset.saturating_add(read as u64);
+                            }
+                            Done::Answered(Answer::Payload(read as u32), read)
+                        }
+                    }
+                }
+            }
+        };
+        if !matches!(outcome, Done::NotYet) {
+            state.waiting = Waiting::EMPTY;
+            state.payload_length = 0;
+            match outcome {
+                Done::Answered(answer, length) => stage_completion(
+                    state,
+                    CompletionRecord {
+                        request: held.request,
+                        disposition: Disposition::Fulfilled,
+                        cause: Cause::None,
+                        trace: held.trace,
+                        answer,
+                    },
+                    bytes.get(..length).unwrap_or(&[]),
+                ),
+                _ => stage_completion(
+                    state,
+                    CompletionRecord {
+                        request: held.request,
+                        disposition: Disposition::Rejected,
+                        cause: Cause::Unavailable,
+                        trace: held.trace,
+                        answer: Answer::None,
+                    },
+                    &[],
+                ),
+            }
+        }
+    }
+
     if state.phase == 1 {
         return 1;
     }
 
-    if state.staged + COMPLETION_FRAME + PAYLOAD_BYTES <= state.replies.len() {
+    if !state.waiting.live && state.staged + COMPLETION_FRAME + PAYLOAD_BYTES <= state.replies.len()
+    {
         if !state.frame_ready
             && wire::take_frame(
                 syscalls,
@@ -553,28 +830,37 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.frame_ready = false;
             if let Some(record) = CallRecord::decode(&state.request) {
                 let mut bytes = [0u8; PAYLOAD_BYTES];
+                state.deferred = false;
                 let (reply, length) = answer(state, &record, &mut bytes, syscalls);
-                let at = state.staged;
-                let frame = reply.encode();
-                copy_into(
-                    state
-                        .replies
-                        .get_mut(at..at + COMPLETION_FRAME)
-                        .unwrap_or(&mut []),
-                    &frame,
-                );
-                copy_into(
-                    state
-                        .replies
-                        .get_mut(at + COMPLETION_FRAME..at + COMPLETION_FRAME + length)
-                        .unwrap_or(&mut []),
-                    bytes.get(..length).unwrap_or(&[]),
-                );
-                state.staged = at + COMPLETION_FRAME + length;
-                state.answered = state.answered.saturating_add(1);
+                // Held: the provider cannot answer yet, so nothing is staged
+                // and the step answers once it can.
+                if !state.deferred {
+                    let at = state.staged;
+                    let frame = reply.encode();
+                    copy_into(
+                        state
+                            .replies
+                            .get_mut(at..at + COMPLETION_FRAME)
+                            .unwrap_or(&mut []),
+                        &frame,
+                    );
+                    copy_into(
+                        state
+                            .replies
+                            .get_mut(at + COMPLETION_FRAME..at + COMPLETION_FRAME + length)
+                            .unwrap_or(&mut []),
+                        bytes.get(..length).unwrap_or(&[]),
+                    );
+                    state.staged = at + COMPLETION_FRAME + length;
+                    state.answered = state.answered.saturating_add(1);
+                }
             }
             state.payload_filled = 0;
-            state.payload_length = 0;
+            // A held call's payload stays staged: its retry reads the bytes
+            // from here, and no new call can arrive to overwrite them.
+            if !state.deferred {
+                state.payload_length = 0;
+            }
         }
     }
 

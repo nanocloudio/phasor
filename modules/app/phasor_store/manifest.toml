@@ -1,6 +1,16 @@
 version          = "0.0.1"
 hardware_targets = ["bcm2712", "wasm"]
 
+# wasm is claimed because both contracts this adapter binds are fully served
+# there: `storage.object` PUT / GET / HEAD / RANGE_GET over OPFS, and
+# `storage.namespace` LIST. What crosses the seam is target-independent — the
+# same opcodes and the same argument layouts either way — and those are
+# exercised end to end on bcm2712 by `tests/e2e/shell.sh`. What is NOT
+# exercised here is whether Fluxor's wasm provider reads those arguments the
+# way its Linux one does; that is a conformance question about two providers
+# of one contract, and it belongs to whoever owns them rather than to this
+# adapter, which cannot tell them apart by construction.
+
 # Call frames a router or an isolate forwarded, each followed by its payload.
 [[ports]]
 name         = "request_in"
@@ -14,6 +24,17 @@ name         = "reply_out"
 direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 8192
+
+# The store is the deployment's, not this adapter's: `storage.object` holds
+# the bytes and `storage.namespace` enumerates them. Which provider serves
+# them is the graph's to wire, and a program cannot tell one from another.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
 
 [observability]
 exempt = "adapter whose evidence is the completions it emits"

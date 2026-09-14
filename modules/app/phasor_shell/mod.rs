@@ -70,6 +70,8 @@ mod heap;
 mod job;
 #[path = "../../common/lex.rs"]
 mod lex;
+#[path = "../../common/register.rs"]
+mod register;
 #[path = "../../common/lower.rs"]
 #[macro_use]
 mod lower;
@@ -217,10 +219,16 @@ const TRACE: u64 = 0x5041_5348_4f52_0002;
 /// an adapter the graph wires to it, and each carries members: the bindings
 /// the deployment admits, one per operation the interface offers.
 const MAX_GRANTS: usize = 7;
+
+/// Longest origin list a grant may be qualified with. Matches the adapter's
+/// own `ORIGINS_BYTES`: a list the shell cannot hold is one it must refuse
+/// rather than truncate, because a prefix of an origin list is a different
+/// policy.
+const GRANT_ORIGINS_BYTES: usize = 255;
+
 /// Bindings across every granted interface.
 const MAX_BINDINGS: usize = 16;
-/// Members one interface may carry.
-const MAX_MEMBERS: usize = 8;
+/// The interfaces, by the kind `--grant` names them by.
 const GRANT_CLOCK: u8 = 1;
 const GRANT_ENTROPY: u8 = 2;
 const GRANT_STORE: u8 = 3;
@@ -237,105 +245,13 @@ const CALL_PAYLOAD_BYTES: usize = 32 * 1024;
 /// Bytes of payload one answer may carry.
 const REPLY_PAYLOAD_BYTES: usize = 8 * 1024;
 
-/// One member of an interface: the name a program calls it by, how it is
-/// served, and the method number the adapter knows it as.
-///
-/// The name is held inline rather than borrowed: a module image takes no
-/// relocations, so a table of static references would not survive loading.
-#[derive(Clone, Copy)]
-struct Member {
-    name: [u8; 8],
-    name_length: usize,
-    class: binding::Class,
-    method: u32,
-}
+use register::{Member, MAX_MEMBERS};
 
-impl Member {
-    const EMPTY: Self = Self {
-        name: [0; 8],
-        name_length: 0,
-        class: binding::Class::Async,
-        method: 0,
-    };
-
-    const fn new(name: [u8; 8], name_length: usize, class: binding::Class, method: u32) -> Self {
-        Self {
-            name,
-            name_length,
-            class,
-            method,
-        }
-    }
-
-    fn name(&self) -> &[u8] {
-        self.name.get(..self.name_length).unwrap_or(&[])
-    }
-}
-
-/// The members of each interface, which are the bindings a grant admits.
-///
-/// A clock is a fact supplied at a task boundary, so its member is a snapshot
-/// and a program reads it with no call. Everything else is a call.
+/// The members of each interface, which are the bindings a grant admits,
+/// read from the register by the interface's identifier.
 fn members(kind: u8) -> ([Member; MAX_MEMBERS], usize) {
-    let mut out = [Member::EMPTY; MAX_MEMBERS];
-    let count = match kind {
-        GRANT_CLOCK => {
-            out[0] = Member::new(*b"now\0\0\0\0\0", 3, binding::Class::Snapshot, 0);
-            // Waiting is a call: the adapter holds it until the delay has
-            // passed, and the promise it answers is what a timer is built on.
-            out[1] = Member::new(*b"sleep\0\0\0", 5, binding::Class::Async, 1);
-            2
-        }
-        GRANT_ENTROPY => {
-            out[0] = Member::new(*b"random\0\0", 6, binding::Class::Async, 0);
-            1
-        }
-        GRANT_HTTP => {
-            out[0] = Member::new(*b"send\0\0\0\0", 4, binding::Class::Async, 0);
-            out[1] = Member::new(*b"status\0\0", 6, binding::Class::Async, 1);
-            out[2] = Member::new(*b"headers\0", 7, binding::Class::Async, 2);
-            out[3] = Member::new(*b"read\0\0\0\0", 4, binding::Class::Async, 3);
-            out[4] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 4);
-            out[5] = Member::new(*b"origin\0\0", 6, binding::Class::Async, 5);
-            6
-        }
-        GRANT_WS => {
-            out[0] = Member::new(*b"open\0\0\0\0", 4, binding::Class::Async, 0);
-            out[1] = Member::new(*b"send\0\0\0\0", 4, binding::Class::Async, 1);
-            out[2] = Member::new(*b"receive\0", 7, binding::Class::Async, 2);
-            out[3] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 3);
-            out[4] = Member::new(*b"origin\0\0", 6, binding::Class::Async, 4);
-            5
-        }
-        GRANT_NET => {
-            out[0] = Member::new(*b"connect\0", 7, binding::Class::Async, 0);
-            out[1] = Member::new(*b"send\0\0\0\0", 4, binding::Class::Async, 1);
-            out[2] = Member::new(*b"receive\0", 7, binding::Class::Async, 2);
-            out[3] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 3);
-            out[4] = Member::new(*b"endpoint", 8, binding::Class::Async, 4);
-            5
-        }
-        GRANT_FS => {
-            out[0] = Member::new(*b"read\0\0\0\0", 4, binding::Class::Async, 0);
-            out[1] = Member::new(*b"write\0\0\0", 5, binding::Class::Async, 1);
-            out[2] = Member::new(*b"open\0\0\0\0", 4, binding::Class::Async, 4);
-            out[3] = Member::new(*b"readAt\0\0", 6, binding::Class::Async, 5);
-            out[4] = Member::new(*b"close\0\0\0", 5, binding::Class::Async, 6);
-            out[5] = Member::new(*b"size\0\0\0\0", 4, binding::Class::Async, 7);
-            6
-        }
-        GRANT_STORE => {
-            out[0] = Member::new(*b"read\0\0\0\0", 4, binding::Class::Async, 0);
-            out[1] = Member::new(*b"write\0\0\0", 5, binding::Class::Async, 1);
-            out[2] = Member::new(*b"list\0\0\0\0", 4, binding::Class::Async, 2);
-            out[3] = Member::new(*b"delete\0\0", 6, binding::Class::Async, 3);
-            out[4] = Member::new(*b"open\0\0\0\0", 4, binding::Class::Async, 4);
-            out[5] = Member::new(*b"readAt\0\0", 6, binding::Class::Async, 5);
-            6
-        }
-        _ => 0,
-    };
-    (out, count)
+    let (id, id_length) = interface_id(kind);
+    register::members(id.get(..id_length).unwrap_or(&[]))
 }
 
 /// How the shell was asked to run.
@@ -363,7 +279,8 @@ options:\n\
   --grant store          admit store.read/write/list/delete/open/readAt\n\
   --grant fs             admit fs.read/write/open/readAt/close/size\n\
   --grant net            admit net.connect/send/receive/close/endpoint\n\
-  --grant http           admit http.send/status/headers/read/close/origin\n\
+  --grant http           admit http.send/status/headers/read/close/origins\n\
+  --grant websocket      admit websocket.open/send/receive/close/origin\n\
   --steps <n>            instructions one input may run, up to the ceiling\n\
   --bare                 leave out the standard surface the graph offers\n\
 \n\
@@ -394,11 +311,20 @@ struct GrantWire {
     /// Whether the frame is whole and its payload is what remains.
     frame_ready: bool,
     ready: bool,
+    /// The shell's own snapshot answer, kept apart from the program's.
+    ///
+    /// One wire carries both: the program's `clock.sleep` and the shell's
+    /// request for the reading a task will read. One slot for the two would
+    /// race, and whichever the shell looked at first would be taken for the
+    /// other, so replies are routed by request identifier as they arrive.
+    snapshot_reply: [u8; COMPLETION_FRAME],
+    snapshot_ready: bool,
 }
 
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
+    announced: bool,
     args_in: i32,
     stdout_out: i32,
     stdin_in: i32,
@@ -426,6 +352,13 @@ struct State {
     /// The interfaces granted, as `GRANT_*` kinds.
     grants: [u8; MAX_GRANTS],
     grant_count: usize,
+    /// Origins an operator qualified a grant with (`--grant http=a,b`).
+    /// Carried to the adapter once, as a narrowing: the shell never decides
+    /// whether a request is admitted, it only passes on what it was told.
+    grant_origins: [u8; GRANT_ORIGINS_BYTES],
+    grant_origins_len: usize,
+    /// 0 until the narrowing has been delivered, so it is sent exactly once.
+    grant_origins_sent: u8,
     /// For each admitted binding, the interface it belongs to and the method
     /// the adapter knows it as. This shell's own numbering is its own: what
     /// crosses to an adapter is the method its interface names.
@@ -452,7 +385,18 @@ struct State {
     /// whether one has been asked for, and what the last one said.
     snapshot_ready: bool,
     snapshot_asked: bool,
+    /// The most recent reading the adapter has answered with. Updated
+    /// whenever one lands, which may be part-way through a task.
     snapshot_value: f64,
+    /// The reading the RUNNING task sees. Latched from `snapshot_value` at a
+    /// task boundary and then left alone, so a reply that arrives mid-task
+    /// cannot move a clock the program is in the middle of reading. Without
+    /// this the same program reports a different elapsed time depending on
+    /// which step the answer happened to land on.
+    task_clock: f64,
+    /// Whether any reading has ever arrived. Until one has, a task has
+    /// nothing to run on and waits unconditionally.
+    snapshot_seen: bool,
 
     arec: [u8; ARGV_CAPACITY],
     arec_length: usize,
@@ -786,13 +730,37 @@ fn read_argv(state: &mut State) -> Parsed {
                 index += 1;
             }
             b"--grant" => {
-                let Some(kind) = next.and_then(grant_of) else {
+                let (word, tail) = match next {
+                    Some(w) => grant_parts(w),
+                    None => (&[][..], &[][..]),
+                };
+                let Some(kind) = grant_of(word) else {
                     emit(
                         &mut state.out,
-                        b"phasor: --grant takes clock, entropy, store, fs, net, or http\n",
+                        b"phasor: --grant takes clock, entropy, store, fs, net, http, or websocket\n",
                     );
                     return Parsed::Refused;
                 };
+                // `http=a,b` narrows the origins the adapter will admit. Only
+                // the two grants that reach an authority take a tail; naming
+                // origins for `fs` or `clock` is a mistake worth saying so
+                // about rather than ignoring.
+                if !tail.is_empty() {
+                    if kind != GRANT_HTTP && kind != GRANT_WS && kind != GRANT_NET {
+                        emit(
+                            &mut state.out,
+                            b"phasor: only http, websocket and net take =<origins>\n",
+                        );
+                        return Parsed::Refused;
+                    }
+                    let n = tail.len().min(state.grant_origins.len());
+                    if n < tail.len() {
+                        emit(&mut state.out, b"phasor: too many origins\n");
+                        return Parsed::Refused;
+                    }
+                    state.grant_origins[..n].copy_from_slice(tail.get(..n).unwrap_or(&[]));
+                    state.grant_origins_len = n;
+                }
                 let held = state.grants.get(..state.grant_count).unwrap_or(&[]);
                 if !held.contains(&kind) {
                     let Some(slot) = state.grants.get_mut(state.grant_count) else {
@@ -884,6 +852,19 @@ fn grant_name(kind: u8) -> ([u8; GRANT_NAME_MAX], usize) {
 }
 
 /// The interface a grant names on the command line.
+/// A grant word split into its kind and the origins it was qualified with:
+/// `http=a,b` is the `http` grant narrowed to those two. A bare word carries
+/// no tail and narrows nothing.
+fn grant_parts(word: &[u8]) -> (&[u8], &[u8]) {
+    match word.iter().position(|&c| c == b'=') {
+        Some(at) => (
+            word.get(..at).unwrap_or(&[]),
+            word.get(at + 1..).unwrap_or(&[]),
+        ),
+        None => (word, &[]),
+    }
+}
+
 fn grant_of(word: &[u8]) -> Option<u8> {
     match word {
         b"clock" => Some(GRANT_CLOCK),
@@ -1140,7 +1121,8 @@ fn advance(state: &mut State) -> Advance {
     let policy = policy(state);
     let grants = state.grants;
     let grant_count = state.grant_count;
-    let snapshot_value = state.snapshot_value;
+    // The reading this whole task runs on, latched at its boundary.
+    let task_clock = state.task_clock;
     let running_facade = state.running_facade;
     let starting = state.task_starting;
     let current = state.current_unit;
@@ -1201,8 +1183,16 @@ fn advance(state: &mut State) -> Advance {
                 name: capability::name_of(id.get(..id_length).unwrap_or(&[]), member.name()),
                 in_flight_max: IN_FLIGHT_MAX,
                 in_flight: 0,
-                class: member.class,
-                snapshot: snapshot_value,
+                class: if member.snapshot {
+                    binding::Class::Snapshot
+                } else {
+                    binding::Class::Async
+                },
+                snapshot: task_clock,
+                // Every member of one grant shares a handle scope: a
+                // response opened by `send` is read by `status` and closed
+                // by `close`, and those are the same capability.
+                scope: u32::from(kind),
             };
             if let (Some(k), Some(m)) = (
                 state.binding_kind.get_mut(count),
@@ -1257,6 +1247,23 @@ fn advance(state: &mut State) -> Advance {
         resources: Some(&mut state.resources),
     };
     let step = |machine: &mut Vm<'_, '_, '_, '_>| -> Advance {
+        // The wall clock the task about to run reads. Supplied every
+        // advance, not only the first: a task's reading is latched afresh at
+        // every boundary, so a continuation sees the time it resumed at
+        // rather than the time the program started.
+        //
+        // Only when a clock was granted. Without one the value stays absent
+        // and `Date.now()` keeps its logical tick, which is what a program
+        // given no clock is owed.
+        if grants
+            .get(..grant_count)
+            .unwrap_or(&[])
+            .contains(&GRANT_CLOCK)
+            && machine.set_wall_clock(task_clock).is_err()
+        {
+            emit(&mut state.out, b"phasor: heap-exhausted\n");
+            return Advance::Failed;
+        }
         if first {
             // The realm's own additions: the grants, by name, and `print`.
             // Each granted interface is one namespace object holding the
@@ -1607,7 +1614,56 @@ fn ports_of(state: &State, kind: u8) -> (i32, i32) {
     }
 }
 
+/// Method an adapter knows the narrowing by. Kept in step with
+/// `phasor_http`'s `METHOD_NARROW`.
+const METHOD_NARROW: u32 = 6;
+
+/// Deliver `--grant <kind>=<origins>` to the adapter behind that grant,
+/// once, before any program has run.
+///
+/// The shell carries the operator's intent and nothing else: it does not
+/// decide whether a request is admitted, and the method it calls can only
+/// lower what the deployment already allowed. That keeps one enforcement
+/// point — the adapter — while letting an operator narrow it from the
+/// command line.
+fn push_grant_narrowing(state: &mut State, syscalls: &SyscallTable) {
+    if state.grant_origins_sent != 0 || state.grant_origins_len == 0 {
+        return;
+    }
+    let length = state.grant_origins_len.min(state.grant_origins.len());
+    let mut grant = 0usize;
+    while grant < state.grant_count {
+        let kind = state.grants.get(grant).copied().unwrap_or(0);
+        if kind == GRANT_HTTP || kind == GRANT_WS || kind == GRANT_NET {
+            let (port, _) = ports_of(state, kind);
+            if port >= 0 {
+                let record = binding::CallRecord {
+                    request: 0,
+                    binding: METHOD_NARROW,
+                    payload_length: u32::try_from(length).unwrap_or(0),
+                    trace: 0,
+                    payload: digest::Digest([0u8; 32]),
+                };
+                let frame = record.encode();
+                let mut written = 0usize;
+                if wire::push_progress(syscalls, port, &frame, &mut written) {
+                    let mut body = 0usize;
+                    let _ = wire::push_progress(
+                        syscalls,
+                        port,
+                        state.grant_origins.get(..length).unwrap_or(&[]),
+                        &mut body,
+                    );
+                }
+            }
+        }
+        grant += 1;
+    }
+    state.grant_origins_sent = 1;
+}
+
 fn push_calls(state: &mut State, syscalls: &SyscallTable) {
+    push_grant_narrowing(state, syscalls);
     let mut grant = 0usize;
     while grant < state.grant_count {
         let kind = state.grants.get(grant).copied().unwrap_or(0);
@@ -1632,6 +1688,8 @@ fn push_calls(state: &mut State, syscalls: &SyscallTable) {
 }
 
 fn pull_replies(state: &mut State, syscalls: &SyscallTable) {
+    // Set when any capability answered this pass; see the end of the loop.
+    let mut stale = false;
     let mut grant = 0usize;
     while grant < state.grant_count {
         let kind = state.grants.get(grant).copied().unwrap_or(0);
@@ -1663,9 +1721,40 @@ fn pull_replies(state: &mut State, syscalls: &SyscallTable) {
             )
         {
             wire.frame_ready = false;
-            wire.ready = true;
+            // Route by who asked. The shell's own snapshot request carries
+            // `u64::MAX`; everything else is the program's and goes to the
+            // slot the program reads.
+            let mine = CompletionRecord::decode(&wire.reply)
+                .is_some_and(|record| record.request == u64::MAX);
+            if mine {
+                wire.snapshot_reply = wire.reply;
+                wire.snapshot_ready = true;
+                wire.filled = 0;
+                wire.reply_length = 0;
+                wire.reply_filled = 0;
+            } else {
+                wire.ready = true;
+                // An answer has come back, so the program is about to resume
+                // at a continuation and real time has passed: the clock fact
+                // it reads is stale. Marking it here is what lets a program
+                // measure the thing it just waited for.
+                //
+                // Deliberately NOT per step, and deliberately not for the
+                // branch above. Within one turn the clock stays still, which
+                // is the property that makes a task's reading of it
+                // deterministic; it moves exactly where the PROGRAM yielded
+                // and something answered it. Marking the shell's own
+                // snapshot answer stale would invalidate the reading the
+                // moment it arrived, so the shell would ask again every
+                // step and a program that never waited for anything would
+                // still watch its clock run.
+                stale = true;
+            }
         }
         grant += 1;
+    }
+    if stale {
+        state.snapshot_ready = false;
     }
 }
 
@@ -1675,6 +1764,14 @@ fn pull_replies(state: &mut State, syscalls: &SyscallTable) {
 /// at the task boundary, which is what lets a clock be a capability and still
 /// answer synchronously. The shell asks for it here, on the port a call would
 /// use, under a request identifier of its own. Answers whether it is ready.
+///
+/// A task does not wait for a fresh reading once any reading exists: the
+/// request was staged behind whatever the program asked for, and stopping
+/// the task until it is answered stops the very work the answer is waiting
+/// on. The cost is that a reading is up to one round trip old, so a program
+/// timing a single short wait sees less than it waited. Only the FIRST
+/// reading is worth blocking for, because until one arrives there is no hour
+/// to run on at all.
 fn take_snapshot(state: &mut State, syscalls: &SyscallTable) -> bool {
     let held =
         (0..state.grant_count).find(|&grant| state.grants.get(grant).copied() == Some(GRANT_CLOCK));
@@ -1687,51 +1784,101 @@ fn take_snapshot(state: &mut State, syscalls: &SyscallTable) -> bool {
         state.snapshot_ready = true;
         return true;
     }
-    if !state.snapshot_asked {
-        let record = CallRecord {
-            request: u64::MAX,
-            binding: 0,
-            payload_length: 0,
-            trace: TRACE,
-            payload: digest::digest(b""),
-        };
-        let frame = record.encode();
-        let Some(wire) = state.wires.get_mut(grant) else {
-            state.snapshot_ready = true;
-            return true;
-        };
-        let at = wire.staged;
-        if !copy_into(
-            wire.calls.get_mut(at..at + CALL_FRAME).unwrap_or(&mut []),
-            &frame,
-        ) {
-            state.snapshot_ready = true;
-            return true;
-        }
-        wire.staged = at + CALL_FRAME;
-        state.snapshot_asked = true;
+    // Take whatever has come back and make sure another request is on its
+    // way, then give the wire one turn in case the answer is a step away —
+    // which it is for the very first reading, the one this blocks for.
+    collect_snapshot(state, grant);
+    if !state.snapshot_asked && !stage_snapshot(state, grant) {
+        state.snapshot_ready = true;
+        return true;
     }
     push_calls(state, syscalls);
     pull_replies(state, syscalls);
+    collect_snapshot(state, grant);
+    if !state.snapshot_seen {
+        // Nothing has ever been read, so there is no hour to run on: this is
+        // the one case worth blocking for.
+        return false;
+    }
+    // Latch. From here until the next boundary the task reads this and only
+    // this, however many readings arrive behind it.
+    state.task_clock = state.snapshot_value;
+    state.snapshot_ready = true;
+    true
+}
+
+/// Keep one clock reading on its way at all times.
+///
+/// Called every step while a clock is granted, so the newest reading is
+/// never older than a round trip. It does NOT latch: what the running task
+/// sees is decided at a boundary, by [`take_snapshot`], and a reading that
+/// lands mid-task waits there for the next one.
+fn poll_snapshot(state: &mut State, syscalls: &SyscallTable) {
+    let held =
+        (0..state.grant_count).find(|&grant| state.grants.get(grant).copied() == Some(GRANT_CLOCK));
+    let Some(grant) = held else {
+        return;
+    };
+    let (call_port, reply_port) = ports_of(state, GRANT_CLOCK);
+    if call_port < 0 || reply_port < 0 {
+        return;
+    }
+    collect_snapshot(state, grant);
+    if !state.snapshot_asked {
+        let _ = stage_snapshot(state, grant);
+        push_calls(state, syscalls);
+    }
+}
+
+/// Stage the shell's own clock request. Answers whether it went on the wire.
+///
+/// It carries `u64::MAX` as its request identifier, which is what the reply
+/// path routes on: the shell's answer lands in a slot of its own rather than
+/// being taken for the answer to a program's `clock.sleep`.
+fn stage_snapshot(state: &mut State, grant: usize) -> bool {
+    let record = CallRecord {
+        request: u64::MAX,
+        binding: 0,
+        payload_length: 0,
+        trace: TRACE,
+        payload: digest::digest(b""),
+    };
+    let frame = record.encode();
     let Some(wire) = state.wires.get_mut(grant) else {
         return false;
     };
-    if !wire.ready {
+    let at = wire.staged;
+    if !copy_into(
+        wire.calls.get_mut(at..at + CALL_FRAME).unwrap_or(&mut []),
+        &frame,
+    ) {
         return false;
     }
-    wire.ready = false;
-    wire.filled = 0;
-    wire.reply_length = 0;
-    wire.reply_filled = 0;
-    let reply = wire.reply;
+    wire.staged = at + CALL_FRAME;
+    state.snapshot_asked = true;
+    true
+}
+
+/// Move a reading that has arrived out of its slot and into the shell.
+///
+/// Updates the latest reading only. What the running task sees is latched
+/// separately, at a boundary, by [`take_snapshot`].
+fn collect_snapshot(state: &mut State, grant: usize) {
+    let Some(wire) = state.wires.get_mut(grant) else {
+        return;
+    };
+    if !wire.snapshot_ready {
+        return;
+    }
+    let reply = wire.snapshot_reply;
+    wire.snapshot_ready = false;
     if let Some(record) = CompletionRecord::decode(&reply) {
         if let Answer::Number(value) = record.answer {
             state.snapshot_value = value;
+            state.snapshot_seen = true;
         }
     }
     state.snapshot_asked = false;
-    state.snapshot_ready = true;
-    true
 }
 
 // ------------------------------------------------------------ the REPL
@@ -1933,6 +2080,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
+    announce_ready!(state);
 
     if state.phase == PHASE_DONE {
         return 1;
@@ -2048,6 +2196,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         push_calls(state, syscalls);
         pull_replies(state, syscalls);
+        // Sample the clock continuously, not only at a boundary. The reading
+        // a task latches is the freshest one that has come back, so how OLD
+        // that is decides what a program measuring a wait can see. Asking
+        // only at boundaries means the newest reading was taken before the
+        // wait began, and a program that slept fifty milliseconds reports
+        // one. Keeping exactly one request in flight costs a frame per round
+        // trip and bounds the error at a round trip instead of a wait.
+        poll_snapshot(state, syscalls);
         if state.task_running {
             // The task about to run reads facts rather than calling for them:
             // the snapshot is taken here, at the boundary, before any of the
