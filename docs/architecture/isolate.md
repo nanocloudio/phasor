@@ -111,12 +111,44 @@ which phase spoke is worth keeping.
 ## 4b. What bounds a program
 
 The instruction budget is a parameter, `steps`, rather than a constant: a graph
-that runs bigger programs says how much bigger. The frame and register tables
-are compiled in, and they are what a program's recursion depth is bounded by —
-a call written in bytecode is a frame in this table, and a call a native makes
-nests a bounded inner loop with a declared depth of its own, so a runaway
-recursion is `StackOverflow` at a declared depth rather than a stack that ran
-into something.
+that runs bigger programs says how much bigger. The arena and the tables are
+compiled in, in one of two storage profiles the silicon selects. An
+application-class target takes the arena and tables a deployed program needs.
+RP2350 shares a 240 KiB module-state arena with every other module in its
+graph, so it takes a 96 KiB arena — the realm's 69,240 bytes and about 28 KiB
+over it — thirty-two frames, 256 registers and a 2 KiB image, under 180 KiB
+of state in all. The `embedded` variant selects that profile on any silicon,
+which is how the Linux lanes run it. The language, the bytecode format and the
+feature digest are the same in both, so one image is admitted by either; what
+differs is how large a program may grow before `HeapExhausted`, how deep it
+may call before `StackOverflow`, and how long an image may be before
+`image-too-large`. RP2040 has no profile, because its whole arena is smaller
+than the realm.
+
+The frame table is what a program's recursion depth is bounded by — a call
+written in bytecode is a frame in this table, and a call a native makes nests
+a bounded inner loop with a declared depth of its own, so a runaway recursion
+is `StackOverflow` at a declared depth rather than a stack that ran into
+something.
+
+## 4c. What a build may leave out
+
+The `lean` variant carries neither `JSON` nor `RegExp`. Each is a library area
+reached only through its own natives, so leaving it out removes the code and,
+for regular expressions, the match storage as well: the globals are simply
+absent from the realm, which a program observes the way it observes any host
+without them, and `String.prototype.match` and `search` throw `TypeError`.
+The feature digest does not change, because the language did not, so an image
+is compiled once and admitted by a full build and a lean one alike. The one
+thing a lean build cannot run, a regular expression literal, it refuses when
+the image is admitted — `image-not-admitted`, naming the feature — rather than
+when the literal is reached, so a program either runs whole on the build it
+was given or does not run on it.
+
+`Proxy`, `Date` and the typed arrays are not variants. Each is reached through
+the object model itself, where every property read asks whether its target is
+one, so leaving one out would be a stub at each of those sites rather than an
+omission.
 
 ## 5. Slices, cancellation, and deadlines
 

@@ -138,6 +138,14 @@ versioning a feature changes the digest, and an image compiled against a
 different list is refused as `feature-list-mismatch`. Both digests sit in the
 unit header, and both are checked before any section is read.
 
+The list is the language, not what a particular build carries of it. A build
+that leaves a library area out — the isolate's `lean` variant has no `JSON`
+and no `RegExp` — computes the same digest, because a program compiled for
+the whole language runs on it unless its bytecode needs the omitted engine;
+that one case, a regular expression literal, is refused when the image is
+admitted as `image-not-admitted`. Everything else about absence is a run-time
+fact: the global is not there, which is what a program expects of any host.
+
 The **logical digest** is the digest of the whole unit image. Because the image
 is canonical, the same source produces the same digest on every target, which is
 what makes an artefact addressable by content.

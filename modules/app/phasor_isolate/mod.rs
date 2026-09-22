@@ -99,40 +99,122 @@ use binding::{
     Answer, Binding, Bindings, BindingsSave, CallRecord, Cause, CompletionRecord, Disposition,
     Pending, CALL_FRAME, COMPLETION_FRAME,
 };
-use bytecode::Unit;
+use bytecode::{Opcode, Unit};
 use closure::Closure;
 use diagnostic::{code, Diagnostic, Severity};
 use heap::Slot;
 use job::{Job, Queue, QueueSave};
 use policy::Policy;
 use realm::Realm;
+#[cfg(not(feature = "omit_regexp"))]
 use regexp::Choice;
 use string::{Atoms, AtomsSave};
 use value::{Handle, Value};
 use vm::{Completion, Frame, ModuleInstance, Progress, Saves, Vm};
 
-const IMAGE_CAPACITY: usize = 64 * 1024;
+/// The storage profile: what this build sets aside for a program.
+///
+/// Selected by the silicon the module is compiled for, because the silicon is
+/// what fixes the budget. An application-class core has a module-state arena
+/// measured in megabytes and takes the sizes a deployed program needs. RP2350
+/// has 240 KiB shared by every module in its graph and takes sizes that leave
+/// room for them. The `embedded` variant selects the smaller profile on any
+/// silicon, which is how a Linux lane runs the numbers a Cortex-M deployment
+/// runs under.
+///
+/// The engine is the same in both. The language, the bytecode format and the
+/// feature digest do not move, so one image is admitted by either. What moves
+/// is how large a program may grow before `HeapExhausted`, how deep it may
+/// call before `StackOverflow`, and how long an image may be before
+/// `image-too-large`.
+///
+/// A silicon with no profile does not compile, because a size that merely
+/// happened to fit would be a policy nobody chose. RP2040 is named so the
+/// reason is at hand: its whole module-state arena is 64 KiB, and the realm
+/// alone — the intrinsics a program starts with, before it allocates anything
+/// — takes 69,240 bytes of heap.
+mod profile {
+    #[cfg(not(any(fluxor_silicon = "rp2350", feature = "profile_embedded")))]
+    pub use application::*;
+    #[cfg(any(fluxor_silicon = "rp2350", feature = "profile_embedded"))]
+    pub use embedded::*;
+    #[cfg(fluxor_silicon = "rp2040")]
+    compile_error!(
+        "phasor_isolate has no storage profile for rp2040: its 64 KiB module-state arena is smaller than the 69,240 bytes the realm alone takes"
+    );
+
+    /// Sized for the programs an application-class target is given: one that
+    /// holds a few thousand properties is ordinary, and refusing it would be
+    /// a policy no deployment asked for.
+    ///
+    /// The arena is NOT the bound on how large a response body a program can
+    /// turn into a string: that stalls around 15 KiB against `phasor_http`'s
+    /// 32 KiB body, and doubling the arena changes nothing. What costs is the
+    /// number of allocations the decode makes, not the bytes it holds — see
+    /// `bytesToText` in `modules/common/facade.rs`.
+    pub mod application {
+        pub const IMAGE_CAPACITY: usize = 64 * 1024;
+        pub const ARENA_BYTES: usize = 256 * 1024;
+        pub const SLOT_COUNT: usize = 8192;
+        pub const WORKLIST: usize = 2048;
+        pub const ATOM_ENTRIES: usize = 1024;
+        pub const ATOM_HANDLES: usize = 768;
+        /// How deep a program may call, and how many registers those calls
+        /// may hold. A call is a frame here rather than a host stack frame,
+        /// so this is what a program's recursion is bounded by.
+        pub const FRAME_COUNT: usize = 256;
+        pub const REGISTER_COUNT: usize = 4096;
+        /// Bytes of payload one call or one completion may carry behind its
+        /// frame. A call whose arguments do not fit is refused by the
+        /// machine, and an answer longer than this is not taken.
+        pub const PAYLOAD_BYTES: usize = 8 * 1024;
+        /// Roots a collection stages before it starts: the registers in use,
+        /// the frames, the interned handles, and the realm's own handles.
+        pub const ROOT_COUNT: usize = 8192;
+        /// One entry per byte of the longest function the verifier may be
+        /// handed. An image cannot hold a function longer than itself, so
+        /// matching the image capacity is exactly enough.
+        pub const VERIFIER_CAPACITY: usize = 16 * 1024;
+    }
+
+    /// Sized to share a 240 KiB module-state arena: under 180 KiB of state
+    /// in all, leaving the rest of the graph 60 KiB.
+    ///
+    /// The arena holds the realm — 69,240 bytes and 798 handles — and about
+    /// 28 KiB of working heap over it, which is room for a hundred or so
+    /// small objects: a script, not an application. Each table is matched to
+    /// that. The handle table leaves 738 slots past the realm's. The atom
+    /// table is a power of two, three-quarters full at its handle count.
+    /// Thirty-two frames bound recursion at thirty-two calls. The verifier
+    /// holds one entry per byte of the longest image it can be handed. Two
+    /// kilobytes of image is a few hundred lines of source, which is what a
+    /// program for a part this size is.
+    pub mod embedded {
+        pub const IMAGE_CAPACITY: usize = 2 * 1024;
+        pub const ARENA_BYTES: usize = 96 * 1024;
+        pub const SLOT_COUNT: usize = 1536;
+        pub const WORKLIST: usize = 512;
+        pub const ATOM_ENTRIES: usize = 512;
+        pub const ATOM_HANDLES: usize = 384;
+        pub const FRAME_COUNT: usize = 32;
+        pub const REGISTER_COUNT: usize = 256;
+        pub const PAYLOAD_BYTES: usize = 2048;
+        pub const ROOT_COUNT: usize = 1024;
+        pub const VERIFIER_CAPACITY: usize = 2048;
+    }
+}
+use profile::*;
+
+/// Opcodes this build cannot run. An image that carries one is refused when
+/// it is admitted, as `image-not-admitted` naming the feature, rather than
+/// running until it reaches the instruction: an image either runs whole on
+/// this build or does not run on it.
+#[cfg(feature = "omit_regexp")]
+const REFUSED: &[verify::Refused] = &[(Opcode::CreateRegExp, diagnostic::image_feature::REGEXP)];
+#[cfg(not(feature = "omit_regexp"))]
+const REFUSED: &[verify::Refused] = &[];
+
 const RESULT_CAPACITY: usize = 128;
-// Sized for the application-class targets this fmod declares: a program that
-// holds a few thousand properties is ordinary, and refusing it would be a
-// policy choice no deployment asked for.
-//
-// NOT the bound on how large a response body a program can turn into a
-// string: that stalls around 15 KiB against `phasor_http`'s 32 KiB body, and
-// doubling this changed nothing at all. What costs is the number of
-// allocations the decode makes, not the bytes it holds -- see
-// `bytesToText` in `modules/common/facade.rs`.
-const ARENA_BYTES: usize = 256 * 1024;
-const SLOT_COUNT: usize = 8192;
-const WORKLIST: usize = 2048;
-const ATOM_ENTRIES: usize = 1024;
-const ATOM_HANDLES: usize = 768;
-/// How deep a program may call, and how many registers those calls may hold.
-/// A call is a frame here rather than a host stack frame, so this number is
-/// what a program's recursion is bounded by: deep enough for ordinary nesting,
-/// small enough that the whole machine still fits in a module's state.
-const FRAME_COUNT: usize = 256;
-const REGISTER_COUNT: usize = 4096;
 const JOB_COUNT: usize = 32;
 /// Bindings this isolate admits, and calls it lets be outstanding at once.
 ///
@@ -143,37 +225,25 @@ const JOB_COUNT: usize = 32;
 const BINDING_COUNT: usize = MAX_BINDINGS;
 const PENDING_COUNT: usize = 4;
 const IN_FLIGHT_MAX: u32 = 4;
-/// Bytes of payload one call or one completion may carry behind its frame.
-/// The arguments a program passes cross as bytes, and the bytes a provider
-/// answers with come back the same way; a call whose arguments do not fit is
-/// refused by the machine, and an answer longer than this is not taken.
-const PAYLOAD_BYTES: usize = 8 * 1024;
 /// Resources a program may hold open at once. A provider that answers with a
 /// resource answers with a handle, and a handle is an index and a generation
 /// held here: an isolate with nowhere to hold one could be granted `open` and
 /// would have to refuse every call to it.
 const RESOURCE_COUNT: usize = 16;
-/// Roots a collection stages before it starts: the registers in use, the
-/// frames, the interned handles, and the realm all fit with room over.
-const ROOT_COUNT: usize = 8192;
 /// Cells or bytes one collection slice works through.
 const COLLECTION_SLICE: u32 = 512;
 /// Free arena below which the isolate collects rather than waiting to fail.
 ///
-/// A sixteenth, not the quarter this was. A quarter of a 256 KiB arena is
-/// 64 KiB of headroom, which a script-scope loop refills every ~1,700
-/// iterations, and every refill is a FULL collection charged to the same
-/// budget as instructions (`collect_now` says so outright). On
-/// `for(let i=0;i<N;i++)s+=i` that made garbage collection 94% of the
-/// metered cost: 187 of the 200 fuel per iteration, against 13 for the
-/// bytecode the loop actually is.
-///
-/// Measured on linux at 4,000 iterations: a quarter costs 200.1 fuel per
-/// iteration, a sixteenth 134.0. Past that it stops helping and slightly
-/// reverses -- a sixty-fourth is 139.9 and a two-hundred-and-fifty-sixth
-/// 141.4 -- because each collection then starts from a fuller heap and
-/// reclaims proportionally less. So a sixteenth is where the curve bottoms
-/// out, not a guess at "smaller is better".
+/// A sixteenth of the arena. The fraction sets how often a program that
+/// allocates steadily pays for a full collection, and every collection is
+/// charged to the same budget as instructions, so it is a throughput number
+/// and is measured as one: on `for(let i=0;i<N;i++)s+=i` at 4,000 iterations
+/// on linux, a quarter costs 200.1 fuel per iteration and a sixteenth 134.0,
+/// with the collector rather than the bytecode taking most of the difference.
+/// Past a sixteenth the curve turns back -- a sixty-fourth is 139.9 and a
+/// two-hundred-and-fifty-sixth 141.4 -- because each collection then starts
+/// from a fuller heap and reclaims proportionally less. A sixteenth is where
+/// it bottoms out, not a guess at "smaller is better".
 ///
 /// Headroom is the smaller lever. The larger one is where a binding lives:
 /// script-scope bindings sit in a context and allocate per iteration where
@@ -182,7 +252,6 @@ const COLLECTION_SLICE: u32 = 512;
 /// direct `eval` may introduce a nearer binding at run time, which is what
 /// `LdaShadowable` and `dynamic_names` in the lowerer are for.
 const COLLECTION_HEADROOM: u32 = (ARENA_BYTES / 16) as u32;
-const VERIFIER_CAPACITY: usize = 16 * 1024;
 /// Instructions one image may run here when the graph names no other number.
 /// A budget is what makes a run answerable rather than open-ended, so it is a
 /// parameter: a graph that runs bigger programs says so.
@@ -387,9 +456,13 @@ enum Advance {
 }
 
 /// The port side: frames staged to leave, and the frame arriving.
-/// Where a match backtracks, what it must put back, and the units it runs over.
+/// Where a match backtracks, what it must put back, and the units it runs
+/// over. A build without the regular expression engine sets none aside.
+#[cfg(not(feature = "omit_regexp"))]
 const CHOICE_COUNT: usize = 256;
+#[cfg(not(feature = "omit_regexp"))]
 const UNDO_COUNT: usize = 256;
+#[cfg(not(feature = "omit_regexp"))]
 const SUBJECT_UNITS: usize = 1024;
 #[repr(C)]
 struct Wire {
@@ -416,9 +489,9 @@ struct State {
     /// meaningful. Fluxor gates a module until every forward upstream has
     /// signalled `StepOutcome::Ready` (3 from a PIC module), and a module
     /// that never signals it holds its whole downstream dark for the life of
-    /// the graph. Nothing on linux or wasm enforces the gate, so this was
-    /// invisible until the first bare-metal run, where the front end and the
-    /// isolate were never stepped at all.
+    /// the graph. Only bare metal enforces the gate -- linux and wasm step
+    /// every module regardless -- so a module that forgets to announce runs
+    /// everywhere but on the board.
     announced: bool,
     image_in: i32,
     completion_in: i32,
@@ -453,8 +526,11 @@ struct State {
     image: [u8; IMAGE_CAPACITY],
     result: [u8; RESULT_CAPACITY],
     arena: [u8; ARENA_BYTES],
+    #[cfg(not(feature = "omit_regexp"))]
     choices: [Choice; CHOICE_COUNT],
+    #[cfg(not(feature = "omit_regexp"))]
     undo: [(u8, u32); UNDO_COUNT],
+    #[cfg(not(feature = "omit_regexp"))]
     subject: [u16; SUBJECT_UNITS],
     slots: [Slot; SLOT_COUNT],
     worklist: [u32; WORKLIST],
@@ -518,6 +594,8 @@ struct State {
 /// Admit the staged image and start the task, saving the machine's state.
 fn start(state: &mut State) -> bool {
     if state.overflowed {
+        // Refused before this is reached; kept so that a partial image can
+        // never be admitted by any path.
         return false;
     }
     let image_length = state.image_length;
@@ -543,7 +621,7 @@ fn start(state: &mut State) -> bool {
                 let Some(image) = closure.image(index as u32) else {
                     return false;
                 };
-                let Ok(unit) = verify::admit(image, &mut state.verifier_state) else {
+                let Ok(unit) = verify::admit_with(image, &mut state.verifier_state, REFUSED) else {
                     return false;
                 };
                 units[index] = unit;
@@ -552,7 +630,7 @@ fn start(state: &mut State) -> bool {
             count
         }
         None => {
-            match verify::admit(bytes, &mut state.verifier_state) {
+            match verify::admit_with(bytes, &mut state.verifier_state, REFUSED) {
                 Ok(unit) => units[0] = unit,
                 Err(report) => {
                     state.diagnostic = report.encode();
@@ -1346,17 +1424,19 @@ fn drain_control(state: &mut State, syscalls: &SyscallTable) {
 /// The requirements are read from the image's own import table, where nothing
 /// outside the image can claim one for it, and checked before anything is
 /// admitted or run.
-fn requirements_granted(state: &State) -> bool {
-    let Some(bytes) = state.image.get(..state.image_length) else {
-        // The image is not as long as it says. Nothing here can be read, and
-        // an image that cannot be read cannot be checked.
-        return false;
-    };
+/// Whether the deployment granted every capability the image requires.
+///
+/// `Some(false)` is a requirement that is not granted, or one that could not
+/// be checked, which refuses the image the same way. `None` is an image that
+/// does not parse at all, which is not the same thing: admission reads it
+/// next and says what is wrong with it, rather than this saying something is
+/// not granted when nothing was asked for.
+fn requirements_granted(state: &State) -> Option<bool> {
+    let bytes = state.image.get(..state.image_length)?;
     if bytes.is_empty() {
         // Nothing arrived. Whatever was to produce an image said why on its
-        // own port, and an image that does not exist requires nothing --
-        // which is not the same as one that could not be read.
-        return true;
+        // own port, and an image that does not exist requires nothing.
+        return Some(true);
     }
     let mut units = [Unit::EMPTY; MAX_MODULES];
     let count = match Closure::parse(bytes) {
@@ -1365,7 +1445,7 @@ fn requirements_granted(state: &State) -> bool {
             // A closure with more modules than this reads is not a closure
             // whose first sixteen modules are the whole of it.
             if count > MAX_MODULES {
-                return false;
+                return None;
             }
             let mut index = 0usize;
             while index < count {
@@ -1374,7 +1454,7 @@ fn requirements_granted(state: &State) -> bool {
                     .ok_or(())
                     .and_then(|image| Unit::parse(image).map_err(|_| ()))
                 else {
-                    return false;
+                    return None;
                 };
                 units[index] = unit;
                 index += 1;
@@ -1386,37 +1466,30 @@ fn requirements_granted(state: &State) -> bool {
                 units[0] = unit;
                 1
             }
-            Err(_) => return false,
+            Err(_) => return None,
         },
     };
     let mut required = [capability::Requirement::EMPTY; MAX_REQUIREMENTS];
     let mut index = 0usize;
     while index < count {
-        let Some(unit) = units.get(index) else {
-            return false;
-        };
-        // A requirement that could not be read is not a requirement that is
-        // absent: refusing is the only answer that does not admit the image
-        // nobody could check.
+        let unit = units.get(index)?;
         // A requirement that could not be read is not a requirement that is
         // absent: refusing is the only answer that does not admit the image
         // nobody could check.
         let Ok(stated) = capability::requirements(unit, &mut required) else {
-            return false;
+            return Some(false);
         };
         let mut position = 0usize;
         while position < stated {
-            let Some(requirement) = required.get(position) else {
-                return false;
-            };
+            let requirement = required.get(position)?;
             if !granted(state, requirement.name()) {
-                return false;
+                return Some(false);
             }
             position += 1;
         }
         index += 1;
     }
-    true
+    Some(true)
 }
 
 /// Whether the deployment granted this capability. The gate and the table an
@@ -1512,10 +1585,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if !stage_image(state, syscalls) {
             return 0;
         }
+        // Longer than this build stages: what is staged is a prefix, not an
+        // image, and nothing read from it means anything. Said with the
+        // length that is staged, which is the number the author has to get
+        // under.
+        if state.overflowed {
+            state.diagnostic = Diagnostic::at(code::IMAGE_TOO_LARGE, Severity::Error, 0)
+                .with(u32::try_from(IMAGE_CAPACITY).unwrap_or(u32::MAX))
+                .encode();
+            state.has_diagnostic = true;
+            state.failed = true;
+            state.phase = 2;
+            return 0;
+        }
         // Every binding the image says it requires must be one the deployment
         // granted, or the image is refused whole. A program never starts and
-        // then discovers that a capability it imported is `undefined`.
-        if !requirements_granted(state) {
+        // then discovers that a capability it imported is `undefined`. An
+        // image whose requirements cannot be read goes on to admission, which
+        // says what is wrong with it rather than what is not granted.
+        if requirements_granted(state) == Some(false) {
             state.diagnostic =
                 Diagnostic::at(code::BINDING_NOT_GRANTED, Severity::Error, 0).encode();
             state.has_diagnostic = true;

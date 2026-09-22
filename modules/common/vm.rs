@@ -9,6 +9,11 @@
 //! accessor or a `valueOf`, is performed by pushing a frame and continuing the
 //! same loop, so a call needs no host recursion and stays inside the budget.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "the omit flags belong to the variants of the modules that can leave a library area out; a module that declares no variant receives no matching --check-cfg, and for it every flag is absent, which is the whole language"
+)]
+
 use core::ffi::c_void;
 
 use crate::binding::{Bindings, CallError, CallRecord, Cause, CompletionRecord, Disposition};
@@ -46,6 +51,7 @@ mod host;
 #[path = "vm/iteration.rs"]
 mod iteration;
 #[path = "vm/json.rs"]
+#[cfg(not(feature = "omit_json"))]
 mod json;
 #[path = "vm/modules.rs"]
 mod modules;
@@ -62,6 +68,7 @@ mod proxy;
 #[path = "vm/realms.rs"]
 mod realms;
 #[path = "vm/regexps.rs"]
+#[cfg(not(feature = "omit_regexp"))]
 mod regexps;
 use bigints::*;
 use buffers::*;
@@ -72,6 +79,7 @@ use date::*;
 use eval::*;
 use host::*;
 use iteration::*;
+#[cfg(not(feature = "omit_json"))]
 use json::*;
 use modules::*;
 use names::*;
@@ -80,6 +88,7 @@ use privates::*;
 use properties::*;
 use proxy::*;
 use realms::*;
+#[cfg(not(feature = "omit_regexp"))]
 use regexps::*;
 
 /// How a suspended frame is being resumed.
@@ -346,6 +355,7 @@ pub struct Snapshot {
     started: bool,
     current_native: Option<Handle>,
     collections: u32,
+    pressed_collections: u32,
     trace: u64,
     retained: Value,
     /// The source of an eval the machine is paused on, waiting for the host
@@ -396,6 +406,7 @@ impl Default for Snapshot {
             started: false,
             current_native: None,
             collections: 0,
+            pressed_collections: 0,
             trace: 0,
             retained: Value::UNDEFINED,
             pending_eval: Value::UNDEFINED,
@@ -529,6 +540,9 @@ pub struct Vm<'a, 'u, 'h, 'atoms> {
     collection_slice: u32,
     collection_headroom: u32,
     collections: u32,
+    /// Collections in a row that ended with the heap still under pressure.
+    /// See [`PRESSED_COLLECTIONS`].
+    pressed_collections: u32,
     /// The trace context every call this machine makes carries.
     trace: u64,
     /// A value the host asked the machine to keep alive: a result it is holding
@@ -579,9 +593,12 @@ pub struct Vm<'a, 'u, 'h, 'atoms> {
     /// explicit rather than whatever stack the platform happened to give.
     nested: u32,
     /// Where a match backtracks, and what it must put back when it does.
+    #[cfg(not(feature = "omit_regexp"))]
     regexp_choices: Option<&'a mut [crate::regexp::Choice]>,
+    #[cfg(not(feature = "omit_regexp"))]
     regexp_undo: Option<&'a mut [(u8, u32)]>,
     /// The units a match runs over, copied out of the heap.
+    #[cfg(not(feature = "omit_regexp"))]
     regexp_subject: Option<&'a mut [u16]>,
     /// The bindings this isolate was granted, when a host attached any.
     bindings: Option<&'a mut Bindings<'a>>,
@@ -641,6 +658,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             collection_slice: 0,
             collection_headroom: 0,
             collections: 0,
+            pressed_collections: 0,
             trace: 0,
             retained: Value::UNDEFINED,
             pending_eval: Value::UNDEFINED,
@@ -657,8 +675,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             eval_generation: 0,
             pending_new_target: Value::UNDEFINED,
             nested: 0,
+            #[cfg(not(feature = "omit_regexp"))]
             regexp_choices: None,
+            #[cfg(not(feature = "omit_regexp"))]
             regexp_undo: None,
+            #[cfg(not(feature = "omit_regexp"))]
             regexp_subject: None,
             bindings: None,
             outbox: None,
@@ -718,6 +739,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             started: self.started,
             current_native: self.current_native,
             collections: self.collections,
+            pressed_collections: self.pressed_collections,
             trace: self.trace,
             retained: self.retained,
             pending_eval: self.pending_eval,
@@ -753,6 +775,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         self.started = snapshot.started;
         self.current_native = snapshot.current_native;
         self.collections = snapshot.collections;
+        self.pressed_collections = snapshot.pressed_collections;
         self.trace = snapshot.trace;
         self.retained = snapshot.retained;
         self.pending_eval = snapshot.pending_eval;
@@ -1850,7 +1873,15 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 let value = self.accumulator;
                 self.init_context_slot(frame, operands[0], operands[1], value)?;
             }
+            #[cfg(not(feature = "omit_regexp"))]
             Op::CreateRegExp => self.op_create_regexp(&operands)?,
+            // Unreachable on a build that admits images through `verify_with`
+            // and refuses this opcode there; kept so the machine is total
+            // over its own instruction set whatever admitted the image.
+            #[cfg(feature = "omit_regexp")]
+            Op::CreateRegExp => {
+                return Err(Completion::Terminated(Termination::NotImplemented));
+            }
             Op::CreateClosure => self.op_create_closure(frame, &operands)?,
             Op::ToPropertyKeyChecked => {
                 let base = self.register(frame, operands[0]);

@@ -44,12 +44,13 @@ const fn feature(name: &[u8], version: u16) -> Feature {
     }
 }
 
-/// Every feature this build admits, in the order the digest takes them.
+/// Every feature the engine has, in the order the digest takes them.
 ///
-/// The order is the layers of the engine: what is scanned, what is parsed, and
-/// what runs. Adding, removing, or versioning an entry changes the digest, and
-/// therefore refuses every image compiled before the change.
-pub const FEATURES: [Feature; 49] = [
+/// The order is the layers of the engine: what is scanned, what is parsed, what
+/// runs, and the library on top. Adding, removing, or versioning an entry
+/// changes the digest, and therefore refuses every image compiled before the
+/// change.
+pub const FEATURES: [Feature; 53] = [
     feature(b"lex.source-text", 1),
     feature(b"lex.comment", 1),
     feature(b"lex.identifier", 1),
@@ -117,9 +118,23 @@ pub const FEATURES: [Feature; 49] = [
     feature(b"library.function", 1),
     feature(b"library.promise", 1),
     feature(b"library.regexp", 1),
+    feature(b"library.json", 1),
+    feature(b"library.date", 1),
+    feature(b"library.buffers", 1),
+    feature(b"runtime.proxy", 1),
 ];
 
-/// The digest of the admitted feature list.
+/// The digest of the feature list.
+///
+/// Every entry goes in, whatever a given build carries. The list is the
+/// language an image was compiled against — the syntax and the semantics of
+/// what runs — and that is one language everywhere. A build may leave a
+/// library area out (`omit_json`, `omit_regexp`) without touching it: an
+/// omitted area is absent from the realm, which a program observes the way it
+/// observes any host without that object, and an image whose bytecode needs
+/// an omitted engine area is refused when it is admitted. Neither is a
+/// different language, so neither is a different digest, and one image is
+/// admitted by every build that can run it.
 pub fn digest() -> Digest {
     let mut hasher = Hasher::new();
     hasher.update(b"phasor.features.1");

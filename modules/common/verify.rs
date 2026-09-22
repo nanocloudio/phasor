@@ -23,10 +23,26 @@ const MAX_REGION_NESTING: usize = 32;
 const NOT_START: i32 = -1;
 const UNVISITED: i32 = -2;
 
+/// An opcode a build cannot run, and the image feature to name when an image
+/// carries it. A build that leaves an engine area out refuses the images that
+/// need it here, when they are admitted, rather than at the instruction: an
+/// image either runs whole on this build or does not run on it.
+pub type Refused = (Opcode, u32);
+
 /// Verify every function of a unit image.
 ///
 /// `state` must hold at least one entry per byte of the unit's code section.
 pub fn verify(unit: &Unit<'_>, state: &mut [i32]) -> Result<(), Diagnostic> {
+    verify_with(unit, state, &[])
+}
+
+/// Verify every function of a unit image, refusing any that carries one of
+/// `refused`.
+pub fn verify_with(
+    unit: &Unit<'_>,
+    state: &mut [i32],
+    refused: &[Refused],
+) -> Result<(), Diagnostic> {
     let header = unit.header();
     for index in 0..header.function_count {
         let Some(function) = unit.function(index) else {
@@ -59,13 +75,23 @@ pub fn verify(unit: &Unit<'_>, state: &mut [i32]) -> Result<(), Diagnostic> {
                 index,
             ));
         };
-        verify_function(unit, index, &function, code_bytes, slots)?;
+        verify_function(unit, index, &function, code_bytes, slots, refused)?;
     }
     Ok(())
 }
 
 /// Validate an image and then verify it, which is the whole admission path.
 pub fn admit<'a>(bytes: &'a [u8], state: &mut [i32]) -> Result<Unit<'a>, Diagnostic> {
+    admit_with(bytes, state, &[])
+}
+
+/// Parse and verify a unit image, refusing one that carries an opcode in
+/// `refused`.
+pub fn admit_with<'a>(
+    bytes: &'a [u8],
+    state: &mut [i32],
+    refused: &[Refused],
+) -> Result<Unit<'a>, Diagnostic> {
     let unit = Unit::parse(bytes).map_err(|error| {
         let (failure, argument) = match error {
             ImageError::Magic => (code::MALFORMED_IMAGE, image_argument::MAGIC),
@@ -81,7 +107,7 @@ pub fn admit<'a>(bytes: &'a [u8], state: &mut [i32]) -> Result<Unit<'a>, Diagnos
         };
         Diagnostic::at(failure, Severity::Error, 0).with(argument)
     })?;
-    verify(&unit, state)?;
+    verify_with(&unit, state, refused)?;
     Ok(unit)
 }
 
@@ -91,6 +117,7 @@ fn verify_function(
     function: &crate::bytecode::Function,
     code_bytes: &[u8],
     state: &mut [i32],
+    refused: &[Refused],
 ) -> Result<(), Diagnostic> {
     let constant_count = unit.header().constant_count;
     let length = u32::try_from(code_bytes.len()).unwrap_or(u32::MAX);
@@ -112,6 +139,16 @@ fn verify_function(
         })?;
         if let Some(slot) = state.get_mut(offset as usize) {
             *slot = UNVISITED;
+        }
+        if let Some((_, feature)) = refused
+            .iter()
+            .find(|(opcode, _)| *opcode == instruction.opcode)
+        {
+            return Err(
+                Diagnostic::at(code::IMAGE_NOT_ADMITTED, Severity::Error, offset)
+                    .with(*feature)
+                    .with(index),
+            );
         }
 
         let signature = instruction.opcode.signature();

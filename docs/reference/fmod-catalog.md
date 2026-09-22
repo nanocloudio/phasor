@@ -75,7 +75,7 @@ Every fmod's work is bounded per step and its state carries the rest.
 |---|---|
 | `phasor_compile` | source bytes staged per step, syntax nodes, constants, code bytes |
 | `phasor_link` | modules in a closure, bytes of stream and closure |
-| `phasor_isolate` | `steps` a program may run and `call_wait` steps before an unanswered call times out, both parameters clamped to the compiled-in ceiling; instructions per slice, jobs per slice, collection slice, calls in flight, bindings admitted, resources held open at once, and bytes of payload behind the calls of one step or one answer, all compiled in |
+| `phasor_isolate` | `steps` a program may run and `call_wait` steps before an unanswered call times out, both parameters clamped to the compiled-in ceiling; instructions per slice, jobs per slice, collection slice, calls in flight, bindings admitted, resources held open at once, and bytes of payload behind the calls of one step or one answer, all compiled in, in one of two storage profiles the silicon selects: an application-class target takes the arena and tables a deployed program needs, RP2350 takes ones that share its 240 KiB module-state arena, and the `embedded` variant selects the latter on any silicon. The `lean` variant leaves `JSON` and `RegExp` out and refuses an image that carries a regular expression literal when it is admitted. The language, the bytecode format and the feature digest are the same in every build, so one image is admitted by all of them |
 | `phasor_host_router` | calls in flight, frames staged per output, bytes of payload behind one frame |
 | `phasor_fault_host`, `phasor_time`, `phasor_entropy` | replies staged, and the quota an adapter was given |
 | `phasor_cli` | bytes of result and of rendered text |

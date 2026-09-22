@@ -201,6 +201,7 @@ the first argument is the function index unless the table says otherwise.
 | `0x0417` | `image-not-admitted` | error | image feature |
 | `0x0418` | `feature-list-mismatch` | error | image failure |
 | `0x0419` | `binding-not-granted` | error | none |
+| `0x041A` | `image-too-large` | error | admitted maximum |
 
 `verifier-storage-too-small` is fatal because verification did not finish, and a
 partial result would say nothing about the rest of the image.
@@ -209,19 +210,24 @@ Enumerated arguments:
 
 - image failure: `0` magic, `1` format digest, `2` truncated, `3` overflow,
   `4` feature digest.
-- image feature: `0` BigInt (retired with its code).
+- image feature: `0` BigInt (kept for the number; every build runs it),
+  `1` a regular expression literal.
 
 `feature-list-mismatch` means the image was compiled against a different
-admitted language. The encoding may match exactly; the semantics behind it do
-not, so the image is refused rather than reinterpreted.
+language. The encoding may match exactly; the semantics behind it do not, so
+the image is refused rather than reinterpreted.
 
-`image-not-admitted` is retired: it named a construct the machine could not
-run, refused when the image was admitted rather than when the construct was
-reached. Every construct the admitted feature list names runs, so no path
-raises it, and the number is kept rather than reassigned (§8).
-`lowering-not-admitted` is the same rule at the front end: source the lowering
-cannot express is refused where it is written, so a program either compiles
-whole or not at all.
+`image-not-admitted` names a construct the build cannot run, refused when the
+image is admitted rather than when the construct is reached. A full build
+raises it for nothing: every construct the feature list names runs there. A
+`lean` build of the isolate has no regular expression engine, and raises it
+for an image that carries a regular expression literal, with the function
+index as the second argument. `lowering-not-admitted` is the same rule at the
+front end: source the lowering cannot express is refused where it is written,
+so a program either compiles whole or not at all.
+
+`image-too-large` is the isolate's: the image is longer than the storage
+profile stages, and the argument is the length it does stage.
 
 ## 6a. Termination codes
 

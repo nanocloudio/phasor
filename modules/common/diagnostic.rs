@@ -108,12 +108,21 @@ pub mod code {
     pub const FEATURE_LIST_MISMATCH: u16 = 0x0418;
     /// The image states it requires a binding the deployment did not grant.
     pub const BINDING_NOT_GRANTED: u16 = 0x0419;
+    /// The image is longer than this build stages. Reported with the bytes
+    /// this build holds, which is what the program's author needs to know.
+    pub const IMAGE_TOO_LARGE: u16 = 0x041A;
 }
 
-/// Enumerated `image feature` argument values of the retired
-/// `image-not-admitted` code, kept so the number is never reassigned.
+/// Enumerated `image feature` argument values of `image-not-admitted`: the
+/// construct a build cannot run, named when the image is admitted.
 pub mod image_feature {
+    /// Named for the number only: every build runs BigInt, so no path raises
+    /// it. A number is never reassigned.
     pub const BIG_INT: u32 = 0;
+    /// A regular expression literal, in a build that leaves the regular
+    /// expression engine out. Refused when the image is admitted, because a
+    /// `CreateRegExp` this build cannot run is knowable before anything runs.
+    pub const REGEXP: u32 = 1;
 }
 
 /// Why a task stopped without producing a value, `0x0500`-`0x05FF`.
@@ -231,6 +240,7 @@ pub fn name_of(value: u16) -> Option<&'static [u8]> {
         code::IMAGE_NOT_ADMITTED => b"image-not-admitted",
         code::FEATURE_LIST_MISMATCH => b"feature-list-mismatch",
         code::BINDING_NOT_GRANTED => b"binding-not-granted",
+        code::IMAGE_TOO_LARGE => b"image-too-large",
         termination::FUEL_EXHAUSTED => b"fuel-exhausted",
         termination::QUOTA_EXCEEDED => b"quota-exceeded",
         termination::CANCELLED => b"cancelled",

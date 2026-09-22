@@ -5,6 +5,11 @@
 //! no built-in functions, and no host objects, because those are either not
 //! implemented or belong to a capability rather than to the language.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "the omit flags belong to the variants of the modules that can leave a library area out; a module that declares no variant receives no matching --check-cfg, and for it every flag is absent, which is the whole language"
+)]
+
 use crate::env;
 use crate::heap::Heap;
 use crate::object::{self, attribute, Descriptor, ObjectError};
@@ -29,6 +34,7 @@ mod functions;
 #[path = "realm/iterators.rs"]
 mod iterators;
 #[path = "realm/json.rs"]
+#[cfg(not(feature = "omit_json"))]
 mod json;
 #[path = "realm/math.rs"]
 mod math;
@@ -55,6 +61,7 @@ use date::*;
 use errors::*;
 use functions::*;
 use iterators::*;
+#[cfg(not(feature = "omit_json"))]
 use json::*;
 use math::*;
 use numbers::*;
@@ -691,7 +698,9 @@ pub struct Realm {
     pub symbol_prototype: Handle,
     /// `BigInt.prototype`.
     pub big_int_prototype: Handle,
-    /// `RegExp.prototype`.
+    /// `RegExp.prototype`. A build without the regular expression engine
+    /// has no `RegExp` at all, so it has no prototype to hold.
+    #[cfg(not(feature = "omit_regexp"))]
     pub regexp_prototype: Handle,
     /// The prototype every iterator this engine makes shares.
     pub iterator_prototype: Handle,
@@ -867,7 +876,8 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
         async_generator_object: async_generator_object_prototype,
         async_function: async_function_prototype,
         big_int: big_int_prototype,
-        regexp: regexp_prototype,
+        #[cfg(not(feature = "omit_regexp"))]
+            regexp: regexp_prototype,
     } = build_functions(
         heap,
         atoms,
@@ -971,6 +981,7 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
         object_prototype,
         symbols,
     )?;
+    #[cfg(not(feature = "omit_json"))]
     build_json(
         heap,
         atoms,
@@ -1012,6 +1023,7 @@ pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, Objec
         boolean_prototype,
         symbol_prototype,
         big_int_prototype,
+        #[cfg(not(feature = "omit_regexp"))]
         regexp_prototype,
         iterator_prototype,
         generator_function_prototype,

@@ -21,6 +21,19 @@ targets = ["rp2350", "bcm2712", "wasm"]
 forbid_inline_tests = ["modules"]
 mode                = "strict"
 
+# Every PIC module mounts the whole of the Fluxor ABI surface through
+# `include!` and consumes a subset of it, so each crate root carries one
+# `#![allow(dead_code, unused_imports, unreachable_patterns)]` with that
+# reason: an `#[expect]` at every unused item of a surface this project does
+# not own would say less and change more often. Fluxor's own `fluxor.toml`
+# carries the same row for the same cause.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/"
+reason = """PIC modules mount the whole of the Fluxor ABI surface via include! \
+and consume a subset, so every module's compile sees items it does not use. \
+The unreachable_patterns arms are defensive branches over ABI enums this \
+project does not define."""
+
 # This glob is also the CI materialisation guard: a primary-only checkout has
 # no matching script, and the no-vacuous-phase rule fails the gate explicitly.
 [ci.test]

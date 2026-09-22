@@ -1,14 +1,19 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712", "wasm"]
+# Not rp2040: its whole module-state arena is 64 KiB, and the realm a
+# program starts with takes 69,240 bytes of heap before a line of it runs.
+hardware_targets = ["bcm2712", "wasm", "rp2350"]
 
 # One input stream ending in HUP is one unit image, wherever it was compiled.
 # The buffer holds a whole image: a payload larger than one buffer stalls the
 # writer against a reader that is only stepped on events, and the pair hangs.
+# Sized with the image the storage profile stages, so on RP2350 it is the
+# 2 KiB that profile holds rather than the 64 KiB an application-class
+# target does -- which would be that part's entire buffer arena.
 [[ports]]
 name         = "image_in"
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = 65536
+buffer_size  = { default = 65536, rp2350 = 2048 }
 
 # Completion frames answering the calls this isolate made, each followed by
 # the bytes it answers with.
@@ -17,7 +22,38 @@ name         = "completion_in"
 index        = 1
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = 8192
+buffer_size  = { default = 8192, rp2350 = 4096 }
+
+# What a build may be that the default is not. A flag names something left
+# out or sized down, and the default declares none, so the unsuffixed fmod is
+# the whole engine at the size the silicon selects.
+#
+# `lean` leaves out the two library areas reached only through their own
+# natives: `JSON`, and `RegExp` with the engine behind it. Neither global is
+# in the realm, which a program observes the way it observes any host
+# without them. The feature digest does not change -- the language did not
+# -- so one image is admitted by a full build and a lean one alike; what a
+# lean build cannot run, a regular expression literal, it refuses when the
+# image is admitted rather than when the literal is reached. Proxy, typed
+# arrays and Date are not flags: each is reached through the object model,
+# where every property read asks whether its target is one, so leaving one
+# out is a stub at each of those sites rather than an omission.
+#
+# `embedded` selects the storage profile RP2350 selects for itself, on any
+# silicon, so that the numbers a Cortex-M deployment runs under are run on
+# Linux by a lane every time.
+[[variant]]
+name     = "full"
+features = []
+default  = true
+
+[[variant]]
+name     = "lean"
+features = ["omit_json", "omit_regexp"]
+
+[[variant]]
+name     = "embedded"
+features = ["profile_embedded"]
 
 # Task control: cancellation, the deadline, and the reported time, as small
 # fixed records. A graph that wires nothing here runs tasks to their budgets.
@@ -42,7 +78,7 @@ name         = "call_out"
 index        = 1
 direction    = "output"
 content_type = "OctetStream"
-buffer_size  = 8192
+buffer_size  = { default = 8192, rp2350 = 4096 }
 
 # Why a run produced no value: a termination, a rejection, or an image that
 # could not be admitted. Numbers, not words.

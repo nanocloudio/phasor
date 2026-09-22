@@ -1,5 +1,10 @@
 //! The primitive prototypes, the generator and async function prototypes, RegExp, and BigInt.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "the omit flags belong to the variants of the modules that can leave a library area out; a module that declares no variant receives no matching --check-cfg, and for it every flag is absent, which is the whole language"
+)]
+
 use super::*;
 
 /// The prototypes `build_functions` creates, which the realm keeps and the
@@ -16,6 +21,7 @@ pub(super) struct Prototypes {
     pub async_generator_object: Handle,
     pub async_function: Handle,
     pub big_int: Handle,
+    #[cfg(not(feature = "omit_regexp"))]
     pub regexp: Handle,
 }
 
@@ -127,23 +133,30 @@ pub(super) fn build_functions(
         function_prototype,
     )?;
     let big_int_prototype = object::create(heap, Value::object(object_prototype))?;
-    let regexp_prototype = object::create(heap, Value::object(object_prototype))?;
-    object::reserve(heap, regexp_prototype, 6)?;
-    constructor(
-        heap,
-        atoms,
-        global,
-        b"RegExp",
-        native::REG_EXP,
-        regexp_prototype,
-        function_prototype,
-    )?;
-    let entries = [
-        Entry::Method(b"exec", native::REG_EXP_EXEC),
-        Entry::Method(b"test", native::REG_EXP_TEST),
-        Entry::Method(b"toString", native::REG_EXP_TO_STRING),
-    ];
-    install(heap, atoms, regexp_prototype, function_prototype, &entries)?;
+    // A build without the regular expression engine defines no `RegExp`: the
+    // global is absent, as `JSON` is absent from a build without it, and a
+    // program finds out the way it finds out about any host object.
+    #[cfg(not(feature = "omit_regexp"))]
+    let regexp_prototype = {
+        let regexp_prototype = object::create(heap, Value::object(object_prototype))?;
+        object::reserve(heap, regexp_prototype, 6)?;
+        constructor(
+            heap,
+            atoms,
+            global,
+            b"RegExp",
+            native::REG_EXP,
+            regexp_prototype,
+            function_prototype,
+        )?;
+        let entries = [
+            Entry::Method(b"exec", native::REG_EXP_EXEC),
+            Entry::Method(b"test", native::REG_EXP_TEST),
+            Entry::Method(b"toString", native::REG_EXP_TO_STRING),
+        ];
+        install(heap, atoms, regexp_prototype, function_prototype, &entries)?;
+        regexp_prototype
+    };
 
     // `BigInt` is callable but not constructible: there is no wrapper to make
     // with `new`, only the conversion.
@@ -189,6 +202,7 @@ pub(super) fn build_functions(
         async_generator_object: async_generator_object_prototype,
         async_function: async_function_prototype,
         big_int: big_int_prototype,
+        #[cfg(not(feature = "omit_regexp"))]
         regexp: regexp_prototype,
     })
 }

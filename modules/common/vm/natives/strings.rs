@@ -1,5 +1,10 @@
 //! The natives of `String` and `String.prototype`.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "the omit flags belong to the variants of the modules that can leave a library area out; a module that declares no variant receives no matching --check-cfg, and for it every flag is absent, which is the whole language"
+)]
+
 use super::*;
 
 impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
@@ -201,6 +206,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 }
                 Ok(Value::string(result))
             }
+            #[cfg(not(feature = "omit_regexp"))]
             native::STRING_REPLACE
                 if first.is_object()
                     && object::regexp_program(self.heap, first.as_handle())
@@ -209,6 +215,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             {
                 self.replace_with_pattern(text, first, second)
             }
+            #[cfg(not(feature = "omit_regexp"))]
             native::STRING_SPLIT
                 if first.is_object()
                     && object::regexp_program(self.heap, first.as_handle())

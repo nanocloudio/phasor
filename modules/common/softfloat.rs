@@ -561,6 +561,14 @@ fn shift_significand(significand: u64, exponent: i32) -> u64 {
 mod arm {
     use super::{add, compare, div, from_i64, from_u64, mul, rem, sub, to_i64};
 
+    // `__clzsi2` and `__aeabi_uldivmod` are not defined here. Both are the
+    // SDK's, in `runtime/intrinsics.rs`, and an EABI symbol has one owner: a
+    // second definition is a duplicate at link, not a fallback. The property
+    // a division intrinsic owes a module that handles secrets — a fixed
+    // sixty-four iterations whatever the operands, so its time says nothing
+    // about the values — is the SDK's to hold, and Fluxor's harness holds it
+    // to that in `tests/harness/tests/eabi_divide.rs`.
+
     #[no_mangle]
     pub extern "C" fn __aeabi_dadd(left: f64, right: f64) -> f64 {
         add(left, right)

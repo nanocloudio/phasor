@@ -13,6 +13,11 @@
 //! collection slice come from it, and a host that admits against a policy
 //! runs under the same numbers it admitted.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "the omit flags belong to the variants of the modules that can leave a library area out; a module that declares no variant receives no matching --check-cfg, and for it every flag is absent, which is the whole language"
+)]
+
 use core::ffi::c_void;
 
 use crate::binding::{Binding, Bindings, CallRecord, Pending};
@@ -79,9 +84,20 @@ macro_rules! agent_storage {
             registers: &mut $s.registers,
             roots: &mut $s.roots,
             jobs: &mut $s.jobs,
+            #[cfg(not(feature = "omit_regexp"))]
             choices: &mut $s.choices,
+            #[cfg(not(feature = "omit_regexp"))]
             undo: &mut $s.undo,
+            #[cfg(not(feature = "omit_regexp"))]
             subject: &mut $s.subject,
+            // No engine to match with, so no storage to match in: a host
+            // built without regular expressions declares none of these.
+            #[cfg(feature = "omit_regexp")]
+            choices: &mut [],
+            #[cfg(feature = "omit_regexp")]
+            undo: &mut [],
+            #[cfg(feature = "omit_regexp")]
+            subject: &mut [],
             descriptors: &mut $s.descriptors,
             pending: &mut $s.pending,
             outbox: &mut $s.outbox,
@@ -279,7 +295,12 @@ fn run<'a, 'u, R>(
         realm,
         metering.policy.fuel,
     );
+    #[cfg(not(feature = "omit_regexp"))]
     machine.attach_regexp(choices, undo, subject);
+    // Without the engine there is nothing to attach them to. The slices are
+    // the empty ones the storage macro supplies on such a build.
+    #[cfg(feature = "omit_regexp")]
+    let _ = (choices, undo, subject);
     machine.attach_jobs(queue);
     machine.attach_bindings(bindings, outbox);
     if let Some(payloads) = payloads {

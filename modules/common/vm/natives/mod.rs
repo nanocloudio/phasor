@@ -1,6 +1,11 @@
 //! The functions the engine implements itself: the entry that routes a
 //! native id to its area, and the promise combinators.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "the omit flags belong to the variants of the modules that can leave a library area out; a module that declares no variant receives no matching --check-cfg, and for it every flag is absent, which is the whole language"
+)]
+
 use super::*;
 #[path = "arrays.rs"]
 mod arrays;
@@ -19,6 +24,7 @@ mod objects;
 #[path = "reflect.rs"]
 mod reflect;
 #[path = "regexps.rs"]
+#[cfg(not(feature = "omit_regexp"))]
 mod regexps;
 #[path = "strings.rs"]
 mod strings;
@@ -34,6 +40,7 @@ use math::*;
 use numbers::*;
 use objects::*;
 use reflect::*;
+#[cfg(not(feature = "omit_regexp"))]
 use regexps::*;
 use strings::*;
 use symbols::*;
@@ -943,11 +950,13 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 let fraction = crate::softfloat::from_u64(mixed >> 11) / 9_007_199_254_740_992.0;
                 Ok(Value::number(fraction))
             }
+            #[cfg(not(feature = "omit_json"))]
             native::JSON_PARSE => {
                 let text = arguments.first().copied().unwrap_or(Value::UNDEFINED);
                 let reviver = arguments.get(1).copied().unwrap_or(Value::UNDEFINED);
                 self.json_parse(text, reviver)
             }
+            #[cfg(not(feature = "omit_json"))]
             native::JSON_STRINGIFY => {
                 let value = arguments.first().copied().unwrap_or(Value::UNDEFINED);
                 let replacer = arguments.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -1231,7 +1240,20 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             | native::REG_EXP_TEST
             | native::REG_EXP_TO_STRING
             | native::STRING_MATCH
-            | native::STRING_SEARCH => self.regexp_native(id, this, arguments),
+            | native::STRING_SEARCH => {
+                #[cfg(not(feature = "omit_regexp"))]
+                {
+                    self.regexp_native(id, this, arguments)
+                }
+                // `match` and `search` are the reachable ones here: with no
+                // `RegExp` in the realm, nothing else on this list has an
+                // object to be called on. A string argument would have been
+                // compiled into a pattern; without the engine it is refused.
+                #[cfg(feature = "omit_regexp")]
+                {
+                    Err(self.throw_type_error())
+                }
+            }
             id if id >= native::BINDING_BASE => {
                 self.host_call(id - native::BINDING_BASE, arguments)
             }

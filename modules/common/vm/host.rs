@@ -10,6 +10,17 @@ pub(super) const MAX_ARGUMENTS: usize = 16;
 /// draws the same sequence every run.
 pub(super) const RANDOM_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Collections in a row that may end with the heap still under pressure
+/// before the task ends as `HeapExhausted`.
+///
+/// Pressure is the heap being within its headroom of full. One collection
+/// that does not relieve it is a live set that has grown into the headroom;
+/// a program can do that on its way to freeing something. This many in a
+/// row is a program whose live set stays there, and every further
+/// collection would reclaim what one allocation takes back. Eight bounds
+/// the cost of finding that out at eight collections, on any arena.
+const PRESSED_COLLECTIONS: u32 = 8;
+
 impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// Grant the machine its bindings and somewhere to put the call records a
     /// program produces.
@@ -517,17 +528,40 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// that makes a collection necessary pays for it.
     pub(super) fn maybe_collect(&mut self) -> Option<Completion> {
         self.roots_storage.as_ref()?;
-        // A heap runs out of two things: the arena and the handle table. A
-        // program that makes many small cells — a call's environment, say —
-        // exhausts the table long before the bytes, so both are watched.
-        let slots = self.heap.slot_capacity();
-        let slot_headroom = (slots / 8).max(16);
-        let pressed =
-            self.heap.free() < self.collection_headroom || self.heap.free_slots() < slot_headroom;
-        if !pressed {
+        if !self.pressed() {
+            self.pressed_collections = 0;
             return None;
         }
-        self.collect_now()
+        if let Some(outcome) = self.collect_now() {
+            return Some(outcome);
+        }
+        if !self.pressed() {
+            self.pressed_collections = 0;
+            return None;
+        }
+        // The collection ran and the heap is still under pressure: what is
+        // live is what is live. Left alone, the next allocation would press
+        // again and collect again, and a program whose live set has grown to
+        // within the headroom of its arena would spend the rest of its fuel
+        // collecting a few bytes at a time and end as `FuelExhausted` — the
+        // wrong answer, and on a small arena an expensive one. A few in a row
+        // is a program passing through the headroom; more is one living
+        // there, and that is a full heap.
+        self.pressed_collections = self.pressed_collections.saturating_add(1);
+        if self.pressed_collections > PRESSED_COLLECTIONS {
+            return Some(Completion::HEAP_EXHAUSTED);
+        }
+        None
+    }
+
+    /// Whether the heap is low enough to collect. A heap runs out of two
+    /// things: the arena and the handle table. A program that makes many
+    /// small cells — a call's environment, say — exhausts the table long
+    /// before the bytes, so both are watched.
+    fn pressed(&self) -> bool {
+        let slots = self.heap.slot_capacity();
+        let slot_headroom = (slots / 8).max(16);
+        self.heap.free() < self.collection_headroom || self.heap.free_slots() < slot_headroom
     }
 
     /// Collect immediately, whatever the pressure heuristic says.

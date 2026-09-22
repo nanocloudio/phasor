@@ -187,6 +187,11 @@ carries `source`, `flags`, `lastIndex`, and one boolean per flag.
 and `split`. A `$` in a replacement names part of the match: `$&`, `` $` ``,
 `$'`, `$$`, and `$1` to `$99`.
 
+A `lean` build of the isolate carries neither `RegExp` nor `JSON`. Both
+globals are absent, `match` and `search` throw `TypeError`, and an image with
+a regular expression literal is refused when it is admitted. `replace` and
+`split` still take a string.
+
 ## 8. Dynamic source
 
 `eval` and the `Function` constructor go through the same compiler, verifier,
