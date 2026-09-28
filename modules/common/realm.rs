@@ -11,10 +11,13 @@
 )]
 
 use crate::env;
+// The runtime's name table, declared at the crate root by `include!` and named
+// here for the macro that expands to it.
 use crate::heap::Heap;
 use crate::object::{self, attribute, Descriptor, ObjectError};
 use crate::string::{Atoms, Key};
 use crate::value::{Handle, Value};
+use crate::{name_table_len, NameTable};
 
 // One realm across these files: each child builds one family of intrinsics
 // at the point `create` calls it, so the order of every definition — and
@@ -648,20 +651,28 @@ impl ErrorKind {
     }
 
     /// The name the specification gives this kind.
-    pub const fn name(self) -> &'static [u8] {
-        match self {
-            Self::Error => b"Error",
-            Self::Type => b"TypeError",
-            Self::Range => b"RangeError",
-            Self::Reference => b"ReferenceError",
-            Self::Syntax => b"SyntaxError",
-            Self::Eval => b"EvalError",
-            Self::Uri => b"URIError",
-            Self::Suppressed => b"SuppressedError",
-            Self::Aggregate => b"AggregateError",
-        }
+    pub fn name(self) -> &'static [u8] {
+        ERROR_NAMES.get(self as usize)
     }
 }
+
+// Held as one run of bytes with integer ends, in the order of the enum. A
+// `match` returning the literals is a table of their addresses on 32-bit Arm,
+// and a module image is placed at a load-time address with nothing relocating
+// it, so each entry would read the wrong place at run time.
+name_table!(
+    ERROR_NAMES = [
+        b"Error",
+        b"TypeError",
+        b"RangeError",
+        b"ReferenceError",
+        b"SyntaxError",
+        b"EvalError",
+        b"URIError",
+        b"SuppressedError",
+        b"AggregateError",
+    ]
+);
 
 /// A created realm.
 #[derive(Clone, Copy, Debug)]
