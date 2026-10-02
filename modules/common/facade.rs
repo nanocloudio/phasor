@@ -719,7 +719,9 @@ pub const SOURCE: &[u8] =
       }).then(function (status) {
         return http.headers(handle).then(function (block) {
           return drain(handle, "").then(function (body) {
-            return http.close(handle).then(function () {
+            const closing = handle;
+            handle = null;
+            return http.close(closing).then(function () {
               return new G.Response(body, {
                 status: status,
                 headers: parseFields(G.__bytesToText(block)),
@@ -728,6 +730,16 @@ pub const SOURCE: &[u8] =
             });
           });
         });
+      }).then(function (response) { return response; }, function (error) {
+        // A request that failed after it was sent still holds the adapter's
+        // one response until it is closed, and every later fetch would be
+        // refused as busy behind it. Closed here, whatever the close says,
+        // and the failure is the program's to see.
+        if (handle === null) throw error;
+        const closing = handle;
+        handle = null;
+        const rethrow = function () { throw error; };
+        return http.close(closing).then(rethrow, rethrow);
       });
     };
   }

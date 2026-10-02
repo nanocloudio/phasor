@@ -1,6 +1,7 @@
 version          = "0.0.1"
-# `wasm` joined `bcm2712` when the browser became a provider: the browser serves HTTP as `fetch`, and `wasm_browser_http` takes this
-# adapter's own `publish_out` records on `publish_in`,
+# `wasm` joined `bcm2712` when the browser became a provider: the browser
+# serves HTTP as `fetch`, and `wasm_browser_http` takes this adapter's own
+# `publish_out` records on `request_in`,
 # so nothing here is target-conditional and the wasm graph is the Linux
 # one with a different module named in one place.
 hardware_targets = ["bcm2712", "wasm"]
@@ -12,22 +13,28 @@ direction    = "input"
 content_type = "OctetStream"
 buffer_size  = 16384
 
-# The head of a response: an exchange `Reply` carrying the status and the
-# header block, which arrives before the body it describes.
+# The answers to a request sent down `publish_out`: exchange response
+# records, a HEAD with the status, the content type and the header block, then
+# the body in BODY records as far as this adapter's credit reaches. Framed, so
+# each is read whole.
 [[ports]]
-name         = "reply_in"
+name         = "response_in"
 index        = 1
 direction    = "input"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
 buffer_size  = 16384
+max_record   = 8192
 
-# The body, in length-framed chunks ended by a zero-length one.
+# The same, for a request sent down `plain_out`. A leg of its own rather than
+# a second edge into `response_in`: a framed edge is a mailbox, and one reader
+# behind two of them would be reading two channels through one port.
 [[ports]]
-name         = "body_in"
+name         = "plain_in"
 index        = 2
 direction    = "input"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
 buffer_size  = 16384
+max_record   = 8192
 
 # Completion frames, each followed by the bytes it answers with.
 [[ports]]
@@ -36,25 +43,27 @@ direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 16384
 
-# The request, as an exchange `Publish`, on the leg its scheme picked. Where
-# either leg goes is the graph's to say: this adapter names no host and opens
-# no socket. `publish_out` carries `https`, and the graph wires it through a
-# transport that authenticates the authority; `plain_out` carries `http`
-# straight to the socket. A scheme whose leg the graph left unwired is
-# refused rather than sent down the other one.
+# The request, as one exchange request HEAD naming its authority in a `host`
+# field, on the leg its scheme picked. Where either leg goes is the graph's to
+# say: this adapter names no host and opens no socket. `publish_out` carries
+# `https`, and the graph wires it through a transport that authenticates the
+# authority; `plain_out` carries `http` straight to the socket. A scheme whose
+# leg the graph left unwired is refused rather than sent down the other one.
 [[ports]]
 name         = "publish_out"
 index        = 1
 direction    = "output"
-content_type = "OctetStream"
+content_type = "ExchangeRequest"
 buffer_size  = 16384
+max_record   = 8192
 
 [[ports]]
 name         = "plain_out"
 index        = 2
 direction    = "output"
-content_type = "OctetStream"
+content_type = "ExchangeRequest"
 buffer_size  = 16384
+max_record   = 8192
 
 [observability]
 exempt = "adapter whose evidence is the completions it emits"

@@ -77,14 +77,15 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use abi::contracts::exchange;
-
-// The records this adapter composes and reads are fluxor's `http_exchange`
-// contract, already carried by the `abi` mount above. Every connector that
+// The records this adapter composes and reads are fluxor's `exchange`
+// contract, already carried by the `abi` mount above. Every provider that
 // performs the request reads the same definition, so an offset written here
 // could not disagree with one written there -- because neither end writes
 // one.
-use abi::contracts::net::http_exchange as wire_http;
+use abi::contracts::exchange::{
+    self, flag, header_lines, kind, link, parse_response, write_abort, write_credit,
+    write_request_head, ExchangeId, Record, RequestHead, HDR, RECORD_MAX,
+};
 // The authority a request names is parsed by the stream contract's own
 // reader, so what this module admits is exactly what a provider can dial:
 // a name, a dotted quad, or a bracketed v6 literal, with a port or without.
@@ -95,16 +96,19 @@ use binding::{
 
 /// Bytes one call or completion may carry.
 const PAYLOAD_BYTES: usize = 8 * 1024;
-/// Bytes of a response body held before the provider is made to wait.
+/// Bytes of a response body held before the provider is made to wait. It is
+/// also the credit a request opens with: the provider never sends past what
+/// is granted, and what is granted is never more than there is room for.
 const BODY_BYTES: usize = 32 * 1024;
 /// The response head: a status and the block of fields that came with it.
 const HEAD_BYTES: usize = 4 * 1024;
 /// Completions staged for the reply port.
 const STAGE_BYTES: usize = 2 * (COMPLETION_FRAME + PAYLOAD_BYTES);
-/// One publish frame, staged for the provider.
-const PUBLISH_BYTES: usize = 3 + exchange::PUBLISH_FRAME_MAX;
-/// The largest frame this adapter reads in one piece from either input.
-const FRAME_BYTES: usize = 16 * 1024;
+/// A CREDIT or ABORT record, the largest control record this adapter writes.
+const CONTROL_BYTES: usize = HDR + 4;
+/// The longest authority a provider dials: what fits a `host` field the
+/// provider will carry.
+const AUTHORITY_MAX: usize = 255;
 /// Calls this adapter may hold while it waits.
 const PENDING: usize = 4;
 
@@ -138,8 +142,15 @@ struct Response {
     headers_length: usize,
     body: [u8; BODY_BYTES],
     filled: usize,
-    /// Whether the body's last chunk has come.
+    /// Whether the body's last record has come.
     complete: bool,
+    /// Whether the provider gave the exchange up after its head: what has
+    /// arrived is all there will be, and it is not the whole body.
+    aborted: bool,
+    /// The status the provider raised itself, in place of an answer: no
+    /// peer answered, so there is no response to read, only a failure to
+    /// report. Zero when the provider raised nothing.
+    raised: u16,
 }
 
 impl Response {
@@ -152,6 +163,8 @@ impl Response {
         body: [0; BODY_BYTES],
         filled: 0,
         complete: false,
+        aborted: false,
+        raised: 0,
     };
 }
 
@@ -180,14 +193,16 @@ struct State {
     syscalls: *const SyscallTable,
     announced: bool,
     request_in: i32,
-    reply_in: i32,
-    body_in: i32,
+    /// The answers from the provider behind `publish_out`.
+    response_in: i32,
+    /// The answers from the provider behind `plain_out`.
+    plain_in: i32,
     reply_out: i32,
     publish_out: i32,
     plain_out: i32,
-    /// The output the staged record goes to: whichever leg the request's
-    /// scheme picked.
-    publish_port: i32,
+    /// The output the exchange in flight went to: whichever leg the
+    /// request's scheme picked. Its control records follow it there.
+    exchange_port: i32,
 
     call: [u8; CALL_FRAME],
     call_filled: usize,
@@ -198,14 +213,24 @@ struct State {
     staged: usize,
     written: usize,
 
-    publish: [u8; PUBLISH_BYTES],
-    publish_staged: usize,
-    publish_written: usize,
-
-    frame: [u8; FRAME_BYTES],
-    frame_filled: usize,
-    body_frame: [u8; FRAME_BYTES],
-    body_filled: usize,
+    /// The request HEAD, held here until the provider's port takes it.
+    outbound: [u8; RECORD_MAX],
+    outbound_box: ExchangeOutbox,
+    /// A CREDIT or ABORT, behind the HEAD on the same port.
+    control: [u8; CONTROL_BYTES],
+    control_box: ExchangeOutbox,
+    /// Body bytes the program has read and the provider has not yet been
+    /// told it may send again.
+    credit_owed: u32,
+    /// Whether a program closed an exchange before its response ended, which
+    /// the provider is told to give up so it is free for the next. Plain
+    /// fields rather than an `Option`: the state block starts as zeroes, and
+    /// zero is `false` where it need not be `None`.
+    abort_owed: bool,
+    abort_id: ExchangeId,
+    abort_port: i32,
+    /// The port the held control record goes to.
+    control_port: i32,
 
     response: Response,
     held: [Held; PENDING],
@@ -362,10 +387,19 @@ fn granted(list: &[u8], authority: &[u8]) -> bool {
 /// The table is the contract's; only the shape of the answer is this
 /// adapter's, which wants absence rather than a sentinel.
 fn verb_of(name: &[u8]) -> Option<u8> {
-    match wire_http::method_from_token(name) {
-        wire_http::METHOD_NONE => None,
+    match exchange::method_from_token(name) {
+        exchange::METHOD_NONE => None,
         verb => Some(verb),
     }
+}
+
+/// Whether an authority can travel as a `host` field: something, not too
+/// long for the provider to dial, and visible ASCII throughout, so it cannot
+/// end the field it is written into.
+fn authority_ok(authority: &[u8]) -> bool {
+    !authority.is_empty()
+        && authority.len() <= AUTHORITY_MAX
+        && authority.iter().all(|&c| c > 0x20 && c < 0x7F)
 }
 
 /// Stage one completion, with the bytes it answers with behind it.
@@ -443,7 +477,12 @@ fn serve_held(state: &mut State) {
         match held.method {
             METHOD_STATUS | METHOD_HEADERS if state.response.head => {
                 state.held[index] = Held::EMPTY;
-                if held.method == METHOD_STATUS {
+                if state.response.status == 0 {
+                    // Given up before a head came: there is no status to
+                    // read, and the response that would have had one is not
+                    // coming.
+                    refuse(state, held.request, held.trace, failure(state));
+                } else if held.method == METHOD_STATUS {
                     let status = softfloat::from_u64(u64::from(state.response.status));
                     fulfil(state, held.request, held.trace, Answer::Number(status), &[]);
                 } else {
@@ -464,6 +503,13 @@ fn serve_held(state: &mut State) {
                 continue;
             }
             METHOD_READ => {
+                if state.response.filled == 0 && state.response.aborted {
+                    // Drained, and the rest is never coming: answering with
+                    // nothing would tell the reader the body was whole.
+                    state.held[index] = Held::EMPTY;
+                    refuse(state, held.request, held.trace, failure(state));
+                    continue;
+                }
                 if state.response.filled == 0 && !state.response.complete {
                     index += 1;
                     continue;
@@ -484,6 +530,12 @@ fn serve_held(state: &mut State) {
                     at += 1;
                 }
                 state.response.filled = rest;
+                // The room just made is room the provider may fill.
+                if !state.response.complete {
+                    state.credit_owed = state
+                        .credit_owed
+                        .saturating_add(u32::try_from(taken).unwrap_or(0));
+                }
                 fulfil(
                     state,
                     held.request,
@@ -499,15 +551,15 @@ fn serve_held(state: &mut State) {
     }
 }
 
-// Both legs answer on the one `reply_in`/`body_in` pair. That is safe because
-// one request is in flight at a time and only the leg it was sent down has
-// anything to say: a reply carries the correlation this module chose, and a
-// body chunk can only follow a reply. A second pair per leg would be a
-// second copy of the same reader, told apart by nothing.
+// Each leg answers on an input of its own. Exchange records are framed, so
+// each edge is a mailbox a reader takes whole records from, and two writers
+// into one would be two mailboxes behind one port. Only the leg a request
+// went down has anything to say, and every record carries the exchange id
+// this module chose, so both are read by the same reader.
 entry! {
     State;
     primary { request_in, reply_out }
-    inputs { reply_in = 1, body_in = 2 }
+    inputs { response_in = 1, plain_in = 2 }
     outputs { publish_out = 1, plain_out = 2 }
     params apply_params
 }
@@ -618,7 +670,11 @@ fn serve(state: &mut State, record: &CallRecord) {
         }
         // One request is in flight at a time, because one is what the surface
         // behind this carries.
-        if state.response.live || state.publish_staged != 0 {
+        if state.response.live
+            || state.outbound_box.holding()
+            || state.control_box.holding()
+            || state.abort_owed
+        {
             refuse(state, record.request, record.trace, Cause::Busy);
             return;
         }
@@ -633,9 +689,7 @@ fn serve(state: &mut State, record: &CallRecord) {
         let body = if taken > 5 { parts[5] } else { &[] };
         // An authority is one a provider can dial and the record can carry,
         // or the call is malformed: nothing here guesses at a name.
-        if path.is_empty()
-            || !wire_http::authority_ok(authority)
-            || proto::Target::parse(authority).is_none()
+        if path.is_empty() || !authority_ok(authority) || proto::Target::parse(authority).is_none()
         {
             refuse(state, record.request, record.trace, Cause::Malformed);
             return;
@@ -669,17 +723,22 @@ fn serve(state: &mut State, record: &CallRecord) {
             refuse(state, record.request, record.trace, Cause::Denied);
             return;
         }
-        // The record the provider takes, composed by the core that owns it,
-        // naming the authority so the open provider behind either leg dials
-        // it. The extended form asks to be answered with the whole response
-        // rather than its body alone, which is what lets a program read a
-        // status and a header block at all.
+        // The authority travels as the request's `host` field, written here
+        // and nowhere else: a block naming one of its own would be a second
+        // answer to where the request goes.
+        if header_lines(headers).any(|(name, _)| name.eq_ignore_ascii_case(b"host")) {
+            refuse(state, record.request, record.trace, Cause::Malformed);
+            return;
+        }
+        // The record the provider takes, composed by the contract that owns
+        // it, naming the authority in its `host` field so the open provider
+        // behind either leg dials it.
         //
         // An authority that names no port is completed here, because the
         // port a scheme implies is known here and nowhere below: the
         // provider's own default is its protocol's, which is the cleartext
         // one. The leg the scheme picked is what says which port that is.
-        let mut dialled = [0u8; wire_http::AUTHORITY_MAX + 4];
+        let mut dialled = [0u8; AUTHORITY_MAX + 4];
         let authority = match (port == state.publish_out, port_of(authority)) {
             (true, None) => {
                 let n = authority.len();
@@ -697,31 +756,40 @@ fn serve(state: &mut State, record: &CallRecord) {
             }
             _ => authority,
         };
-        let mut payload = [0u8; exchange::PAYLOAD_MAX];
-        let Some(at) =
-            wire_http::write_request_to(verb, true, path, headers, body, authority, &mut payload)
-        else {
+        // `host: <authority>\r\n`, then the program's own block.
+        let mut block = [0u8; PAYLOAD_BYTES + AUTHORITY_MAX + 16];
+        let mut filled = 0usize;
+        for part in [&b"host: "[..], authority, b"\r\n", headers] {
+            let end = filled + part.len();
+            if !copy_into(block.get_mut(filled..end).unwrap_or(&mut []), part) {
+                refuse(state, record.request, record.trace, Cause::Malformed);
+                return;
+            }
+            filled = end;
+        }
+        state.corr = state.corr.wrapping_add(1).max(1);
+        // The whole request goes in one HEAD, body inline: a call carries no
+        // more than a record holds, so there is never request body to wait
+        // for credit on. One that does not fit is refused, as it was before.
+        let head = RequestHead {
+            id: ExchangeId::from_u64(state.corr),
+            flags: 0,
+            method: verb,
+            target: path,
+            headers: block.get(..filled).unwrap_or(&[]),
+            peer: &[],
+            resp_credit: BODY_BYTES as u32,
+            body,
+        };
+        let Some(length) = write_request_head(&head, &mut state.outbound) else {
             refuse(state, record.request, record.trace, Cause::Malformed);
             return;
         };
-        state.corr = state.corr.wrapping_add(1).max(1);
-        let publish = exchange::Publish {
-            corr: state.corr,
-            flags: 0,
-            msg_key: &[],
-            payload: payload.get(..at).unwrap_or(&[]),
-        };
-        let Some(encoded) = publish.encode(state.publish.get_mut(3..).unwrap_or(&mut [])) else {
-            refuse(state, record.request, record.trace, Cause::Internal);
-            return;
-        };
-        state.publish[0] = exchange::MSG_PUBLISH;
-        let framed = u16::try_from(encoded).unwrap_or(0).to_le_bytes();
-        state.publish[1] = framed[0];
-        state.publish[2] = framed[1];
-        state.publish_staged = 3 + encoded;
-        state.publish_written = 0;
-        state.publish_port = port;
+        // Held rather than written: the step loop places it, after the
+        // completions this call stages, on the leg the scheme picked.
+        state.outbound_box.hold(length);
+        state.exchange_port = port;
+        state.credit_owed = 0;
         state.response = Response {
             live: true,
             ..Response::EMPTY
@@ -751,6 +819,18 @@ fn serve(state: &mut State, record: &CallRecord) {
     }
     match record.binding {
         METHOD_CLOSE => {
+            if state.outbound_box.holding() {
+                // The request never left, so there is nothing to give up.
+                state.outbound_box = ExchangeOutbox::new();
+            } else if !state.response.complete && !state.response.aborted {
+                // The provider performs one exchange at a time and holds this
+                // one until it ends; a program that stops reading would
+                // otherwise hold it, short of credit, for good.
+                state.abort_owed = true;
+                state.abort_id = ExchangeId::from_u64(state.corr);
+                state.abort_port = state.exchange_port;
+            }
+            state.credit_owed = 0;
             state.response = Response::EMPTY;
             fulfil(state, record.request, record.trace, Answer::None, &[]);
         }
@@ -770,76 +850,136 @@ fn serve(state: &mut State, record: &CallRecord) {
     }
 }
 
-/// Take the head of a response from one `Reply` frame.
-fn apply_reply(state: &mut State, payload: &[u8]) {
-    let Some(reply) = exchange::Reply::decode(payload) else {
-        return;
-    };
-    if reply.corr != state.corr || !state.response.live {
-        return;
+/// Why the response in flight will not be answered, as a program is told it.
+/// A status the provider raised keeps its meaning across the binding: a
+/// request it would not perform is malformed, a provider at capacity is busy,
+/// an origin that did not answer in time timed out. Anything else — an origin
+/// that could not be reached, a link that went, a body cut short — is a
+/// provider with no answer to give.
+fn failure(state: &State) -> Cause {
+    match state.response.raised {
+        exchange::status::BAD_REQUEST | exchange::status::TOO_LARGE => Cause::Malformed,
+        exchange::status::BUSY => Cause::Busy,
+        exchange::status::TIMEOUT => Cause::Timeout,
+        exchange::status::FAILED => Cause::Internal,
+        _ => Cause::Unavailable,
     }
-    if reply.status != exchange::STATUS_OK {
-        // The provider refused the exchange. Every call waiting on a response
-        // that will not come is told so.
-        let mut index = 0usize;
-        while index < PENDING {
-            let held = state.held[index];
-            if held.live {
-                state.held[index] = Held::EMPTY;
-                refuse(state, held.request, held.trace, Cause::Unavailable);
-            }
-            index += 1;
-        }
-        state.response.complete = true;
-        state.response.head = true;
-        return;
-    }
-    // Read by the core that owns the layout, so the status and the block are
-    // taken from where the provider actually put them.
-    let Some((status, headers)) = wire_http::parse_reply_head(reply.payload) else {
-        return;
-    };
-    state.response.status = u32::from(status);
-    let kept = headers.len().min(HEAD_BYTES);
-    copy_into(
-        state.response.headers.get_mut(..kept).unwrap_or(&mut []),
-        headers.get(..kept).unwrap_or(&[]),
-    );
-    state.response.headers_length = kept;
-    state.response.head = true;
 }
 
-/// Take one length-framed chunk of the body, or its ending.
-fn apply_body(state: &mut State, chunk: &[u8]) {
-    if !state.response.live {
-        return;
-    }
-    if chunk.is_empty() {
-        // The chunk that carries nothing is the one that says there are no
-        // more: without it a reader could not tell a pause from an ending.
-        state.response.complete = true;
-        return;
-    }
+/// The exchange in flight, as the id its records carry.
+fn current_id(state: &State) -> ExchangeId {
+    ExchangeId::from_u64(state.corr)
+}
+
+/// The provider will say no more about the response in flight. Before its
+/// head that is a response that never came; after it, a body that stops
+/// short. Either way every call waiting on what will not arrive is told so,
+/// by `serve_held`, rather than answered as if it had.
+fn give_up(state: &mut State) {
+    state.response.head = true;
+    state.response.aborted = true;
+    state.credit_owed = 0;
+}
+
+/// Take body bytes into the buffer. Credit is what keeps them within it; a
+/// provider that sends past its credit has broken the exchange, and is told
+/// to give it up.
+fn take_body(state: &mut State, bytes: &[u8], more: bool) {
     let at = state.response.filled;
-    if copy_into(
+    if !copy_into(
         state
             .response
             .body
-            .get_mut(at..at + chunk.len())
+            .get_mut(at..at + bytes.len())
             .unwrap_or(&mut []),
-        chunk,
+        bytes,
     ) {
-        state.response.filled = at + chunk.len();
+        give_up(state);
+        state.abort_owed = true;
+        state.abort_id = current_id(state);
+        state.abort_port = state.exchange_port;
+        return;
+    }
+    state.response.filled = at + bytes.len();
+    if !more {
+        state.response.complete = true;
     }
 }
 
-/// Whether the body buffer can hold the chunk a staged frame carries.
-fn room_for_body(state: &State, frame: &[u8]) -> bool {
-    let Some((bytes, _)) = wire_http::parse_chunk(frame) else {
-        // Still arriving: nothing to make room for yet.
-        return true;
+/// Take the head of the response: its status, its fields, and the first of
+/// its body.
+fn apply_head(state: &mut State, status: u16, content_type: &[u8], headers: &[u8]) {
+    state.response.status = u32::from(status);
+    // The provider carries the content type beside the block rather than in
+    // it; a program reads one block, so it goes back in as the first field.
+    let mut kept = 0usize;
+    if !content_type.is_empty() {
+        for part in [&b"content-type: "[..], content_type, b"\r\n"] {
+            let end = kept + part.len();
+            if !copy_into(
+                state.response.headers.get_mut(kept..end).unwrap_or(&mut []),
+                part,
+            ) {
+                break;
+            }
+            kept = end;
+        }
+    }
+    let rest = headers.len().min(HEAD_BYTES - kept);
+    copy_into(
+        state
+            .response
+            .headers
+            .get_mut(kept..kept + rest)
+            .unwrap_or(&mut []),
+        headers.get(..rest).unwrap_or(&[]),
+    );
+    state.response.headers_length = kept + rest;
+    state.response.head = true;
+}
+
+/// Take one response record. A record for any exchange but the one in
+/// flight is a closed exchange's tail, and is dropped.
+fn apply_record(state: &mut State, record: &[u8]) {
+    let Some(parsed) = parse_response(record) else {
+        return;
     };
-    bytes.is_empty() || BODY_BYTES - state.response.filled >= bytes.len()
+    if !state.response.live || state.response.complete || state.response.aborted {
+        return;
+    }
+    let id = current_id(state);
+    match parsed {
+        Record::Head(head) if head.id == id && head.flags & flag::RAISED != 0 => {
+            // No peer answered. The status is the provider's report of why,
+            // which a program learns as a failure, not as a response: a
+            // `fetch` with no origin behind it rejects. Any account the
+            // provider gives in a body is its own and is not read; one still
+            // to come is declined, so the exchange does not wait on credit.
+            give_up(state);
+            state.response.raised = head.status;
+            if head.flags & flag::MORE != 0 {
+                state.abort_owed = true;
+                state.abort_id = id;
+                state.abort_port = state.exchange_port;
+            }
+        }
+        Record::Head(head) if head.id == id && !state.response.head => {
+            apply_head(state, head.status, head.content_type, head.headers);
+            take_body(state, head.body, head.flags & flag::MORE != 0);
+        }
+        Record::Body {
+            id: of,
+            flags,
+            data,
+        } if of == id && state.response.head => {
+            take_body(state, data, flags & flag::MORE != 0);
+        }
+        Record::Abort { id: of, .. } if of == id => give_up(state),
+        // The link under the exchange went, and with it the answer.
+        Record::Link { state: link::DOWN } => give_up(state),
+        // Request-body credit is never waited on: every body goes inline.
+        _ => {}
+    }
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -862,95 +1002,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         return 1;
     }
 
-    // The head of a response, which comes before the body it describes.
-    if state.reply_in >= 0 {
-        let read = wire::read_available(
-            syscalls,
-            state.reply_in,
-            state.frame.get_mut(state.frame_filled..).unwrap_or(&mut []),
-        );
-        state.frame_filled += read;
-        while state.frame_filled >= 3 {
-            let kind = state.frame[0];
-            let length = usize::from(u16::from_le_bytes([state.frame[1], state.frame[2]]));
-            let total = 3 + length;
-            if total > state.frame.len() {
-                state.frame_filled = 0;
-                break;
-            }
-            if state.frame_filled < total {
-                break;
-            }
-            let mut payload = [0u8; FRAME_BYTES];
-            copy_into(
-                payload.get_mut(..length).unwrap_or(&mut []),
-                state.frame.get(3..total).unwrap_or(&[]),
-            );
-            if kind == exchange::MSG_REPLY {
-                apply_reply(state, payload.get(..length).unwrap_or(&[]));
-            }
-            let rest = state.frame_filled - total;
-            let mut at = 0usize;
-            while at < rest {
-                state.frame[at] = state.frame[total + at];
-                at += 1;
-            }
-            state.frame_filled = rest;
+    // Whole records from either leg: a mailbox read is one record or none.
+    // Drained rather than read once, so a provider writing faster than this
+    // takes is not left with writes that fail.
+    for port in [state.response_in, state.plain_in] {
+        if port < 0 {
+            continue;
         }
-    }
-
-    // The body, in the chunks it was framed as.
-    if state.body_in >= 0 {
-        // Drain what is there, not one read of it. A provider that fills the
-        // channel faster than this takes from it is one whose writes start
-        // failing, and a stream that stops for that reason stops for good --
-        // the reader has to keep up, or take everything each time it looks.
         loop {
-            let read = wire::read_available(
-                syscalls,
-                state.body_in,
-                state
-                    .body_frame
-                    .get_mut(state.body_filled..)
-                    .unwrap_or(&mut []),
-            );
+            let mut record = [0u8; RECORD_MAX];
+            let read = wire::read_available(syscalls, port, &mut record);
             if read == 0 {
                 break;
             }
-            state.body_filled += read;
-        }
-        while state.body_filled >= wire_http::CHUNK_HEAD {
-            let staged = state.body_frame.get(..state.body_filled).unwrap_or(&[]);
-            // Read by the core: `None` while a chunk is still arriving, which
-            // is the one case a reader must not guess at.
-            let Some((bytes, total)) = wire_http::parse_chunk(staged) else {
-                if state.body_filled >= state.body_frame.len() {
-                    // Longer than this adapter can stage, so it will never
-                    // complete. Dropping what is staged is the only way on.
-                    state.body_filled = 0;
-                }
-                break;
-            };
-            let carried = bytes.len();
-            // A chunk the body cannot hold is left where it is and taken
-            // again once the program has read what is already here, so the
-            // stream stops rather than losing the middle of itself.
-            if !room_for_body(state, staged) {
-                break;
-            }
-            let mut chunk = [0u8; FRAME_BYTES];
-            copy_into(chunk.get_mut(..carried).unwrap_or(&mut []), bytes);
-            apply_body(state, chunk.get(..carried).unwrap_or(&[]));
-            let rest = state.body_filled - total;
-            let mut at = 0usize;
-            while at < rest {
-                state.body_frame[at] = state.body_frame[total + at];
-                at += 1;
-            }
-            state.body_filled = rest;
+            apply_record(state, record.get(..read).unwrap_or(&[]));
         }
     }
-
     serve_held(state);
 
     // One call is taken only when there is room for what it may answer with.
@@ -983,13 +1050,43 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
     }
 
-    wire::push_staged(
-        syscalls,
-        state.publish_port,
-        &state.publish,
-        &mut state.publish_staged,
-        &mut state.publish_written,
-    );
+    // The request first, then what follows it on the same port: a CREDIT or
+    // ABORT that overtook its HEAD would name an exchange the provider has
+    // not heard of.
+    // SAFETY: `syscalls` is the loader's table, and each record stays in its
+    // buffer until its outbox reports it placed.
+    unsafe {
+        if state
+            .outbound_box
+            .flush(syscalls, state.exchange_port, &state.outbound)
+            && state
+                .control_box
+                .flush(syscalls, state.control_port, &state.control)
+        {
+            if state.abort_owed {
+                state.abort_owed = false;
+                if let Some(length) = write_abort(
+                    &state.abort_id,
+                    exchange::abort::UNDELIVERABLE,
+                    &mut state.control,
+                ) {
+                    state.control_port = state.abort_port;
+                    state
+                        .control_box
+                        .send(syscalls, state.control_port, &state.control, length);
+                }
+            } else if state.credit_owed > 0 && state.response.live {
+                let id = current_id(state);
+                if let Some(length) = write_credit(&id, state.credit_owed, &mut state.control) {
+                    state.credit_owed = 0;
+                    state.control_port = state.exchange_port;
+                    state
+                        .control_box
+                        .send(syscalls, state.control_port, &state.control, length);
+                }
+            }
+        }
+    }
     wire::push_staged(
         syscalls,
         state.reply_out,

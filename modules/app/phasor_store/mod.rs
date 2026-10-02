@@ -188,6 +188,11 @@ struct State {
     /// Set when the call just taken was held rather than answered, so the
     /// step knows to stage nothing for it.
     deferred: bool,
+    /// Where a `write` or `delete` has the provider put its fence. Here and
+    /// not on the stack: a write the provider has not decided is asked again
+    /// with the same bytes, which name this buffer by address, and the
+    /// provider writes the fence on whichever ask decides it.
+    fence: [u8; FENCE_BYTES],
     phase: u8,
 }
 
@@ -234,6 +239,7 @@ unsafe fn apply_params(state: &mut State, params: *const u8, params_len: usize) 
 
 use abi::contracts::storage::namespace as ns;
 use abi::contracts::storage::object as obj;
+use abi::contracts::storage::object::{write_answer, WriteAnswer};
 
 /// Write `value` little-endian at `at`, answering where the next field goes.
 fn put_u16(buf: &mut [u8], at: usize, value: u16) -> usize {
@@ -647,11 +653,18 @@ fn answer(
             let Some(length) = qualify(state, key, &mut name) else {
                 return refuse(record, Cause::Malformed);
             };
-            let mut fence = [0u8; FENCE_BYTES];
-            let mut body = [0u8; VALUE_BYTES];
-            if !copy_into(body.get_mut(..value.len()).unwrap_or(&mut []), value) {
+            // The value the provider reads is the one in the staged payload,
+            // not this step's copy of it: a write the provider has not
+            // decided is asked again with the same bytes, so the address
+            // they name has to outlive the step, and the payload stays
+            // staged until the call is answered.
+            let mut staged_parts: [&[u8]; 2] = [&[], &[]];
+            let staged = state.payload.get(..state.payload_length).unwrap_or(&[]);
+            let (_, staged_value) = key_of(staged, &mut staged_parts);
+            if staged_value.len() != value.len() {
                 return refuse(record, Cause::Internal);
             }
+            let body = staged_value.as_ptr() as u64;
             let mut arg = [0u8; KEY_BYTES * 2 + 32];
             let at = put_u16(&mut arg, 0, u16::try_from(length).unwrap_or(0));
             if !copy_into(
@@ -666,21 +679,25 @@ fn answer(
             // does not promise.
             arg[at] = 0;
             at += 1;
-            let at = put_u64(&mut arg, at, body.as_mut_ptr() as u64);
+            let at = put_u64(&mut arg, at, body);
             let at = put_u64(&mut arg, at, value.len() as u64);
             arg[at] = obj::precondition::ANY;
             arg[at + 1] = 0;
-            let at = put_u64(&mut arg, at + 2, fence.as_mut_ptr() as u64);
+            let at = put_u64(&mut arg, at + 2, state.fence.as_mut_ptr() as u64);
             let at = put_u16(&mut arg, at, FENCE_BYTES as u16);
-            // SAFETY: every pointer in `arg` names a buffer live for this
-            // call, and the table is the loader's own.
-            let rc = unsafe { (syscalls.provider_call)(-1, obj::PUT, arg.as_mut_ptr(), at) };
-            if rc == EAGAIN {
-                // The store has not taken the bytes yet. That is not a store
-                // that failed, and answering as though it were would tell a
-                // program its write was lost while it is still in flight.
-                return hold_from_payload(state, record);
-            }
+            // SAFETY: every pointer in `arg` names a buffer in the module's
+            // state, live until the write is decided, and the table is the
+            // loader's own.
+            let rc = match write_answer(unsafe {
+                (syscalls.provider_call)(-1, obj::PUT, arg.as_mut_ptr(), at)
+            }) {
+                // Taken, not yet decided. That is not a store that failed,
+                // and answering as though it were would tell a program its
+                // write was lost while it is still in flight: the call is
+                // held and asked again next step with the same request.
+                WriteAnswer::Pending => return hold_from_payload(state, record),
+                WriteAnswer::Decided(rc) => rc,
+            };
             if rc < 0 {
                 // No store is wired, or it refused. Saying so is the whole of
                 // what this adapter can honestly do: it holds nothing itself,
@@ -703,7 +720,6 @@ fn answer(
             let Some(length) = qualify(state, key, &mut name) else {
                 return refuse(record, Cause::Malformed);
             };
-            let mut fence = [0u8; FENCE_BYTES];
             let mut arg = [0u8; KEY_BYTES * 2 + 16];
             let at = put_u16(&mut arg, 0, u16::try_from(length).unwrap_or(0));
             if !copy_into(
@@ -716,16 +732,19 @@ fn answer(
             arg[at] = obj::precondition::ANY;
             arg[at + 1] = 0;
             at += 2;
-            let at = put_u64(&mut arg, at, fence.as_mut_ptr() as u64);
+            let at = put_u64(&mut arg, at, state.fence.as_mut_ptr() as u64);
             let at = put_u16(&mut arg, at, FENCE_BYTES as u16);
             // SAFETY: as for the write above.
-            let rc = unsafe { (syscalls.provider_call)(-1, obj::DELETE, arg.as_mut_ptr(), at) };
-            // Worse here than anywhere else: this member answers with whether
-            // the key went, so reading "not yet" as a number would tell a
-            // program the key is still there when it is merely still going.
-            if rc == EAGAIN {
-                return hold_from_payload(state, record);
-            }
+            let rc = match write_answer(unsafe {
+                (syscalls.provider_call)(-1, obj::DELETE, arg.as_mut_ptr(), at)
+            }) {
+                // Worse here than anywhere else: this member answers with
+                // whether the key went, so reading "not yet" as a number
+                // would tell a program the key is still there when it is
+                // merely still going.
+                WriteAnswer::Pending => return hold_from_payload(state, record),
+                WriteAnswer::Decided(rc) => rc,
+            };
             (
                 CompletionRecord {
                     request: record.request,

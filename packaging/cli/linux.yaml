@@ -39,8 +39,8 @@ modules:
     params:
       authority: "localhost:8080"
   # HTTP is Wave's, not this project's. The adapter turns a granted call into
-  # one exchange record naming the authority the program wrote, and the
-  # answer back into a head and a stream; what protocol carried it, and
+  # one exchange request naming the authority the program wrote in its `host`
+  # field, and the answer back into a head and a stream; what protocol carried it, and
   # which version, is the provider's business and reaches no program.
   # `origins` is left unset: `--grant http` admits every origin.
   - name: phasor_http
@@ -130,15 +130,13 @@ wiring:
     to: phasor_http.request_in
   - from: phasor_http.reply_out
     to: phasor_shell.http_reply
-  # The request as a record, and the response as a head then a body. Both
-  # legs answer on the adapter's one reply pair: one request is in flight
-  # at a time, and only the leg it went down has anything to say.
+  # The request as an exchange record, and the response as a head then a
+  # body under the adapter's credit. Each leg answers on an input of its own,
+  # because a framed edge is a mailbox and a mailbox has one writer.
   - from: phasor_http.publish_out
-    to: http_tls.publish_in
-  - from: http_tls.reply_out
-    to: phasor_http.reply_in
-  - from: http_tls.file_ctrl
-    to: phasor_http.body_in
+    to: http_tls.request_in
+  - from: http_tls.response_out
+    to: phasor_http.response_in
   - from: http_tls.net_out
     to: tls.clear_in
   - from: tls.clear_out
@@ -148,11 +146,9 @@ wiring:
   - from: linux_net.net_out
     to: tls.cipher_in
   - from: phasor_http.plain_out
-    to: http_plain.publish_in
-  - from: http_plain.reply_out
-    to: phasor_http.reply_in
-  - from: http_plain.file_ctrl
-    to: phasor_http.body_in
+    to: http_plain.request_in
+  - from: http_plain.response_out
+    to: phasor_http.plain_in
   - from: http_plain.net_out
     to: linux_net.net_in
   - from: linux_net.net_out
