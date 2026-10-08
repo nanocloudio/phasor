@@ -170,11 +170,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// The text of a BigInt, which is its digits with no suffix.
     pub(super) fn big_int_text(&mut self, value: Value, radix: u32) -> Result<Value, Completion> {
         let number = self.big_int_operand(value)?;
-        // A value of the admitted width is at most this many digits in binary,
-        // which is the longest text any radix produces.
-        let mut units = [0u16; crate::bigint::MAX_LIMBS * 32 + 2];
-        let written = crate::bigint::text(&number, radix, &mut units);
-        self.make_string(units.get(..written).unwrap_or(&[]))
+        let mut text = crate::bigint::TextFromEnd::new(&number, radix);
+        let length = u32::try_from(text.length()).map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        let handle = string::latin1_from_end(self.heap, length, || text.next_char())
+            .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+        Ok(Value::string(handle))
     }
 
     /// `BigInt(value)`, which admits an integral Number, a string of digits, a

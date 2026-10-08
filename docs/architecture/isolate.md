@@ -171,6 +171,14 @@ A slice ending is not an outcome: the task has not finished and nothing has been
 decided about it. Fuel exhaustion, cancellation, and a passed deadline are
 outcomes, and they are uncatchable.
 
+A drain is a cancel the graph asks for. When Fluxor drains the isolate —
+`reconfigure` quiescing the graph before a switch, or a hosted runtime told to
+stop — `module_drain` requests cancellation, the task ends at its next safe
+point with `Cancelled`, its outcome is sent, and the step after that answers
+Done. A task that has not started ends at once. Nothing is carried across a
+drain: a paused job is not hot-replaced, and what runs after one is a new
+task, on whatever image the graph then carries.
+
 ## 5a. The machine is rebuilt, not held
 
 A task that is waiting on the outside must survive between module steps, and a

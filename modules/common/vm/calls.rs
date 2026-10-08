@@ -23,6 +23,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         this: Value,
         arguments: &[Value],
     ) -> Result<Value, Completion> {
+        self.host_stack_check()?;
         if !callee.is_object() {
             return Err(self.throw_type_error());
         }
@@ -117,6 +118,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         arguments: &[Value],
         construct: bool,
     ) -> Result<bool, Completion> {
+        self.host_stack_check()?;
         if !callee.is_object() {
             return Ok(false);
         }
@@ -592,6 +594,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         this: Value,
         arguments: &[Value],
     ) -> Result<(), Completion> {
+        self.host_stack_check()?;
         if parent.is_object()
             && object::is_callable(self.heap, parent.as_handle()) == Ok(true)
             && !object::is_native(self.heap, parent.as_handle()).unwrap_or(false)
@@ -656,6 +659,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         callee: Value,
         arguments: &[Value],
     ) -> Result<Value, Completion> {
+        self.host_stack_check()?;
         let new_target = self.pending_new_target;
         self.pending_new_target = Value::UNDEFINED;
         if !callee.is_object() {

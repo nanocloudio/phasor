@@ -164,6 +164,18 @@ mod profile {
         /// so this is what a program's recursion is bounded by.
         pub const FRAME_COUNT: usize = 256;
         pub const REGISTER_COUNT: usize = 4096;
+        /// Host stack the machine may use below its entry; 0 is unbounded.
+        /// A module here has a stack of its own, sized by its MMU.
+        pub const HOST_STACK_BYTES: u32 = 0;
+        /// Modules one linked closure may hold.
+        pub const MAX_MODULES: usize = 16;
+        /// Collection slices one step may run; 0 finishes a collection where
+        /// it starts.
+        pub const COLLECTION_BUDGET: u32 = 0;
+        /// Instructions one step runs before it hands the scheduler back.
+        pub const SLICE: u64 = 4096;
+        /// Jobs one step runs.
+        pub const JOB_SLICE: u32 = 16;
         /// Bytes of payload one call or one completion may carry behind its
         /// frame. A call whose arguments do not fit is refused by the
         /// machine, and an answer longer than this is not taken.
@@ -186,11 +198,41 @@ mod profile {
     /// that. The handle table leaves 738 slots past the realm's. The atom
     /// table is a power of two, three-quarters full at its handle count.
     /// Thirty-two frames bound recursion at thirty-two calls. The verifier
-    /// holds one entry per byte of the longest image it can be handed. Two
-    /// kilobytes of image is a few hundred lines of source, which is what a
-    /// program for a part this size is.
+    /// holds one entry per byte of the longest function it can be handed.
+    /// Eight kilobytes of image is the console-and-timers surface a part this
+    /// size carries ahead of its program (packaging/embedded/surface.js, some
+    /// 3.3 KB compiled) and a program of a hundred lines or so.
     pub mod embedded {
-        pub const IMAGE_CAPACITY: usize = 2 * 1024;
+        /// Host stack the machine may use below its entry. Every module on
+        /// an RP part steps on the kernel's one stack, 40 KiB of which a
+        /// module may reach; this is the part of it the engine's recursions
+        /// may spend, and the rest is the entry path and the deepest frame
+        /// below a check. The declaration beside `entry!` adds them up.
+        ///
+        /// A figure measured on Thumb frames, so it binds on that silicon
+        /// only: the same profile on an application-class part, where frames
+        /// are larger and a module has a stack of its own, is unbounded.
+        #[cfg(fluxor_silicon = "rp2350")]
+        pub const HOST_STACK_BYTES: u32 = 16 * 1024;
+        #[cfg(not(fluxor_silicon = "rp2350"))]
+        pub const HOST_STACK_BYTES: u32 = 0;
+        /// Modules one linked closure may hold. Each is a parsed unit on the
+        /// host stack while the task starts and while it advances, so four,
+        /// which is a program and the few modules it splits into.
+        pub const MAX_MODULES: usize = 4;
+        /// Collection slices one step may run. A whole collection of this
+        /// heap is some 150 slices and, on a 150 MHz core, 11 ms or more;
+        /// twenty-four is under 2 ms, so a collection spans several steps
+        /// and none of them outlasts a cooperative scheduler's deadline.
+        pub const COLLECTION_BUDGET: u32 = 24;
+        /// Instructions one step runs before it hands the scheduler back. An
+        /// instruction is some 8 µs on a 150 MHz core with no floating-point
+        /// unit, so 256 is about 2 ms; a long loop runs on, over more steps.
+        pub const SLICE: u64 = 256;
+        /// Jobs one step runs. A job runs to its end, so this is the bound a
+        /// step's reactions have, and two keeps a turn's to one step.
+        pub const JOB_SLICE: u32 = 2;
+        pub const IMAGE_CAPACITY: usize = 8 * 1024;
         pub const ARENA_BYTES: usize = 96 * 1024;
         pub const SLOT_COUNT: usize = 1536;
         pub const WORKLIST: usize = 512;
@@ -215,6 +257,13 @@ const REFUSED: &[verify::Refused] = &[(Opcode::CreateRegExp, diagnostic::image_f
 const REFUSED: &[verify::Refused] = &[];
 
 const RESULT_CAPACITY: usize = 128;
+/// Bytes of `print` output held between steps. A call that does not fit is
+/// dropped whole, which is the host's quota on output.
+const PRINT_BYTES: usize = 256;
+/// Bytes of one `[js]` log line, the tag included; a longer line is cut.
+const PRINT_LINE: usize = 120;
+/// Grant entries the surface can place: one per admitted binding.
+const SURFACE_ENTRIES: usize = MAX_BINDINGS;
 const JOB_COUNT: usize = 32;
 /// Bindings this isolate admits, and calls it lets be outstanding at once.
 ///
@@ -256,10 +305,6 @@ const COLLECTION_HEADROOM: u32 = (ARENA_BYTES / 16) as u32;
 /// A budget is what makes a run answerable rather than open-ended, so it is a
 /// parameter: a graph that runs bigger programs says so.
 const STEPS: u32 = 20_000_000;
-/// Instructions one module step may run, so a long program yields.
-const SLICE: u64 = 4096;
-/// Jobs one module step may run, so a flood of reactions still yields.
-const JOB_SLICE: u32 = 16;
 /// Steps a call may wait for an answer before the isolate times it out, when
 /// the graph names no other number. A provider that never answers must not
 /// hold a task open forever, and a deployment that knows its providers says
@@ -281,7 +326,6 @@ const EMPTY_WAIT_STEPS: u32 = 64;
 /// graph that wires no clock has no deadline.
 const CONTROL_FRAME: usize = 12;
 /// Modules one closure may hold, and imports it may have in total.
-const MAX_MODULES: usize = 16;
 /// Bindings one image may state it requires.
 const MAX_REQUIREMENTS: usize = 32;
 /// The granted names a graph may name, as text. The register states the
@@ -323,6 +367,7 @@ fn attachments<'a>(
     module_count: u32,
     import_count: u32,
     admitted: &'a [Binding],
+    print: Option<(&'a mut [u8], &'a mut usize)>,
 ) -> agent::Attachments<'a, 'static> {
     agent::Attachments {
         admitted,
@@ -339,7 +384,7 @@ fn attachments<'a>(
         module_names: &[],
         module_cycles: &[],
         compiler: None,
-        print: None,
+        print,
     }
 }
 
@@ -439,6 +484,198 @@ fn binding_of(state: &State, want: crate::digest::Digest) -> Option<u32> {
         index += 1;
     }
     None
+}
+
+/// Request identifiers the seed's draws go out under, apart from any a task
+/// makes.
+const SEED_REQUEST: u64 = u64::MAX - 64;
+
+/// Draw the seed a surfaced task's generator is keyed with, a word per call
+/// on the granted entropy member, through the same port and router the task's
+/// own calls take. Answers whether the drawing is over: it is at once when
+/// the task is not surfaced or holds no entropy grant, and a refused draw
+/// ends it without a seed, so the task runs with no `crypto` rather than one
+/// keyed by less than it should be.
+fn draw_seed(state: &mut State, syscalls: &SyscallTable) -> bool {
+    let name = capability::name_of(b"wasi:random/random", b"random");
+    let binding = if state.surface {
+        binding_of(state, name)
+    } else {
+        None
+    };
+    let Some(binding) = binding else {
+        state.seed_done = true;
+        return true;
+    };
+    if state.call_out < 0 || state.completion_in < 0 {
+        state.seed_done = true;
+        return true;
+    }
+    if usize::from(state.seed_taken) == state.seed.len() {
+        state.seed_done = true;
+        return true;
+    }
+    let request = SEED_REQUEST + u64::from(state.seed_taken);
+    if !state.seed_asked {
+        let frame = CallRecord {
+            request,
+            binding,
+            payload_length: 0,
+            trace: TRACE,
+            payload: crate::digest::digest(&[]),
+        }
+        .encode();
+        let at = state.wire.staged;
+        let staged = state
+            .wire
+            .calls
+            .get_mut(at..at + CALL_FRAME)
+            .is_some_and(|room| copy_into(room, &frame));
+        if !staged {
+            return false;
+        }
+        state.wire.staged = at + CALL_FRAME;
+        state.seed_asked = true;
+    }
+    push_calls(state, syscalls);
+    pull_completion(state, syscalls);
+    if !state.wire.ready {
+        return false;
+    }
+    state.wire.ready = false;
+    state.wire.filled = 0;
+    let Some(record) = CompletionRecord::decode(&state.wire.completion) else {
+        state.seed_done = true;
+        return true;
+    };
+    if record.request != request {
+        // Not this draw's answer: nothing else is out before the task starts.
+        return false;
+    }
+    state.seed_asked = false;
+    match (record.disposition, record.answer) {
+        (Disposition::Fulfilled, Answer::Number(value)) => {
+            if let Some(word) = state.seed.get_mut(usize::from(state.seed_taken)) {
+                *word = crate::value::to_uint32(value);
+            }
+            state.seed_taken += 1;
+            false
+        }
+        _ => {
+            // Refused: no seed, and so no `crypto`.
+            state.seed_taken = 0;
+            state.seed_done = true;
+            true
+        }
+    }
+}
+
+/// One granted member as the surface places it: the global it goes under,
+/// the name it has there, and the binding that serves it.
+#[derive(Clone, Copy)]
+struct SurfaceEntry {
+    namespace: [u8; register::NAMESPACE_MAX],
+    namespace_length: usize,
+    member: [u8; register::MAX_MEMBER],
+    member_length: usize,
+    binding: u32,
+}
+
+impl SurfaceEntry {
+    const EMPTY: Self = Self {
+        namespace: [0; register::NAMESPACE_MAX],
+        namespace_length: 0,
+        member: [0; register::MAX_MEMBER],
+        member_length: 0,
+        binding: 0,
+    };
+}
+
+/// Every granted member a program can call, in admission order, so that the
+/// binding each is defined over is the one `admitted_bindings` admitted for
+/// it. A snapshot member is read at a task boundary rather than called, and
+/// this isolate supplies none, so it is not surfaced; nor is an interface the
+/// register has no word for.
+fn surface_entries(state: &State) -> ([SurfaceEntry; SURFACE_ENTRIES], usize) {
+    let mut out = [SurfaceEntry::EMPTY; SURFACE_ENTRIES];
+    let mut count = 0usize;
+    // Binding 0 is `host`; each grant follows in order.
+    let mut binding = 1u32;
+    let names = state.grants.get(..state.grants_length).unwrap_or(&[]);
+    register::grants(names, |interface, member| {
+        let index = binding;
+        binding += 1;
+        let (namespace, namespace_length) = register::namespace(interface);
+        let callable = register::member_of(interface, member).is_some_and(|m| !m.snapshot);
+        if namespace_length == 0 || !callable || member.len() > register::MAX_MEMBER {
+            return;
+        }
+        let Some(slot) = out.get_mut(count) else {
+            return;
+        };
+        let mut entry = SurfaceEntry {
+            namespace,
+            namespace_length,
+            binding: index,
+            ..SurfaceEntry::EMPTY
+        };
+        if !copy_into(
+            entry.member.get_mut(..member.len()).unwrap_or(&mut []),
+            member,
+        ) {
+            return;
+        }
+        entry.member_length = member.len();
+        *slot = entry;
+        count += 1;
+    });
+    (out, count)
+}
+
+/// Put the grants on the global object, one namespace per interface, and
+/// install `print`.
+fn surface_grants(machine: &mut Vm<'_, '_, '_, '_>, entries: &[SurfaceEntry]) -> bool {
+    let mut at = 0usize;
+    while at < entries.len() {
+        let Some(first) = entries.get(at) else {
+            return false;
+        };
+        let word = first.namespace.get(..first.namespace_length).unwrap_or(&[]);
+        // One namespace per interface, however its members were spread
+        // through the grant list.
+        let mut seen = false;
+        let mut earlier = 0usize;
+        while earlier < at {
+            if entries
+                .get(earlier)
+                .is_some_and(|e| e.namespace.get(..e.namespace_length).unwrap_or(&[]) == word)
+            {
+                seen = true;
+                break;
+            }
+            earlier += 1;
+        }
+        if !seen {
+            let Ok(namespace) = machine.define_namespace(word) else {
+                return false;
+            };
+            for entry in entries {
+                if entry.namespace.get(..entry.namespace_length).unwrap_or(&[]) == word
+                    && machine
+                        .define_binding_in(
+                            namespace,
+                            entry.member.get(..entry.member_length).unwrap_or(&[]),
+                            entry.binding,
+                        )
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+        at += 1;
+    }
+    machine.install_print().is_ok()
 }
 
 /// What one step of the machine did.
@@ -589,6 +826,37 @@ struct State {
     trace: u32,
     /// Steps taken, which the step histogram cannot report.
     trace_steps: u32,
+    /// Surface the grants as the shell does: each granted interface a global
+    /// namespace holding its granted members, and `print`, whose lines go to
+    /// the kernel log. Off, a program reaches capabilities by import only.
+    surface: bool,
+    /// The image arrived whole as the `image` parameter, so nothing is
+    /// staged from `image_in`.
+    preloaded: bool,
+    /// What `print` wrote that has not yet gone to the log.
+    printed: [u8; PRINT_BYTES],
+    printed_length: usize,
+    /// The longest one step of running took, in microseconds, which is what
+    /// a part with a step deadline has to know. Reported with `trace`.
+    slice_us_max: u32,
+    /// How long admitting the image and starting the task took, after the
+    /// realm was built.
+    start_us: u32,
+    /// The realm, built a stage per step before the task starts: on a part
+    /// with a short step deadline the whole of it is too long for one.
+    building: agent::Building,
+    /// When the machine's own work began and ended in the last advance, so a
+    /// slow one says whether the time went to it or to restoring and saving
+    /// it. Reported with `trace`.
+    body_from_us: u64,
+    body_to_us: u64,
+    /// The seed a surfaced task's generator is keyed with, drawn from the
+    /// entropy grant before the program runs: words taken so far, whether a
+    /// draw is out, and whether the drawing is over (with a seed or without).
+    seed: [u32; 8],
+    seed_taken: u8,
+    seed_asked: bool,
+    seed_done: bool,
 }
 
 /// Admit the staged image and start the task, saving the machine's state.
@@ -727,11 +995,17 @@ fn start(state: &mut State) -> bool {
         state.instances[0] = ModuleInstance::EMPTY;
     }
     let (admitted, admitted_count) = admitted_bindings(state);
+    let (surface, surface_count) = surface_entries(state);
+    let surfaced = state.surface;
+    let seeded = surfaced && usize::from(state.seed_taken) == state.seed.len();
+    let seed = state.seed;
     let policy = policy(state);
     let metering = agent::Metering {
         policy: &policy,
         collection_headroom: COLLECTION_HEADROOM,
         trace: TRACE,
+        host_stack: HOST_STACK_BYTES,
+        collection_budget: COLLECTION_BUDGET,
     };
     let linked = state.linked;
     let module_count = state.module_count;
@@ -743,18 +1017,34 @@ fn start(state: &mut State) -> bool {
         module_count,
         import_count,
         admitted.get(..admitted_count).unwrap_or(&[]),
+        if surfaced {
+            Some((&mut state.printed[..], &mut state.printed_length))
+        } else {
+            None
+        },
     );
     let mut storage = agent_storage!(state);
     storage.payloads = Some(&mut state.call_payloads);
     storage.resources = Some(&mut state.resources);
-    let started = agent::fresh(
+    let building = state.building;
+    let started = agent::fresh_built(
         units.get(..count).unwrap_or(&[]),
         storage,
         attach,
         metering,
+        &building,
         |machine| {
             if machine.define_binding(b"host", 0).is_err() {
                 return false;
+            }
+            if surfaced && !surface_grants(machine, surface.get(..surface_count).unwrap_or(&[])) {
+                return false;
+            }
+            if seeded {
+                machine.seed_entropy(&seed);
+                if machine.install_entropy().is_err() {
+                    return false;
+                }
             }
             if linked {
                 // Every module's environment is made before any of them
@@ -830,6 +1120,8 @@ fn advance(state: &mut State) -> Advance {
         policy: &policy,
         collection_headroom: COLLECTION_HEADROOM,
         trace: TRACE,
+        host_stack: HOST_STACK_BYTES,
+        collection_budget: COLLECTION_BUDGET,
     };
     let linked = state.linked;
     let module_count = state.module_count;
@@ -841,6 +1133,11 @@ fn advance(state: &mut State) -> Advance {
         module_count,
         import_count,
         &[],
+        if state.surface {
+            Some((&mut state.printed[..], &mut state.printed_length))
+        } else {
+            None
+        },
     );
     let mut storage = agent_storage!(state);
     storage.payloads = Some(&mut state.call_payloads);
@@ -848,6 +1145,9 @@ fn advance(state: &mut State) -> Advance {
     let realm = state.realm;
     let saves = state.saves;
     let count = if linked { module_count as usize } else { 1 };
+    let syscalls = state.syscalls;
+    let mut body_from = 0u64;
+    let mut body_to = 0u64;
     let stepped = agent::adopt(
         units.get(..count).unwrap_or(&[]),
         storage,
@@ -856,6 +1156,12 @@ fn advance(state: &mut State) -> Advance {
         realm,
         &saves,
         |machine| {
+            // SAFETY: the table pointer was checked non-null by the step.
+            body_from = unsafe { dev_micros(&*syscalls) };
+            if state.surface {
+                // An event loop's budget is per turn, not per lifetime.
+                machine.refuel(u64::from(steps));
+            }
             machine.retain(state.result_value);
             // What the control port asked for reaches the machine here, every step:
             // a cancel is sticky, and a deadline passes when a reported time reaches
@@ -872,6 +1178,27 @@ fn advance(state: &mut State) -> Advance {
 
             let mut outcome = Advance::Running;
             let mut progressed = false;
+
+            // A collection the last step left open finishes before anything
+            // else happens: no answer is applied and no code runs while the
+            // collector holds the heap.
+            if machine.collecting() {
+                if let Some(stopped) = machine.collection_step() {
+                    let reason = match stopped {
+                        Completion::Terminated(reason) => reason.code(),
+                        _ => diagnostic::termination::UNCAUGHT_THROW,
+                    };
+                    state.diagnostic = Diagnostic::at(reason, Severity::Error, 0).encode();
+                    state.has_diagnostic = true;
+                    outcome = Advance::Failed;
+                }
+                if outcome == Advance::Failed || machine.collecting() {
+                    state.collections = machine.collections();
+                    // SAFETY: as above.
+                    body_to = unsafe { dev_micros(&*syscalls) };
+                    return outcome;
+                }
+            }
 
             // An answer that arrived settles its promise before anything else runs, so
             // the reaction it schedules is next in line rather than a step behind.
@@ -992,7 +1319,18 @@ fn advance(state: &mut State) -> Advance {
             if outcome == Advance::Running {
                 match machine.run_jobs(JOB_SLICE) {
                     Ok(ran) => progressed |= ran > 0,
-                    Err(_) => outcome = Advance::Failed,
+                    Err(stopped) => {
+                        // A reaction that stopped the machine says why, as a
+                        // stopped body does: a failure with no reason is one
+                        // nobody can act on.
+                        let reason = match stopped {
+                            Completion::Terminated(reason) => reason.code(),
+                            _ => diagnostic::termination::UNCAUGHT_THROW,
+                        };
+                        state.diagnostic = Diagnostic::at(reason, Severity::Error, 0).encode();
+                        state.has_diagnostic = true;
+                        outcome = Advance::Failed;
+                    }
                 }
             }
 
@@ -1086,8 +1424,14 @@ fn advance(state: &mut State) -> Advance {
             }
 
             // The task is finished when its body has run, the value it produced is not
-            // still waiting on anything, and no reaction is left to run.
-            if outcome == Advance::Running && state.body_done && queue_idle(machine) {
+            // still waiting on anything, and no reaction is left to run. A surfaced
+            // task is a host's event loop as well: a timer it set is a call still in
+            // flight, and the program is not over while one is.
+            if outcome == Advance::Running
+                && state.body_done
+                && queue_idle(machine)
+                && (!state.surface || bindings_in_flight(machine) == 0)
+            {
                 match settled_value(machine, state.result_value) {
                     Settled::Waiting => {}
                     Settled::Value(value) => {
@@ -1119,9 +1463,13 @@ fn advance(state: &mut State) -> Advance {
 
             state.fuel_spent = u64::from(steps).saturating_sub(machine.fuel());
             state.collections = machine.collections();
+            // SAFETY: as above.
+            body_to = unsafe { dev_micros(&*syscalls) };
             outcome
         },
     );
+    state.body_from_us = body_from;
+    state.body_to_us = body_to;
     let Ok((outcome, saves)) = stepped else {
         return Advance::Failed;
     };
@@ -1245,6 +1593,32 @@ entry! {
     params apply_params
 }
 
+// The stack this module may reach, for a part where every module steps on
+// the kernel's one stack. Every recursion in the engine passes a check against
+// `HOST_STACK_BYTES` (see `Vm::bound_host_stack`), so the depth is bounded by
+// three measured terms, read off the call graph of the `embedded_lean` build
+// on rp2350 with the checked functions cut:
+//
+//   12,880  the deepest path that recurses nowhere, which contains the path
+//           from `module_step` to where the limit is set;
+//   16,384  the budget the recursions may spend below that point;
+//    9,368  the deepest path below a check that passed, to the next check
+//           or a leaf.
+//
+// 38,632 bytes, declared as 38 KiB. It holds only where every recursion is
+// checked: the regular expression engine and JSON's nesting are not, so a
+// build carrying either declares nothing and an RP graph refuses it, rather
+// than admitting it on a figure its code can exceed.
+declare_module_stack_bytes!(if cfg!(all(
+    fluxor_silicon = "rp2350",
+    feature = "omit_regexp",
+    feature = "omit_json"
+)) {
+    38 * 1024
+} else {
+    0
+});
+
 define_params! {
     State;
 
@@ -1272,6 +1646,95 @@ define_params! {
 
     5, empty_wait, u32, EMPTY_WAIT_STEPS
         => |s, d, len| { s.empty_wait = p_u32(d, len, 0, EMPTY_WAIT_STEPS); };
+
+    6, surface, u8, 0
+        => |s, d, len| { s.surface = p_u8(d, len, 0, 0) != 0; };
+
+    // A compiled image carried by the graph's own config, for a part with no
+    // compiler on it. It arrives as chunks, the first led by the whole
+    // length, and is copied as it comes: the parameter buffer is the
+    // loader's and is reused for the next module.
+    7, image, blob, 0
+        => |s, d, len| { preload_chunk(s, d, len); };
+}
+
+/// Copy `src` over `dst` when the lengths agree, answering whether it did.
+/// `copy_from_slice` on lengths the compiler cannot prove equal would carry a
+/// panic path, and a module image carries none.
+fn copy_into(dst: &mut [u8], src: &[u8]) -> bool {
+    if dst.len() != src.len() {
+        return false;
+    }
+    for (to, from) in dst.iter_mut().zip(src) {
+        *to = *from;
+    }
+    true
+}
+
+/// Append one chunk of the `image` parameter to the image buffer.
+fn preload_chunk(state: &mut State, data: *const u8, length: usize) {
+    if data.is_null() || length == 0 {
+        return;
+    }
+    // SAFETY: the params reader hands a pointer valid for `length` bytes.
+    let chunk = unsafe { core::slice::from_raw_parts(data, length) };
+    let body = if state.preloaded {
+        chunk
+    } else {
+        // The first chunk opens with the blob's whole length, which the
+        // chunks themselves add up to; the bytes after it are image.
+        state.preloaded = true;
+        state.image_length = 0;
+        chunk.get(2..).unwrap_or(&[])
+    };
+    let at = state.image_length;
+    let copied = state
+        .image
+        .get_mut(at..at + body.len())
+        .is_some_and(|room| copy_into(room, body));
+    if copied {
+        state.image_length = at + body.len();
+    } else {
+        state.overflowed = true;
+    }
+}
+
+/// Say how the task ended, for a graph that wired nowhere to send it: on a
+/// board, the log is the only place an outcome can be read.
+fn log_outcome(state: &State, syscalls: &SyscallTable) {
+    let mut line = trace::Line::<PRINT_LINE>::new();
+    if state.failed {
+        line.text(b"[iso] failed");
+        if state.has_diagnostic {
+            if let Some(diagnostic) = Diagnostic::decode(&state.diagnostic) {
+                line.text(b" diagnostic=")
+                    .number(u32::from(diagnostic.code()));
+            }
+        }
+    } else {
+        line.text(if state.rejected {
+            b"[iso] rejected "
+        } else {
+            b"[iso] done "
+        });
+        let result = state.result.get(..state.result_length).unwrap_or(&[]);
+        line.text(result.strip_suffix(b"\n").unwrap_or(result));
+    }
+    trace::write(syscalls, line.bytes());
+}
+
+/// Send what `print` wrote to the kernel log, one `[js]` line per line.
+fn drain_printed(state: &mut State, syscalls: &SyscallTable) {
+    let printed = state.printed.get(..state.printed_length).unwrap_or(&[]);
+    for text in printed.split(|&byte| byte == b'\n') {
+        if text.is_empty() {
+            continue;
+        }
+        let mut line = trace::Line::<PRINT_LINE>::new();
+        line.text(b"[js] ").text(text);
+        trace::write(syscalls, line.bytes());
+    }
+    state.printed_length = 0;
 }
 
 /// Say where this module got to, once every `trace` steps.
@@ -1327,6 +1790,8 @@ fn say(state: &mut State, syscalls: &SyscallTable) {
     line.text(b" calls=").number(state.calls_made);
     line.text(b" us=")
         .number(u32::try_from(now).unwrap_or(u32::MAX));
+    line.text(b" start=").number(state.start_us);
+    line.text(b" slice_max=").number(state.slice_us_max);
     trace::write(syscalls, line.bytes());
 }
 
@@ -1558,6 +2023,32 @@ fn pull_completion(state: &mut State, syscalls: &SyscallTable) {
     }
 }
 
+/// Asked to drain — by a reconfiguration, or by the runtime stopping —
+/// the task ends as a cancel ends it: at the machine's next safe point,
+/// with its outcome sent, and the step after that answers Done. A task is
+/// not carried across a drain; RFC 0001 has a paused job not
+/// hot-replaceable, and what comes back after one is a new task.
+///
+/// A task that has not started yet has nothing to wind down, and ends now.
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
+#[link_section = ".text.module_drain"]
+pub extern "C" fn module_drain(state: *mut u8) -> i32 {
+    if state.is_null() {
+        return -1;
+    }
+    // SAFETY: as for `module_step`; the loader drains between steps.
+    let state = unsafe { &mut *state.cast::<State>() };
+    state.cancel_requested = true;
+    if state.phase == 0 {
+        state.diagnostic =
+            Diagnostic::at(diagnostic::termination::CANCELLED, Severity::Error, 0).encode();
+        state.has_diagnostic = true;
+        state.failed = true;
+        state.phase = 2;
+    }
+    0
+}
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
@@ -1567,7 +2058,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
-    if state.syscalls.is_null() || state.image_in < 0 || state.result_out < 0 {
+    // The image comes on `image_in` unless the graph carried it as a
+    // parameter; the result goes out on `result_out` when one is wired. A
+    // program that runs for the life of the board has no result to wait on.
+    if state.syscalls.is_null() || (state.image_in < 0 && !state.preloaded) {
         return -2;
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
@@ -1582,7 +2076,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     drain_control(state, syscalls);
 
     if state.phase == 0 {
-        if !stage_image(state, syscalls) {
+        if !state.preloaded && !stage_image(state, syscalls) {
             return 0;
         }
         // Longer than this build stages: what is staged is a prefix, not an
@@ -1632,7 +2126,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.phase = 2;
             return 0;
         }
-        if !start(state) {
+        // The realm first, a stage a step, so that no step builds more of it
+        // than a cooperative scheduler can wait for.
+        if !state.building.done() {
+            if agent::build(agent_storage!(state), &mut state.building).is_err() {
+                state.failed = true;
+                state.phase = 2;
+            }
+            return 0;
+        }
+        // Then a seed, for a surfaced task with an entropy grant: the program
+        // may ask for randomness in the call, so the generator it draws from
+        // is keyed before it runs.
+        if !state.seed_done && !draw_seed(state, syscalls) {
+            return 0;
+        }
+        // SAFETY: the table is the loader's, live for the module's lifetime.
+        let began = unsafe { dev_micros(syscalls) };
+        let started = start(state);
+        if state.trace != 0 {
+            // SAFETY: as above.
+            let took = unsafe { dev_micros(syscalls) }.saturating_sub(began);
+            state.start_us = u32::try_from(took).unwrap_or(u32::MAX);
+        }
+        if !started {
             state.failed = true;
             state.phase = 2;
             return 0;
@@ -1644,7 +2161,38 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.phase == 1 {
         push_calls(state, syscalls);
         pull_completion(state, syscalls);
-        match advance(state) {
+        // SAFETY: the table is the loader's, live for the module's lifetime.
+        let began = unsafe { dev_micros(syscalls) };
+        let advanced = advance(state);
+        // SAFETY: as above.
+        let took = unsafe { dev_micros(syscalls) }.saturating_sub(began);
+        state.slice_us_max = state
+            .slice_us_max
+            .max(u32::try_from(took).unwrap_or(u32::MAX));
+        if state.trace != 0 && took > 2000 {
+            let mut line = trace::Line::<200>::new();
+            line.text(b"[iso] slow slice us=")
+                .number(u32::try_from(took).unwrap_or(u32::MAX))
+                .text(b" step=")
+                .number(state.trace_steps)
+                .text(b" fuel=")
+                .number(u32::try_from(state.fuel_spent).unwrap_or(u32::MAX))
+                .text(b" calls=")
+                .number(state.calls_made)
+                .text(b" setup=")
+                .number(u32::try_from(state.body_from_us.saturating_sub(began)).unwrap_or(0))
+                .text(b" body=")
+                .number(
+                    u32::try_from(state.body_to_us.saturating_sub(state.body_from_us)).unwrap_or(0),
+                )
+                .text(b" collections=")
+                .number(state.collections);
+            trace::write(syscalls, line.bytes());
+        }
+        if state.surface {
+            drain_printed(state, syscalls);
+        }
+        match advanced {
             Advance::Running => return 0,
             Advance::Done => state.phase = 2,
             Advance::Rejected => {
@@ -1661,12 +2209,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     if state.phase == 2 {
         let result = state.result.get(..state.result_length).unwrap_or(&[]);
-        if !wire::push_progress(
-            syscalls,
-            state.result_out,
-            result,
-            &mut state.result_written,
-        ) {
+        if state.result_out >= 0
+            && !wire::push_progress(
+                syscalls,
+                state.result_out,
+                result,
+                &mut state.result_written,
+            )
+        {
             return 0;
         }
         if state.has_diagnostic
@@ -1682,6 +2232,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         if !wire::push_exit(syscalls, state.exit_out, state.failed || state.rejected) {
             return 0;
+        }
+        if state.result_out < 0 {
+            log_outcome(state, syscalls);
         }
         emit_telemetry(state, syscalls);
         state.phase = 3;

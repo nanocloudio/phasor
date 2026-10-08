@@ -46,6 +46,10 @@ macro_rules! entry {
         pub extern "C" fn module_state_size() -> u32 {
             u32::try_from(core::mem::size_of::<$state>()).unwrap_or(u32::MAX)
         }
+        // The same size as data, beside the function that measures it: a
+        // part whose packer admits a graph only on a complete sum of its
+        // modules' state reads this rather than running anything.
+        declare_module_state_bytes!($state);
 
         #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
         #[link_section = ".text.module_init"]
@@ -113,6 +117,10 @@ macro_rules! entry {
         pub extern "C" fn module_state_size() -> u32 {
             u32::try_from(core::mem::size_of::<$state>()).unwrap_or(u32::MAX)
         }
+        // The same size as data, beside the function that measures it: a
+        // part whose packer admits a graph only on a complete sum of its
+        // modules' state reads this rather than running anything.
+        declare_module_state_bytes!($state);
 
         #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
         #[link_section = ".text.module_init"]

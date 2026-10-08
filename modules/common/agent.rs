@@ -161,6 +161,12 @@ pub struct Metering<'p> {
     pub collection_headroom: u32,
     /// The trace context every call the machine makes carries.
     pub trace: u64,
+    /// Bytes of host stack the machine may use below its entry; 0 leaves it
+    /// unbounded. See `Vm::bound_host_stack`.
+    pub host_stack: u32,
+    /// Collection slices one step may run; 0 finishes a collection where it
+    /// starts. See `Vm::set_collection_budget`.
+    pub collection_budget: u32,
 }
 
 /// Bring the machine up over fresh storage: a new heap, a new atom table, a
@@ -169,7 +175,7 @@ pub struct Metering<'p> {
 /// The realm and the saves come back so a later `adopt` can continue.
 pub fn fresh<'u, R>(
     units: &[Unit<'u>],
-    mut storage: Storage<'_>,
+    storage: Storage<'_>,
     attach: Attachments<'_, 'u>,
     metering: Metering<'_>,
     step: impl FnOnce(&mut Vm<'_, 'u, '_, '_>) -> R,
@@ -177,9 +183,111 @@ pub fn fresh<'u, R>(
     if units.is_empty() {
         return Err(AgentError::NoUnit);
     }
-    let mut heap = Heap::with_worklist(storage.arena, storage.slots, storage.worklist);
-    let mut atoms = Atoms::new(storage.entries, storage.handles);
-    let realm = realm::create(&mut heap, &mut atoms).map_err(AgentError::Realm)?;
+    begin(units, storage, None, attach, metering, step)
+}
+
+/// A heap, an atom table and a realm being brought up a stage at a time, for
+/// a host whose steps are too short to build a realm in one: each call to
+/// `build` adds one stage, and `fresh_built` starts the machine over what
+/// they made. Everything here is handles and counters, so it lives in the
+/// host's state between steps.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Building {
+    realm: realm::RealmBuild,
+    heap: crate::heap::HeapSave,
+    atoms: crate::string::AtomsSave,
+    started: bool,
+    done: Option<Realm>,
+}
+
+impl Building {
+    /// Whether the realm is complete.
+    pub const fn done(&self) -> bool {
+        self.done.is_some()
+    }
+
+    /// The stage the next `build` makes.
+    pub const fn stage(&self) -> u8 {
+        self.realm.stage()
+    }
+}
+
+/// Add one stage to a realm being built over fresh storage.
+pub fn build(storage: Storage<'_>, building: &mut Building) -> Result<(), AgentError> {
+    if building.done.is_some() {
+        return Ok(());
+    }
+    let mut heap = if building.started {
+        Heap::adopt(
+            storage.arena,
+            storage.slots,
+            storage.worklist,
+            &building.heap,
+        )
+    } else {
+        Heap::with_worklist(storage.arena, storage.slots, storage.worklist)
+    };
+    let mut atoms = if building.started {
+        Atoms::adopt(storage.entries, storage.handles, &building.atoms)
+    } else {
+        Atoms::new(storage.entries, storage.handles)
+    };
+    building.started = true;
+    let made = realm::create_step(&mut heap, &mut atoms, &mut building.realm)
+        .map_err(AgentError::Realm)?;
+    building.heap = heap.save();
+    building.atoms = atoms.save();
+    building.done = made;
+    Ok(())
+}
+
+/// Bring the machine up over a heap and realm `build` finished, attach every
+/// seam, run `step` and save: `fresh`, with the realm already made.
+pub fn fresh_built<'u, R>(
+    units: &[Unit<'u>],
+    storage: Storage<'_>,
+    attach: Attachments<'_, 'u>,
+    metering: Metering<'_>,
+    building: &Building,
+    step: impl FnOnce(&mut Vm<'_, 'u, '_, '_>) -> R,
+) -> Result<(R, Realm, Saves), AgentError> {
+    if units.is_empty() {
+        return Err(AgentError::NoUnit);
+    }
+    if building.done.is_none() {
+        return Err(AgentError::NoUnit);
+    }
+    begin(units, storage, Some(building), attach, metering, step)
+}
+
+/// What `fresh` and `fresh_built` share: the heap, atoms and realm made here
+/// over fresh storage, or adopted from what `build` finished.
+fn begin<'u, R>(
+    units: &[Unit<'u>],
+    mut storage: Storage<'_>,
+    built: Option<&Building>,
+    attach: Attachments<'_, 'u>,
+    metering: Metering<'_>,
+    step: impl FnOnce(&mut Vm<'_, 'u, '_, '_>) -> R,
+) -> Result<(R, Realm, Saves), AgentError> {
+    let (mut heap, mut atoms, realm) = match built.and_then(|b| b.done.map(|realm| (b, realm))) {
+        Some((building, realm)) => (
+            Heap::adopt(
+                storage.arena,
+                storage.slots,
+                storage.worklist,
+                &building.heap,
+            ),
+            Atoms::adopt(storage.entries, storage.handles, &building.atoms),
+            realm,
+        ),
+        None => {
+            let mut heap = Heap::with_worklist(storage.arena, storage.slots, storage.worklist);
+            let mut atoms = Atoms::new(storage.entries, storage.handles);
+            let realm = realm::create(&mut heap, &mut atoms).map_err(AgentError::Realm)?;
+            (heap, atoms, realm)
+        }
+    };
     let mut queue = Queue::new(storage.jobs);
     let mut bindings = Bindings::new(storage.descriptors, storage.pending);
     if let Some(resources) = storage.resources.take() {
@@ -312,6 +420,8 @@ fn run<'a, 'u, R>(
         metering.collection_headroom,
     );
     machine.set_trace(metering.trace);
+    machine.bound_host_stack(metering.host_stack as usize);
+    machine.set_collection_budget(metering.collection_budget);
     if let Some(closure) = attach.modules {
         machine.attach_modules(units, closure.instances, closure.imports);
     }

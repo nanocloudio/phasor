@@ -15,6 +15,14 @@
 //! closure, since an image with capability imports runs only as a closure.
 //! A result that is not the one the graph named is a module error, which the
 //! host reports the same way it reports a probe with a failed case.
+//!
+//! A part with no room for the compiler takes `assemble` instead of
+//! `source`: the fixture builds a verified image of a counted sum loop
+//! itself, with the same encoder the compiler uses, and that image leaves on
+//! `source_out` for the graph to wire straight to the isolate. An image
+//! carries the language's feature digest and nothing about the build that
+//! made it, so one built here is admitted by every isolate that could run a
+//! compiled one.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -35,8 +43,19 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../common/entry.rs"]
 mod entry;
 
+#[path = "../../common/bytecode.rs"]
+mod bytecode;
+#[path = "../../common/digest.rs"]
+mod digest;
+#[path = "../../common/emit.rs"]
+mod emit;
+#[path = "../../common/feature.rs"]
+mod feature;
 #[path = "../../common/text.rs"]
 mod text;
+
+use bytecode::{Function, Opcode};
+use emit::{CodeBuilder, Patch, UnitWriter};
 #[path = "../../common/trace.rs"]
 mod trace;
 #[path = "../../common/wire.rs"]
@@ -72,6 +91,12 @@ const IMAGE_BYTES: usize = 32 * 1024;
 const SPECIFIER_BYTES: usize = 32;
 /// The linker record's header: the specifier's length and the image's.
 const RECORD_HEADER: usize = 8;
+
+/// Bytes of image the assembled loop may take, and of the code inside it.
+const ASSEMBLED_BYTES: usize = 512;
+const ASSEMBLED_CODE: usize = 128;
+/// Safe points, forward patches, and labels the loop needs: one, one, two.
+const ASSEMBLED_MARKS: usize = 4;
 
 /// How the result is held to the answer.
 const SHAPE_EXACT: u8 = 0;
@@ -117,6 +142,15 @@ struct State {
     record_written: usize,
     /// Whether the record has left and the port has hung up.
     record_done: bool,
+    /// Sum `0..assemble` in an image built here; 0 sends `source` instead.
+    assemble: u32,
+    /// The assembled image's length, once built; it leaves from `image_bytes`.
+    assembled: usize,
+    image_bytes: [u8; ASSEMBLED_BYTES],
+    code: [u8; ASSEMBLED_CODE],
+    safe_points: [u32; ASSEMBLED_MARKS],
+    patches: [Patch; ASSEMBLED_MARKS],
+    labels: [u32; ASSEMBLED_MARKS],
 }
 
 define_params! {
@@ -162,6 +196,72 @@ define_params! {
         => |s, d, len| { s.trace = p_u32(d, len, 0, 0); };
     6, delay, u32, 0
         => |s, d, len| { s.delay = p_u32(d, len, 0, 0); };
+    7, assemble, u32, 0
+        => |s, d, len| { s.assemble = p_u32(d, len, 0, 0); };
+}
+
+/// Build the image of `let s = 0; for (let i = 0; i < count; i++) s += i; s`
+/// into `image_bytes`, as the compiler would lower it inside a function:
+/// both bindings in registers, a safe point on the backward edge.
+fn assemble_sum(state: &mut State) -> Option<usize> {
+    let count = i64::from(state.assemble);
+    let (length, points) = {
+        let mut builder = CodeBuilder::new(
+            &mut state.code,
+            &mut state.safe_points,
+            &mut state.patches,
+            &mut state.labels,
+        );
+        let top = builder.label();
+        let done = builder.label();
+        builder.emit(Opcode::LdaZero, &[]);
+        builder.emit(Opcode::Star, &[0]);
+        builder.emit(Opcode::LdaZero, &[]);
+        builder.emit(Opcode::Star, &[1]);
+        builder.bind(top);
+        builder.safe_point();
+        // `TestLess r` is `r < accumulator`.
+        builder.emit(Opcode::LdaSmi, &[count]);
+        builder.emit(Opcode::TestLess, &[1]);
+        builder.jump(Opcode::JumpIfFalse, done);
+        builder.emit(Opcode::Ldar, &[1]);
+        builder.emit(Opcode::Add, &[0]);
+        builder.emit(Opcode::Star, &[0]);
+        builder.emit(Opcode::Ldar, &[1]);
+        builder.emit(Opcode::Inc, &[]);
+        builder.emit(Opcode::Star, &[1]);
+        builder.jump(Opcode::Jump, top);
+        builder.bind(done);
+        builder.emit(Opcode::Ldar, &[0]);
+        builder.emit(Opcode::Return, &[]);
+        let points = builder.safe_points().len();
+        (builder.finish().ok()?, points)
+    };
+    let function = Function {
+        code_offset: 0,
+        code_length: length,
+        register_count: 2,
+        argument_count: 0,
+        frame_extent: 2,
+        exception_offset: 0,
+        exception_count: 0,
+        safe_point_offset: 0,
+        safe_point_count: u32::try_from(points).ok()?,
+        context_depth: 0,
+        context_slots: 0,
+        flags: 0,
+    };
+    UnitWriter::new(&mut state.image_bytes)
+        .write(
+            &[function],
+            &[],
+            &[],
+            state.code.get(..length as usize)?,
+            &[],
+            state.safe_points.get(..points)?,
+            0,
+        )
+        .ok()
 }
 
 /// Say where this module got to, once per step, when `trace` is set.
@@ -346,7 +446,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     if state.phase == 0 {
-        let source = state.source.get(..state.source_length).unwrap_or(&[]);
+        if state.assemble > 0 && state.assembled == 0 {
+            match assemble_sum(state) {
+                Some(written) => state.assembled = written,
+                None => return -3,
+            }
+        }
+        let source = if state.assemble > 0 {
+            state.image_bytes.get(..state.assembled).unwrap_or(&[])
+        } else {
+            state.source.get(..state.source_length).unwrap_or(&[])
+        };
         if !wire::push_progress(
             syscalls,
             state.source_out,

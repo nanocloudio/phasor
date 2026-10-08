@@ -315,13 +315,16 @@ fn object_close(syscalls: &SyscallTable, descriptor: i32) {
 }
 
 /// Turn one page of `storage.namespace` entries into the NUL-separated key
-/// list this capability answers with, dropping the namespace prefix.
+/// list this capability answers with, dropping `strip` bytes of namespace
+/// from each name (a key-shaped provider names whole keys) and keeping only
+/// names that begin with `wanted` (a directory-shaped one lists a whole
+/// directory, named relative to it).
 ///
 /// An entry is `[name_len: u8][kind: u8][name…]`, and the page ends with a
 /// `0xFF` cursor record. The cursor's own length field is a `u8` where the
 /// request's was a `u16` -- the contract says so out loud, because a consumer
 /// that guessed the other width would corrupt every page but the last.
-fn list_into(page: &[u8], strip: usize, out: &mut [u8]) -> usize {
+fn list_into(page: &[u8], strip: usize, wanted: &[u8], out: &mut [u8]) -> usize {
     let mut at = 0usize;
     let mut length = 0usize;
     while at < page.len() {
@@ -336,7 +339,7 @@ fn list_into(page: &[u8], strip: usize, out: &mut [u8]) -> usize {
         let Some(shown) = name.get(strip..) else {
             continue;
         };
-        if shown.is_empty() {
+        if shown.is_empty() || !shown.starts_with(wanted) {
             continue;
         }
         if length > 0 {
@@ -762,8 +765,17 @@ fn answer(
             // namespace prefix is stripped: a program never sees where its
             // keys actually live.
             let asked = if key == b"*" { &[][..] } else { key };
+            // A directory-shaped provider lists the children of a directory,
+            // named relative to it; a key-shaped one lists whole keys that
+            // begin with the prefix. So the one asks for this adapter's
+            // namespace and the names are filtered here, and the other is
+            // asked for the program's prefix and the namespace stripped.
+            // SAFETY: CAPS takes no argument and the table is the loader's.
+            let caps = unsafe { (syscalls.provider_call)(-1, ns::CAPS, core::ptr::null_mut(), 0) };
+            let directory = caps >= 0 && (caps as u32) & ns::caps::CHILD_NAMES != 0;
             let mut prefix = [0u8; KEY_BYTES * 2];
-            let Some(plen) = qualify(state, asked, &mut prefix) else {
+            let Some(plen) = qualify(state, if directory { &[][..] } else { asked }, &mut prefix)
+            else {
                 return refuse(record, Cause::Malformed);
             };
             let mut page = [0u8; VALUE_BYTES];
@@ -793,9 +805,15 @@ fn answer(
             if written < 0 {
                 return refuse(record, Cause::Unavailable);
             }
+            let (strip, wanted) = if directory {
+                (0, asked)
+            } else {
+                (state.namespace_length, &[][..])
+            };
             let length = list_into(
                 page.get(..written as usize).unwrap_or(&[]),
-                state.namespace_length,
+                strip,
+                wanted,
                 out,
             );
             (

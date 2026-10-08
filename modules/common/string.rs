@@ -164,6 +164,34 @@ pub fn slice(
     Ok(target)
 }
 
+/// A Latin-1 string of `count` units written from its end: `next` is asked
+/// for the last unit first. Text that is produced backwards -- the digits of
+/// a number, least significant first -- is written straight into the heap,
+/// with no buffer sized for the longest text it could be.
+pub fn latin1_from_end(
+    heap: &mut Heap<'_>,
+    count: u32,
+    mut next: impl FnMut() -> u8,
+) -> Result<Handle, HeapError> {
+    if count > MAX_UNITS {
+        return Err(HeapError::ArenaFull);
+    }
+    let size = u32::try_from(HEADER + count as usize).map_err(|_| HeapError::ArenaFull)?;
+    let handle = heap.allocate(CellKind::String, size)?;
+    let cell = heap.cell_mut(handle)?;
+    cell[0] = LATIN1;
+    cell[4..8].copy_from_slice(&count.to_le_bytes());
+    let mut index = count as usize;
+    while index > 0 {
+        index -= 1;
+        match cell.get_mut(HEADER + index) {
+            Some(slot) => *slot = next(),
+            None => return Err(HeapError::StaleHandle),
+        }
+    }
+    Ok(handle)
+}
+
 /// Allocate a string of `count` units, every one of them zero.
 fn allocate_units(heap: &mut Heap<'_>, count: u32) -> Result<Handle, HeapError> {
     if count > MAX_UNITS {

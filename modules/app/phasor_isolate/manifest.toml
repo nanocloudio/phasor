@@ -55,6 +55,13 @@ features = ["omit_json", "omit_regexp"]
 name     = "embedded"
 features = ["profile_embedded"]
 
+# The embedded profile without the two library areas a small part's program
+# least needs, which are also the two whose engines recurse: the regular
+# expression compiler and matcher, and JSON's nesting. What a Pico 2 W runs.
+[[variant]]
+name     = "embedded_lean"
+features = ["profile_embedded", "omit_json", "omit_regexp"]
+
 # Task control: cancellation, the deadline, and the reported time, as small
 # fixed records. A graph that wires nothing here runs tasks to their budgets.
 [[ports]]

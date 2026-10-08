@@ -125,6 +125,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         this: Value,
         arguments: &[Value],
     ) -> Result<Value, Completion> {
+        self.host_stack_check()?;
         let first = arguments.first().copied().unwrap_or(Value::UNDEFINED);
         match id {
             native::MAP | native::SET => {
@@ -282,6 +283,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         this: Value,
         arguments: &[Value],
     ) -> Result<Value, Completion> {
+        self.host_stack_check()?;
         let first = arguments.first().copied().unwrap_or(Value::UNDEFINED);
         let holdable = first.is_object() || matches!(first.tag(), Tag::Symbol);
         match id {

@@ -21,6 +21,12 @@
 //!
 //! It holds no address and no credential. Which adapter serves the binding is
 //! the graph's wiring, not this module's knowledge.
+//!
+//! A router has legs, one per interface it was told it serves, in the order
+//! the graph listed them: leg one is `request_out`/`reply_in`, leg two
+//! `request_out_b`/`reply_in_b`. A program granted a clock and an entropy
+//! source needs both behind one isolate, and the isolate has one call port.
+//! A graph that lists one interface wires only the first leg, as before.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -66,17 +72,34 @@ const HOST_BINDING: u32 = 0;
 /// admitting at its own table's end, so a call above this names no binding
 /// there and is refused here rather than counted past it.
 const MAX_BINDINGS: u32 = 17;
-/// Bytes of grants and of an interface identifier a graph may state, the
-/// same bounds the isolate holds them under.
+/// Bytes of grants and of the interface list a graph may state, the same
+/// bounds the isolate holds them under.
 use register::GRANTS_BYTES;
-const INTERFACE_BYTES: usize = register::MAX_INTERFACE;
-/// Calls that may be outstanding at once. One more is refused as busy, which
-/// the caller may retry.
-const IN_FLIGHT: usize = 4;
-/// Bytes of payload one call or one completion may carry behind its frame.
-const PAYLOAD_BYTES: usize = 8 * 1024;
-/// Frames that may be staged for each output at once, each with its payload.
-const STAGE: usize = 4;
+const INTERFACES_BYTES: usize = register::MAX_INTERFACE * LEGS;
+/// Adapters one router can sit in front of.
+const LEGS: usize = 2;
+
+// The application-class profile carries whole payloads; the embedded one is
+// what a part with a 240 KiB state arena can spare, sized for capabilities
+// that answer in a few bytes -- a clock, an entropy source. A payload over
+// the profile's bound is refused as busy rather than cut.
+#[cfg(not(fluxor_silicon = "rp2350"))]
+mod profile {
+    /// Calls that may be outstanding at once. One more is refused as busy,
+    /// which the caller may retry.
+    pub const IN_FLIGHT: usize = 4;
+    /// Bytes of payload one call or one completion may carry behind its frame.
+    pub const PAYLOAD_BYTES: usize = 8 * 1024;
+    /// Frames that may be staged for each output at once, each with its payload.
+    pub const STAGE: usize = 4;
+}
+#[cfg(fluxor_silicon = "rp2350")]
+mod profile {
+    pub const IN_FLIGHT: usize = 4;
+    pub const PAYLOAD_BYTES: usize = 256;
+    pub const STAGE: usize = 2;
+}
+use profile::{IN_FLIGHT, PAYLOAD_BYTES, STAGE};
 
 /// One call this router forwarded and is waiting on.
 #[derive(Clone, Copy)]
@@ -86,23 +109,11 @@ struct Outstanding {
     live: bool,
 }
 
-#[repr(C)]
-struct State {
-    syscalls: *const SyscallTable,
-    announced: bool,
-    call_in: i32,
-    reply_in: i32,
-    completion_out: i32,
+/// One adapter behind the router: the calls staged for it and the answer
+/// being taken from it.
+struct Leg {
     request_out: i32,
-    table: [Outstanding; IN_FLIGHT],
-    /// The call frame being taken, and its payload behind it.
-    call: [u8; CALL_FRAME],
-    call_filled: usize,
-    call_payload: [u8; PAYLOAD_BYTES],
-    call_payload_filled: usize,
-    call_payload_length: usize,
-    call_ready: bool,
-    /// The completion frame being taken, and its payload behind it.
+    reply_in: i32,
     reply: [u8; COMPLETION_FRAME],
     reply_filled: usize,
     reply_payload: [u8; PAYLOAD_BYTES],
@@ -112,6 +123,27 @@ struct State {
     requests: [u8; (CALL_FRAME + PAYLOAD_BYTES) * STAGE],
     requests_staged: usize,
     requests_written: usize,
+}
+
+#[repr(C)]
+struct State {
+    syscalls: *const SyscallTable,
+    announced: bool,
+    call_in: i32,
+    completion_out: i32,
+    reply_in: i32,
+    request_out: i32,
+    reply_in_b: i32,
+    request_out_b: i32,
+    table: [Outstanding; IN_FLIGHT],
+    /// The call frame being taken, and its payload behind it.
+    call: [u8; CALL_FRAME],
+    call_filled: usize,
+    call_payload: [u8; PAYLOAD_BYTES],
+    call_payload_filled: usize,
+    call_payload_length: usize,
+    call_ready: bool,
+    legs: [Leg; LEGS],
     completions: [u8; (COMPLETION_FRAME + PAYLOAD_BYTES) * STAGE],
     completions_staged: usize,
     completions_written: usize,
@@ -123,9 +155,10 @@ struct State {
     dropped: u64,
     hung_up: bool,
     phase: u8,
-    /// The interface the adapter behind this router serves.
-    interface: [u8; INTERFACE_BYTES],
-    interface_length: usize,
+    /// The interfaces the adapters behind this router serve, one per leg,
+    /// separated by commas.
+    interfaces: [u8; INTERFACES_BYTES],
+    interfaces_length: usize,
     /// The grants the isolate was given, in the order that numbers them.
     grants: [u8; GRANTS_BYTES],
     grants_length: usize,
@@ -136,13 +169,13 @@ define_params! {
 
     1, interface, str, 0
         => |s, d, len| {
-            let taken = if len > INTERFACE_BYTES { INTERFACE_BYTES } else { len };
-            s.interface_length = taken;
+            let taken = if len > INTERFACES_BYTES { INTERFACES_BYTES } else { len };
+            s.interfaces_length = taken;
             if taken > 0 {
                 // SAFETY: the params reader hands a pointer valid for `len`
                 // bytes, and `taken` is no larger than it or the field.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(d, s.interface.as_mut_ptr(), taken);
+                    core::ptr::copy_nonoverlapping(d, s.interfaces.as_mut_ptr(), taken);
                 }
             }
         };
@@ -171,21 +204,42 @@ unsafe fn apply_params(state: &mut State, params: *const u8, params_len: usize) 
     }
 }
 
-/// The method the adapter behind this router answers `binding` under, or
-/// nothing when the binding is not one it can serve.
+/// `entry` without the spaces and tabs around it.
+fn trimmed(entry: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = entry.len();
+    while start < end && matches!(entry.get(start), Some(b' ' | b'\t')) {
+        start += 1;
+    }
+    while end > start && matches!(entry.get(end - 1), Some(b' ' | b'\t')) {
+        end -= 1;
+    }
+    entry.get(start..end).unwrap_or(&[])
+}
+
+/// The leg that serves `interface`, by its place in the graph's list.
+fn leg_of(state: &State, interface: &[u8]) -> Option<usize> {
+    let list = state
+        .interfaces
+        .get(..state.interfaces_length)
+        .unwrap_or(&[]);
+    list.split(|&byte| byte == b',')
+        .map(trimmed)
+        .position(|named| !named.is_empty() && named == interface)
+        .filter(|&leg| leg < LEGS)
+}
+
+/// The leg and the method a call on `binding` goes to, or nothing when no
+/// adapter behind this router can serve it.
 ///
-/// `host` is method 0. Any other binding is the grant at that position,
-/// counted from one; it is served when its interface is the one this router
-/// was told it serves and the register knows the member.
-fn method_of(state: &State, binding: u32) -> Option<u32> {
+/// `host` is method 0 on the first leg. Any other binding is the grant at
+/// that position, counted from one; it is served by the leg whose interface
+/// it names, under the member's method in the register.
+fn method_of(state: &State, binding: u32) -> Option<(usize, u32)> {
     if binding == HOST_BINDING {
-        return Some(0);
+        return Some((0, 0));
     }
     if binding >= MAX_BINDINGS {
-        return None;
-    }
-    let interface = state.interface.get(..state.interface_length).unwrap_or(&[]);
-    if interface.is_empty() {
         return None;
     }
     let names = state.grants.get(..state.grants_length).unwrap_or(&[]);
@@ -193,15 +247,13 @@ fn method_of(state: &State, binding: u32) -> Option<u32> {
     let mut found = None;
     register::grants(names, |granted, member| {
         index += 1;
-        if index == binding && granted == interface {
-            found = register::member_of(interface, member).map(|member| member.method);
+        if index == binding {
+            found = leg_of(state, granted).and_then(|leg| {
+                register::member_of(granted, member).map(|member| (leg, member.method))
+            });
         }
     });
     found
-}
-
-fn in_flight(state: &State) -> usize {
-    state.table.iter().filter(|slot| slot.live).count()
 }
 
 /// Copy `src` into `dst` when they are the same length, answering whether
@@ -215,111 +267,78 @@ fn copy_into(dst: &mut [u8], src: &[u8]) -> bool {
     true
 }
 
+/// Append a frame and the payload behind it to a staging buffer, answering
+/// whether both fit.
+fn stage(buffer: &mut [u8], staged: &mut usize, frame: &[u8], payload: &[u8]) -> bool {
+    let at = *staged;
+    let middle = at + frame.len();
+    let end = middle + payload.len();
+    if end > buffer.len() {
+        return false;
+    }
+    if !copy_into(buffer.get_mut(at..middle).unwrap_or(&mut []), frame)
+        || !copy_into(buffer.get_mut(middle..end).unwrap_or(&mut []), payload)
+    {
+        return false;
+    }
+    *staged = end;
+    true
+}
+
 /// Stage a completion for the isolate, with the bytes it answers with behind
 /// it. A staging buffer that is full is not a reason to drop an answer: the
 /// router stops taking calls instead.
 fn stage_completion(state: &mut State, record: &CompletionRecord, payload: &[u8]) -> bool {
-    let at = state.completions_staged;
-    let frame = record.encode();
-    let end = at + COMPLETION_FRAME + payload.len();
-    if end > state.completions.len() {
-        return false;
-    }
-    if !copy_into(
-        state
-            .completions
-            .get_mut(at..at + COMPLETION_FRAME)
-            .unwrap_or(&mut []),
-        &frame,
-    ) || !copy_into(
-        state
-            .completions
-            .get_mut(at + COMPLETION_FRAME..end)
-            .unwrap_or(&mut []),
+    stage(
+        &mut state.completions,
+        &mut state.completions_staged,
+        &record.encode(),
         payload,
-    ) {
-        return false;
-    }
-    state.completions_staged = end;
-    true
+    )
 }
 
-/// Stage a call for the adapter, with its arguments behind it.
-fn stage_request(state: &mut State, frame: &[u8; CALL_FRAME], payload: &[u8]) -> bool {
-    let at = state.requests_staged;
-    let end = at + CALL_FRAME + payload.len();
-    if end > state.requests.len() {
-        return false;
-    }
-    if !copy_into(
-        state
-            .requests
-            .get_mut(at..at + CALL_FRAME)
-            .unwrap_or(&mut []),
-        frame,
-    ) || !copy_into(
-        state
-            .requests
-            .get_mut(at + CALL_FRAME..end)
-            .unwrap_or(&mut []),
-        payload,
-    ) {
-        return false;
-    }
-    state.requests_staged = end;
-    true
+/// Refuse a call, telling the caller why.
+fn refuse(state: &mut State, record: &CallRecord, cause: Cause) {
+    state.refused = state.refused.saturating_add(1);
+    let _ = stage_completion(
+        state,
+        &CompletionRecord {
+            request: record.request,
+            disposition: Disposition::Rejected,
+            cause,
+            trace: record.trace,
+            answer: Answer::None,
+        },
+        &[],
+    );
 }
 
 /// Admit, refuse, or forward one call, with the bytes behind it.
 fn route(state: &mut State, record: &CallRecord, payload: &[u8]) {
-    let Some(method) = method_of(state, record.binding) else {
-        // A binding nothing behind this router serves is refused here, and
-        // the caller is told so rather than left waiting.
-        state.refused = state.refused.saturating_add(1);
-        let _ = stage_completion(
-            state,
-            &CompletionRecord {
-                request: record.request,
-                disposition: Disposition::Rejected,
-                cause: Cause::Denied,
-                trace: record.trace,
-                answer: Answer::None,
-            },
-            &[],
-        );
-        return;
+    // A binding nothing behind this router serves is refused here, and the
+    // caller is told so rather than left waiting. So is one whose leg the
+    // graph did not wire.
+    let Some((leg, method)) = method_of(state, record.binding) else {
+        return refuse(state, record, Cause::Denied);
     };
+    if state.legs.get(leg).is_none_or(|leg| leg.request_out < 0) {
+        return refuse(state, record, Cause::Denied);
+    }
     let Some(index) = state.table.iter().position(|slot| !slot.live) else {
-        state.refused = state.refused.saturating_add(1);
-        let _ = stage_completion(
-            state,
-            &CompletionRecord {
-                request: record.request,
-                disposition: Disposition::Rejected,
-                cause: Cause::Busy,
-                trace: record.trace,
-                answer: Answer::None,
-            },
-            &[],
-        );
-        return;
+        return refuse(state, record, Cause::Busy);
     };
     let mut forwarded = *record;
     forwarded.binding = method;
-    if !stage_request(state, &forwarded.encode(), payload) {
-        state.refused = state.refused.saturating_add(1);
-        let _ = stage_completion(
-            state,
-            &CompletionRecord {
-                request: record.request,
-                disposition: Disposition::Rejected,
-                cause: Cause::Busy,
-                trace: record.trace,
-                answer: Answer::None,
-            },
-            &[],
-        );
-        return;
+    let staged = state.legs.get_mut(leg).is_some_and(|leg| {
+        stage(
+            &mut leg.requests,
+            &mut leg.requests_staged,
+            &forwarded.encode(),
+            payload,
+        )
+    });
+    if !staged {
+        return refuse(state, record, Cause::Busy);
     }
     if let Some(slot) = state.table.get_mut(index) {
         *slot = Outstanding {
@@ -343,13 +362,13 @@ fn correlate(state: &mut State, record: &CompletionRecord, payload: &[u8]) {
         return;
     };
     let trace = state.table.get(index).map_or(0, |slot| slot.trace);
+    if let Some(slot) = state.table.get_mut(index) {
+        slot.live = false;
+    }
     if trace != record.trace {
         // The correlation must hold on both fields; a mismatch is a malformed
         // answer, and the caller hears that rather than the answer.
         state.dropped = state.dropped.saturating_add(1);
-        if let Some(slot) = state.table.get_mut(index) {
-            slot.live = false;
-        }
         let _ = stage_completion(
             state,
             &CompletionRecord {
@@ -363,18 +382,66 @@ fn correlate(state: &mut State, record: &CompletionRecord, payload: &[u8]) {
         );
         return;
     }
-    if let Some(slot) = state.table.get_mut(index) {
-        slot.live = false;
-    }
     state.answered = state.answered.saturating_add(1);
     let _ = stage_completion(state, record, payload);
+}
+
+/// Take what one leg's adapter answered, and pass it to the isolate once it
+/// is whole.
+fn take_reply(state: &mut State, syscalls: &SyscallTable, leg: usize) {
+    let Some(this) = state.legs.get_mut(leg) else {
+        return;
+    };
+    if this.reply_in < 0 {
+        return;
+    }
+    if !this.reply_ready
+        && wire::take_frame(
+            syscalls,
+            this.reply_in,
+            &mut this.reply,
+            &mut this.reply_filled,
+        )
+    {
+        this.reply_filled = 0;
+        this.reply_ready = true;
+        this.reply_payload_filled = 0;
+        this.reply_payload_length = CompletionRecord::decode(&this.reply)
+            .map_or(0, |record| record.answer.payload_length() as usize)
+            .min(PAYLOAD_BYTES);
+    }
+    if !(this.reply_ready
+        && wire::take_payload(
+            syscalls,
+            this.reply_in,
+            &mut this.reply_payload,
+            &mut this.reply_payload_filled,
+            this.reply_payload_length,
+        ))
+    {
+        return;
+    }
+    this.reply_ready = false;
+    let length = this.reply_payload_length;
+    let mut payload = [0u8; PAYLOAD_BYTES];
+    copy_into(
+        payload.get_mut(..length).unwrap_or(&mut []),
+        this.reply_payload.get(..length).unwrap_or(&[]),
+    );
+    let record = CompletionRecord::decode(&this.reply);
+    this.reply_payload_filled = 0;
+    this.reply_payload_length = 0;
+    match record {
+        Some(record) => correlate(state, &record, payload.get(..length).unwrap_or(&[])),
+        None => state.dropped = state.dropped.saturating_add(1),
+    }
 }
 
 entry! {
     State;
     primary { call_in, completion_out }
-    inputs { reply_in = 1 }
-    outputs { request_out = 1 }
+    inputs { reply_in = 1, reply_in_b = 2 }
+    outputs { request_out = 1, request_out_b = 2 }
     params apply_params
 }
 
@@ -397,11 +464,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.phase == 1 {
         return 1;
     }
-    // A call is taken only when there is room to answer it, which is what
-    // stops an answer from ever being dropped for want of space.
-    if state.completions_staged + COMPLETION_FRAME <= state.completions.len()
-        && state.requests_staged + CALL_FRAME + PAYLOAD_BYTES <= state.requests.len()
-    {
+    // The ports the loader handed over, onto the legs they belong to.
+    state.legs[0].request_out = state.request_out;
+    state.legs[0].reply_in = state.reply_in;
+    state.legs[1].request_out = state.request_out_b;
+    state.legs[1].reply_in = state.reply_in_b;
+
+    // A call is taken only when there is room to answer it and room to
+    // forward it on any leg, which is what stops an answer from ever being
+    // dropped for want of space.
+    let room_to_forward = state
+        .legs
+        .iter()
+        .all(|leg| leg.requests_staged + CALL_FRAME + PAYLOAD_BYTES <= leg.requests.len());
+    if state.completions_staged + COMPLETION_FRAME <= state.completions.len() && room_to_forward {
         if !state.call_ready
             && wire::take_frame(
                 syscalls,
@@ -445,55 +521,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
     }
 
-    if state.completions_staged + COMPLETION_FRAME + PAYLOAD_BYTES <= state.completions.len() {
-        if !state.reply_ready
-            && wire::take_frame(
-                syscalls,
-                state.reply_in,
-                &mut state.reply,
-                &mut state.reply_filled,
-            )
-        {
-            state.reply_filled = 0;
-            state.reply_ready = true;
-            state.reply_payload_filled = 0;
-            state.reply_payload_length = CompletionRecord::decode(&state.reply)
-                .map_or(0, |record| record.answer.payload_length() as usize)
-                .min(PAYLOAD_BYTES);
+    let mut leg = 0usize;
+    while leg < LEGS {
+        if state.completions_staged + COMPLETION_FRAME + PAYLOAD_BYTES <= state.completions.len() {
+            take_reply(state, syscalls, leg);
         }
-        if state.reply_ready
-            && wire::take_payload(
-                syscalls,
-                state.reply_in,
-                &mut state.reply_payload,
-                &mut state.reply_payload_filled,
-                state.reply_payload_length,
-            )
-        {
-            state.reply_ready = false;
-            let length = state.reply_payload_length;
-            let mut payload = [0u8; PAYLOAD_BYTES];
-            copy_into(
-                payload.get_mut(..length).unwrap_or(&mut []),
-                state.reply_payload.get(..length).unwrap_or(&[]),
-            );
-            if let Some(record) = CompletionRecord::decode(&state.reply) {
-                correlate(state, &record, payload.get(..length).unwrap_or(&[]));
-            } else {
-                state.dropped = state.dropped.saturating_add(1);
+        if let Some(this) = state.legs.get_mut(leg) {
+            if this.request_out >= 0 {
+                wire::push_staged(
+                    syscalls,
+                    this.request_out,
+                    &this.requests,
+                    &mut this.requests_staged,
+                    &mut this.requests_written,
+                );
             }
-            state.reply_payload_filled = 0;
-            state.reply_payload_length = 0;
         }
+        leg += 1;
     }
-
-    wire::push_staged(
-        syscalls,
-        state.request_out,
-        &state.requests,
-        &mut state.requests_staged,
-        &mut state.requests_written,
-    );
     wire::push_staged(
         syscalls,
         state.completion_out,
@@ -509,7 +554,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         state.hung_up = true;
     }
     if state.hung_up
-        && state.requests_staged == 0
+        && state.legs.iter().all(|leg| leg.requests_staged == 0)
         && state.completions_staged == 0
         && state.call_filled == 0
         && !state.call_ready

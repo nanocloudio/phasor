@@ -149,6 +149,29 @@ pub fn members(interface: &[u8]) -> ([Member; MAX_MEMBERS], usize) {
     (out, count)
 }
 
+/// Bytes of the longest namespace word below.
+pub const NAMESPACE_MAX: usize = 16;
+
+/// The global a host that surfaces grants puts an interface's members under:
+/// the word a person grants it by. An interface the register does not hold
+/// has none, and is not surfaced.
+///
+/// Answered by value rather than as a borrowed slice: a `match` returning
+/// literals is a table of pointers, which a loaded module has no relocations
+/// for.
+pub fn namespace(interface: &[u8]) -> ([u8; NAMESPACE_MAX], usize) {
+    match interface {
+        b"wasi:clocks/wall-clock" => (*b"clock\0\0\0\0\0\0\0\0\0\0\0", 5),
+        b"wasi:random/random" => (*b"entropy\0\0\0\0\0\0\0\0\0", 7),
+        b"phasor:store/keyvalue" => (*b"store\0\0\0\0\0\0\0\0\0\0\0", 5),
+        b"wasi:filesystem/types" => (*b"fs\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 2),
+        b"wasi:sockets/tcp" => (*b"net\0\0\0\0\0\0\0\0\0\0\0\0\0", 3),
+        b"wasi:http/outgoing-handler" => (*b"http\0\0\0\0\0\0\0\0\0\0\0\0", 4),
+        b"phasor:net/websocket" => (*b"websocket\0\0\0\0\0\0\0", 9),
+        _ => ([0; NAMESPACE_MAX], 0),
+    }
+}
+
 /// The member an interface has under `name`, or nothing when the register
 /// holds no such interface or the interface has no such member.
 pub fn member_of(interface: &[u8], name: &[u8]) -> Option<Member> {

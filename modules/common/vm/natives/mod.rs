@@ -938,6 +938,17 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     None => Err(self.throw_type_error()),
                 }
             }
+            native::MATH_RANDOM if self.entropy.is_seeded() => {
+                // A host that seeded the machine from an entropy grant gets
+                // unpredictable values here too: 53 bits of the generator.
+                let bits = self.entropy.next_u64() >> 11;
+                let fraction = crate::softfloat::from_u64(bits) / 9_007_199_254_740_992.0;
+                Ok(Value::number(fraction))
+            }
+            native::GET_RANDOM_VALUES => {
+                let view = arguments.first().copied().unwrap_or(Value::UNDEFINED);
+                self.get_random_values(view)
+            }
             native::MATH_RANDOM => {
                 // xorshift64*: a fixed sequence, replayable exactly, with
                 // 53 bits of it scaled into [0, 1).

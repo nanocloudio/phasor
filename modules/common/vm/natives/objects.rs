@@ -9,6 +9,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         this: Value,
         arguments: &[Value],
     ) -> Result<Value, Completion> {
+        self.host_stack_check()?;
         let first = arguments.first().copied().unwrap_or(Value::UNDEFINED);
         let second = arguments.get(1).copied().unwrap_or(Value::UNDEFINED);
         match id {

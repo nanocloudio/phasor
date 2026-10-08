@@ -1,0 +1,21 @@
+# The compiler as a host tool: source on standard input, the unit image on
+# standard output. A part with no room for `phasor_compile` runs what this
+# produces, carried in its graph's config; see image.sh.
+target: linux
+tick_us: 100
+
+platform:
+  cli: {}
+
+modules:
+  - name: phasor_compile
+
+wiring:
+  - from: cli_in.stdin_out
+    to: phasor_compile.source_in
+  - from: phasor_compile.image_out
+    to: cli_out.bytes_in
+  - from: phasor_compile.diagnostic
+    to: cli_out.err_in
+  - from: phasor_compile.exit
+    to: cli_out.exit_in

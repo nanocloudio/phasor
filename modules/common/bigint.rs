@@ -640,40 +640,59 @@ pub fn shift_right(value: &Number, count: u64) -> Result<Number, BigIntError> {
     Ok(result)
 }
 
-/// The digits of a value in `radix`, written into `out` as code units.
-pub fn text(value: &Number, radix: u32, out: &mut [u16]) -> usize {
-    let mut digits = [0u8; MAX_LIMBS * 10 + 2];
-    let mut count = 0usize;
-    let mut magnitude = *value;
-    magnitude.negative = false;
-    if magnitude.is_zero() {
-        digits[0] = b'0';
-        count = 1;
+/// The text of a value in `radix`, produced from its end: the least
+/// significant digit first, then the rest, then the sign.
+///
+/// `length` is how many characters there are in all, counted by dividing
+/// once before any is produced, so the text can be written where it ends up
+/// rather than staged in a buffer as long as the longest text could be --
+/// which, in binary, is thirty-two characters a limb.
+pub struct TextFromEnd {
+    magnitude: Number,
+    radix: u32,
+    negative: bool,
+    remaining: usize,
+}
+
+impl TextFromEnd {
+    pub fn new(value: &Number, radix: u32) -> Self {
+        let mut magnitude = *value;
+        magnitude.negative = false;
+        let mut count = magnitude;
+        let mut digits = 0usize;
+        if count.is_zero() {
+            digits = 1;
+        }
+        while !count.is_zero() {
+            divide_small(&mut count, radix);
+            digits += 1;
+        }
+        Self {
+            magnitude,
+            radix,
+            negative: value.negative && !value.is_zero(),
+            remaining: digits,
+        }
     }
-    while !magnitude.is_zero() && count < digits.len() {
-        let digit = divide_small(&mut magnitude, radix) as u8;
-        digits[count] = if digit < 10 {
+
+    /// Characters in the whole text, the sign included.
+    pub fn length(&self) -> usize {
+        self.remaining + usize::from(self.negative)
+    }
+
+    /// The next character from the end.
+    pub fn next_char(&mut self) -> u8 {
+        if self.remaining == 0 {
+            return if self.negative { b'-' } else { b'0' };
+        }
+        self.remaining -= 1;
+        let digit = divide_small(&mut self.magnitude, self.radix) as u8;
+        if digit < 10 {
             b'0' + digit
         } else {
             b'a' + digit - 10
-        };
-        count += 1;
-    }
-    let mut written = 0usize;
-    if value.negative {
-        if let Some(slot) = out.get_mut(written) {
-            *slot = u16::from(b'-');
-            written += 1;
         }
     }
-    while count > 0 {
-        count -= 1;
-        if let Some(slot) = out.get_mut(written) {
-            *slot = u16::from(digits[count]);
-            written += 1;
-        }
-    }
-    written
 }
 
 /// The bitwise operations, which work on two's-complement values.

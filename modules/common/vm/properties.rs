@@ -18,6 +18,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     // Properties.
 
     pub(super) fn get_property(&mut self, target: Value, key: Key) -> Result<Value, Completion> {
+        self.host_stack_check()?;
         if target.is_nullish() {
             return Err(self.throw_type_error());
         }
@@ -379,6 +380,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         value: Value,
         strict: bool,
     ) -> Result<(), Completion> {
+        self.host_stack_check()?;
         if target.is_nullish() {
             return Err(self.throw_type_error());
         }

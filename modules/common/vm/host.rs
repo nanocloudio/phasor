@@ -370,6 +370,122 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             .map_err(|_| Completion::HEAP_EXHAUSTED)
     }
 
+    /// Seed the generator `crypto.getRandomValues` and `Math.random` draw
+    /// from, with words a host took from an entropy capability.
+    pub fn seed_entropy(&mut self, seed: &[u32; 8]) {
+        self.entropy = super::drbg::Drbg::seeded(seed);
+    }
+
+    /// Whether a host has seeded the generator.
+    pub fn entropy_seeded(&self) -> bool {
+        self.entropy.is_seeded()
+    }
+
+    /// Install `crypto.getRandomValues` and `Math.random`, for a host that has
+    /// seeded the generator: a program with an entropy grant can then ask for
+    /// randomness in the call, as the web platform lets it.
+    pub fn install_entropy(&mut self) -> Result<(), Completion> {
+        crate::realm::install_crypto(self.heap, self.atoms, &self.realm)
+            .and_then(|()| crate::realm::install_random(self.heap, self.atoms, &self.realm))
+            .map_err(|_| Completion::HEAP_EXHAUSTED)
+    }
+
+    /// `crypto.getRandomValues(view)`: fill an integer typed array from the
+    /// seeded generator and answer it. A float array is refused, and so is
+    /// one longer than 65,536 bytes, as the web platform refuses them.
+    pub(super) fn get_random_values(&mut self, view: Value) -> Result<Value, Completion> {
+        let (_, kind, _, _) = self.typed_array_parts(view)?;
+        if kind == 7 || kind == 8 || !self.entropy.is_seeded() {
+            return Err(self.throw_type_error());
+        }
+        let Some(count) = self.typed_array_length(view)? else {
+            return Err(self.throw_type_error());
+        };
+        let size = crate::realm::typed_array_element_size(kind);
+        if u64::from(count) * u64::from(size) > 65_536 {
+            return Err(self.throw_error_of(ErrorKind::Range));
+        }
+        let mut index = 0u32;
+        while index < count {
+            let value = if kind >= 9 {
+                let bits = self.entropy.next_u64();
+                let mut number = crate::bigint::Number::ZERO;
+                number.limbs[0] = bits as u32;
+                number.limbs[1] = (bits >> 32) as u32;
+                number.length = if bits >> 32 != 0 {
+                    2
+                } else {
+                    usize::from(bits != 0)
+                };
+                self.big_int_value(&number)?
+            } else {
+                let bits = self.entropy.next_u32();
+                let masked = match size {
+                    1 => bits & 0xFF,
+                    2 => bits & 0xFFFF,
+                    _ => bits,
+                };
+                Value::number(crate::softfloat::from_u64(u64::from(masked)))
+            };
+            self.typed_array_write(view, index, value)?;
+            index += 1;
+        }
+        Ok(view)
+    }
+
+    /// Give the machine a fresh instruction budget.
+    ///
+    /// A task runs on one budget, which is what bounds a program that would
+    /// otherwise run for ever. A host that is an event loop bounds each turn
+    /// of it instead -- one answer and the reactions it runs -- so a turn
+    /// that loops is still stopped, and a program that idles between timers
+    /// for weeks is not stopped for having lived.
+    pub fn refuel(&mut self, fuel: u64) {
+        self.fuel = fuel;
+    }
+
+    /// Bound the host stack the machine may use below this call to `budget`
+    /// bytes; 0 leaves it unbounded.
+    ///
+    /// The machine recurses on the host stack wherever a native calls back
+    /// into JavaScript, a getter runs inside a property read, or a module
+    /// graph is walked, and how deep that goes is a property of the program.
+    /// On a part where every module steps on one small stack nothing else
+    /// stops it, so each of those recursions checks the address of its own
+    /// frame against this limit and terminates the task with a stack
+    /// overflow rather than going past it. What a module declares as its
+    /// stack is then this budget plus the deepest path that has no check on
+    /// it, which is a bound, not a guess.
+    pub fn bound_host_stack(&mut self, budget: usize) {
+        let here = 0u8;
+        let at = core::ptr::addr_of!(here) as usize;
+        self.host_stack_limit = if budget == 0 {
+            0
+        } else {
+            at.saturating_sub(budget)
+        };
+    }
+
+    /// Whether this frame is below the host stack limit.
+    #[inline(always)]
+    pub(crate) fn host_stack_exhausted(&self) -> bool {
+        if self.host_stack_limit == 0 {
+            return false;
+        }
+        let here = 0u8;
+        (core::ptr::addr_of!(here) as usize) < self.host_stack_limit
+    }
+
+    /// The answer to a recursion that reached the host stack limit.
+    #[inline(always)]
+    pub(crate) fn host_stack_check(&self) -> Result<(), Completion> {
+        if self.host_stack_exhausted() {
+            Err(Completion::Terminated(Termination::StackOverflow))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Attach the buffer a host-installed `print` writes into, as UTF-8 with
     /// a line feed after each call. `length` is how much of it is filled, and
     /// persists in the host's storage between steps. A call that does not fit
@@ -509,6 +625,54 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         }
     }
 
+    /// Cap the collection slices one call runs, so that a host whose steps
+    /// are short spreads a collection over several of them. The program is
+    /// paused while one is open: nothing runs until it has finished, so no
+    /// value moves under the collector, and the heap's own saved state
+    /// carries the collection from one step to the next. 0, the default,
+    /// finishes a collection where it starts.
+    pub fn set_collection_budget(&mut self, slices: u32) {
+        self.collection_budget = slices;
+    }
+
+    /// Carry an open collection on by one step's budget, judging the heap if
+    /// it finishes. A host calls this before anything else in a step, and
+    /// runs nothing while `collecting` still answers true.
+    pub fn collection_step(&mut self) -> Option<Completion> {
+        if !self.collecting() {
+            return None;
+        }
+        if self.continue_collection() {
+            return self.after_collection();
+        }
+        None
+    }
+
+    /// Whether a collection is open: begun and not yet finished.
+    pub fn collecting(&self) -> bool {
+        self.heap.phase() != crate::heap::Phase::Idle
+    }
+
+    /// Run an open collection on, up to the budget. Answers whether it has
+    /// finished.
+    pub fn continue_collection(&mut self) -> bool {
+        if !self.collecting() {
+            return true;
+        }
+        let slice = self.collection_slice;
+        let mut ran = 0u32;
+        while self.collecting() {
+            if self.collection_budget != 0 && ran >= self.collection_budget {
+                return false;
+            }
+            crate::gc::collect_slice(self.heap, slice);
+            self.fuel = self.fuel.saturating_sub(u64::from(slice));
+            ran += 1;
+        }
+        self.collections = self.collections.saturating_add(1);
+        true
+    }
+
     /// Let the machine collect on its own.
     ///
     /// `roots` is where a collection stages the handles it starts from,
@@ -528,13 +692,36 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// that makes a collection necessary pays for it.
     pub(super) fn maybe_collect(&mut self) -> Option<Completion> {
         self.roots_storage.as_ref()?;
+        if self.collecting() {
+            // One the budget left open: carry it on, and judge the pressure
+            // once it has finished.
+            return if self.continue_collection() {
+                self.after_collection()
+            } else {
+                None
+            };
+        }
         if !self.pressed() {
             self.pressed_collections = 0;
+            return None;
+        }
+        if self.collection_budget != 0 {
+            // Begin it and run what the budget allows; the pressure is judged
+            // when it has finished, not while it is half done.
+            if self.begin_collection() && self.continue_collection() {
+                return self.after_collection();
+            }
             return None;
         }
         if let Some(outcome) = self.collect_now() {
             return Some(outcome);
         }
+        self.after_collection()
+    }
+
+    /// Judge the heap once a collection has finished: room again, or a live
+    /// set that has grown into the headroom.
+    fn after_collection(&mut self) -> Option<Completion> {
         if !self.pressed() {
             self.pressed_collections = 0;
             return None;
@@ -570,8 +757,37 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// that doubled away from its old copies faster than the headroom check
     /// watched — collects here and retries, so a failure means the live data
     /// truly does not fit.
+    /// Stage the roots and open a collection, answering whether one opened.
+    fn begin_collection(&mut self) -> bool {
+        let Some(storage) = self.roots_storage.take() else {
+            return false;
+        };
+        let count = self.roots(storage);
+        let room = storage.len();
+        self.roots_storage = Some(storage);
+        if count > room {
+            return false;
+        }
+        let Some(storage) = self.roots_storage.as_deref() else {
+            return false;
+        };
+        let Some(roots) = storage.get(..count) else {
+            return false;
+        };
+        self.heap.begin_collection(roots).is_ok()
+    }
+
     pub(super) fn collect_now(&mut self) -> Option<Completion> {
         self.roots_storage.as_ref()?;
+        if self.collecting() {
+            // Asked to collect now with one open: finish it, whatever the
+            // budget, since the caller cannot go on without the room.
+            let budget = self.collection_budget;
+            self.collection_budget = 0;
+            self.continue_collection();
+            self.collection_budget = budget;
+            return None;
+        }
         // Stage the roots into the caller's storage, then collect in slices.
         // The storage is taken out and put back so the machine can read its own
         // state while writing into it.
@@ -629,6 +845,20 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     pub fn run_jobs(&mut self, budget: u32) -> Result<u32, Completion> {
         let mut ran = 0u32;
         while ran < budget {
+            // Between two jobs is a boundary the collector can use: nothing is
+            // nested, and every job still to run is in the queue, which the
+            // roots name. A program whose body has finished lives here -- an
+            // event loop of timers and answers -- and without this it would
+            // never collect, and fill the heap a few turns in.
+            if self.pending_jobs() > 0 {
+                if let Some(stop) = self.maybe_collect() {
+                    return Err(stop);
+                }
+                if self.collecting() {
+                    // Open under the budget: the jobs wait for the next step.
+                    return Ok(ran);
+                }
+            }
             let Some(job) = self.next_job() else {
                 return Ok(ran);
             };

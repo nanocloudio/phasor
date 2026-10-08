@@ -82,20 +82,21 @@ use source::{Limits, LineStart, LineTable};
 
 // Sized for a real program rather than a snippet: a conformance case carries
 // its harness, and this fmod runs on the application targets, where the state
-// arena is memory the deployment declared for it.
-const SOURCE_CAPACITY: usize = 32 * 1024;
-const IMAGE_CAPACITY: usize = 64 * 1024;
-const CODE_CAPACITY: usize = 16 * 1024;
-const NODE_CAPACITY: usize = 4096;
-const LIST_CAPACITY: usize = 4096;
-const NUMBER_CAPACITY: usize = 512;
+// arena is memory the deployment declared for it. The façade alone is some
+// 34 KB of source, and a small part's program is compiled here with it.
+const SOURCE_CAPACITY: usize = 64 * 1024;
+const IMAGE_CAPACITY: usize = 128 * 1024;
+const CODE_CAPACITY: usize = 64 * 1024;
+const NODE_CAPACITY: usize = 32768;
+const LIST_CAPACITY: usize = 32768;
+const NUMBER_CAPACITY: usize = 2048;
 const SCRATCH_CAPACITY: usize = 1024;
-const LINE_CAPACITY: usize = 1024;
-const CONSTANT_CAPACITY: usize = 512;
-const DATA_CAPACITY: usize = 16 * 1024;
-const POINT_CAPACITY: usize = 1024;
-const PATCH_CAPACITY: usize = 512;
-const LABEL_CAPACITY: usize = 512;
+const LINE_CAPACITY: usize = 4096;
+const CONSTANT_CAPACITY: usize = 4096;
+const DATA_CAPACITY: usize = 64 * 1024;
+const POINT_CAPACITY: usize = 4096;
+const PATCH_CAPACITY: usize = 4096;
+const LABEL_CAPACITY: usize = 4096;
 const VERIFIER_CAPACITY: usize = 16 * 1024;
 const FUEL: u32 = 4_000_000;
 

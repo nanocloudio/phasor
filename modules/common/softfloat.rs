@@ -461,8 +461,12 @@ fn reduce(value: u64, divisor: u64) -> u64 {
 
 /// Compare two doubles: `-1`, `0`, `1`, or `2` when they are unordered.
 pub fn compare(left: f64, right: f64) -> i32 {
-    let a = left.to_bits();
-    let b = right.to_bits();
+    // Opaque to the optimiser on purpose. It recognises the NaN test below as
+    // an unordered float comparison and lowers it to `__aeabi_dcmpun` -- the
+    // routine this function implements -- so on a target that calls these
+    // routines, `__aeabi_dcmpun` called itself until the stack ran out.
+    let a = core::hint::black_box(left.to_bits());
+    let b = core::hint::black_box(right.to_bits());
     if is_nan(a) || is_nan(b) {
         return 2;
     }

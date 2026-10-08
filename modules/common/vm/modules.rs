@@ -4,12 +4,15 @@
 use super::*;
 
 /// The names a namespace object carries, sorted as they are gathered: each
-/// with its length, the slot and module it lands in, whether the module's
-/// own export claims it, whether two stars made it ambiguous, and where it
-/// finally binds.
+/// as the constant that holds it in the module it came from, with the slot
+/// and module it lands in, whether the module's own export claims it,
+/// whether two stars made it ambiguous, and where it finally binds.
+///
+/// A name is held by where it is, not copied: the units are read back when
+/// two are compared. A copy of every name is kilobytes of host stack, which
+/// a part whose modules share one small stack does not have.
 pub(super) struct NamespaceNames {
-    pub(super) names: [[u16; 64]; 64],
-    pub(super) lengths: [usize; 64],
+    pub(super) names: [u32; 64],
     pub(super) slots: [u32; 64],
     pub(super) sources: [u32; 64],
     pub(super) owns: [bool; 64],
@@ -20,8 +23,7 @@ pub(super) struct NamespaceNames {
 
 impl NamespaceNames {
     pub(super) const EMPTY: Self = Self {
-        names: [[0u16; 64]; 64],
-        lengths: [0usize; 64],
+        names: [0u32; 64],
         slots: [0u32; 64],
         sources: [0u32; 64],
         owns: [false; 64],
@@ -211,14 +213,15 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         // already holds keeps its first source.
         let mut names = NamespaceNames::EMPTY;
         let held = self.collect_namespace_names(module, &mut names);
+        // Borrowed, not moved: the table is kilobytes, and a second copy of it
+        // on the host stack is a second copy a small part has no room for.
         let NamespaceNames {
-            names,
-            lengths,
+            names: constants,
             slots,
             sources,
             dead,
             ..
-        } = names;
+        } = &names;
         let mut index = 0usize;
         while index < held {
             if dead.get(index).copied().unwrap_or(false) {
@@ -229,9 +232,9 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 name: 0,
                 slot: slots.get(index).copied().unwrap_or(0),
             };
-            let units = names[index];
-            let length = lengths[index];
             let source = sources.get(index).copied().unwrap_or(module);
+            let mut units = [0u16; 64];
+            let length = self.namespace_name(source, constants[index], &mut units);
             let name = self.make_string(units.get(..length).unwrap_or(&[]))?;
             let key = self.coerce_to_key(name)?;
             let getter = object::create_native(
@@ -477,6 +480,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
 
     /// Whether any module the graph loads was refused by the host, every
     /// edge followed, deferred ones included.
+    ///
+    /// A walk over a worklist rather than a recursion: `seen` is both the
+    /// record of what was visited and the queue of what is left to scan, so
+    /// the stack this takes is one frame whatever the graph's depth, which a
+    /// part whose modules share one unguarded stack has to be able to bound.
     pub(super) fn scan_hosts(
         &mut self,
         module: u32,
@@ -489,37 +497,47 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         seen[*count] = module;
         *count += 1;
         self.set_module_status(module, 5);
-        let base = match &self.modules {
-            Some(modules) => modules
-                .get(module as usize)
-                .map_or(u32::MAX, |instance| instance.import_base),
-            None => u32::MAX,
-        };
-        if base == u32::MAX {
-            return Ok(());
-        }
-        let held = self.unit_of(module).header().import_count;
-        let mut import = 0u32;
-        while import < held {
-            let row = self
-                .imports
-                .as_ref()
-                .and_then(|imports| imports.get((base + import) as usize))
-                .copied();
-            if let Some((source, slot)) = row {
+        let mut next = *count - 1;
+        while next < *count {
+            let current = seen.get(next).copied().unwrap_or(u32::MAX);
+            next += 1;
+            let base = match &self.modules {
+                Some(modules) => modules
+                    .get(current as usize)
+                    .map_or(u32::MAX, |instance| instance.import_base),
+                None => u32::MAX,
+            };
+            if base == u32::MAX {
+                continue;
+            }
+            let held = self.unit_of(current).header().import_count;
+            let mut import = 0u32;
+            while import < held {
+                let row = self
+                    .imports
+                    .as_ref()
+                    .and_then(|imports| imports.get((base + import) as usize))
+                    .copied();
+                import += 1;
+                let Some((source, slot)) = row else {
+                    continue;
+                };
                 // A capability has no source to visit: not a module.
                 if source == crate::bytecode::CAPABILITY_IMPORT_SOURCE {
-                    import += 1;
                     continue;
                 }
                 if slot == crate::bytecode::HOST_POISON_IMPORT {
                     return Err(self.throw_type_error());
                 }
-                if source != module && self.module_status(source) == 0 {
-                    self.scan_hosts(source, seen, count)?;
+                if source != current && self.module_status(source) == 0 {
+                    let Some(entry) = seen.get_mut(*count) else {
+                        return Err(Completion::MALFORMED);
+                    };
+                    *entry = source;
+                    *count += 1;
+                    self.set_module_status(source, 5);
                 }
             }
-            import += 1;
         }
         Ok(())
     }
@@ -532,6 +550,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         poison_only: bool,
         strict: bool,
     ) -> Result<(), Completion> {
+        self.host_stack_check()?;
         if *count >= seen.len() {
             return Err(Completion::MALFORMED);
         }
@@ -665,7 +684,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// The completion an unsettled async module behind one of this
     /// module's deferred edges will answer — the gate its evaluation waits
     /// behind — or undefined when nothing gates it.
-    pub(super) fn pending_defer_gate(&mut self, module: u32) -> Value {
+    pub(super) fn pending_defer_gate(&mut self, module: u32) -> Result<Value, Completion> {
         let mut seen = [u32::MAX; MAX_UNIT_REALMS];
         let mut count = 0usize;
         self.defer_gate_scan(module, &mut seen, &mut count, false)
@@ -677,16 +696,17 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         seen: &mut [u32; MAX_UNIT_REALMS],
         count: &mut usize,
         behind_defer: bool,
-    ) -> Value {
+    ) -> Result<Value, Completion> {
+        self.host_stack_check()?;
         let mut at = 0usize;
         while at < *count {
             if seen[at] == module {
-                return Value::UNDEFINED;
+                return Ok(Value::UNDEFINED);
             }
             at += 1;
         }
         if *count >= seen.len() {
-            return Value::UNDEFINED;
+            return Ok(Value::UNDEFINED);
         }
         seen[*count] = module;
         *count += 1;
@@ -706,7 +726,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 // concrete to gate on; a suspended one hands over its
                 // completion.
                 if unsettled && completion.is_object() {
-                    return completion;
+                    return Ok(completion);
                 }
             }
         }
@@ -717,7 +737,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             None => u32::MAX,
         };
         if base == u32::MAX {
-            return Value::UNDEFINED;
+            return Ok(Value::UNDEFINED);
         }
         let held = self.unit_of(module).header().import_count;
         let mut import = 0u32;
@@ -735,15 +755,15 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 }
                 if source != module {
                     let crossing = behind_defer || slot == crate::bytecode::DEFER_IMPORT_NAME;
-                    let found = self.defer_gate_scan(source, seen, count, crossing);
+                    let found = self.defer_gate_scan(source, seen, count, crossing)?;
                     if found.is_object() {
-                        return found;
+                        return Ok(found);
                     }
                 }
             }
             import += 1;
         }
-        Value::UNDEFINED
+        Ok(Value::UNDEFINED)
     }
 
     /// Run a deferred module on this loop, its unevaluated dependencies
@@ -768,6 +788,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         strict: bool,
         blocked: &mut Value,
     ) -> Result<(), Completion> {
+        self.host_stack_check()?;
         self.set_module_status(module, 4);
         let base = match &self.modules {
             Some(modules) => modules
@@ -806,7 +827,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                                 // async-deferred subgraph waits its turn;
                                 // its siblings run meanwhile.
                                 if !strict {
-                                    let gate = self.pending_defer_gate(source);
+                                    let gate = self.pending_defer_gate(source)?;
                                     if gate.is_object() {
                                         *blocked = gate;
                                         import += 1;
@@ -1253,6 +1274,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         pending: &mut Value,
         owner: &mut u32,
     ) -> Result<(), Completion> {
+        self.host_stack_check()?;
         let mut at = 0usize;
         while at < *count {
             if seen[at] == module {
@@ -1346,6 +1368,15 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// Gather a namespace's names: the module's own exports first, then
     /// whatever its `export * from` records reach, without `default`, a name
     /// the list already holds keeping its first source. Answers how many.
+    /// The units of a name a namespace holds: the constant `name` of `source`.
+    pub(super) fn namespace_name(&self, source: u32, name: u32, out: &mut [u16; 64]) -> usize {
+        let unit = self.unit_of(source);
+        match unit.constant(name) {
+            Some(constant) => unit.constant_units(&constant, out).unwrap_or(0),
+            None => 0,
+        }
+    }
+
     pub(super) fn collect_namespace_names(&self, module: u32, names: &mut NamespaceNames) -> usize {
         let mut held = 0usize;
         let mut queue = [0u32; 16];
@@ -1443,8 +1474,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 };
                 let mut duplicate = false;
                 let mut at = 0usize;
+                let mut other = [0u16; 64];
                 while at < held {
-                    if names.names[at].get(..names.lengths[at]) == Some(name) {
+                    let other_length =
+                        self.namespace_name(names.sources[at], names.names[at], &mut other);
+                    if other.get(..other_length) == Some(name) {
                         if !names.owns[at]
                             && !names.dead[at]
                             && (names.final_units[at], names.final_slots[at])
@@ -1463,14 +1497,17 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 }
                 let mut place = held;
                 while place > 0 {
-                    let previous = names.names[place - 1]
-                        .get(..names.lengths[place - 1])
-                        .unwrap_or(&[]);
-                    if previous <= units.get(..length).unwrap_or(&[]) {
+                    let previous_length = self.namespace_name(
+                        names.sources[place - 1],
+                        names.names[place - 1],
+                        &mut other,
+                    );
+                    if other.get(..previous_length).unwrap_or(&[])
+                        <= units.get(..length).unwrap_or(&[])
+                    {
                         break;
                     }
                     names.names[place] = names.names[place - 1];
-                    names.lengths[place] = names.lengths[place - 1];
                     names.slots[place] = names.slots[place - 1];
                     names.sources[place] = names.sources[place - 1];
                     names.owns[place] = names.owns[place - 1];
@@ -1479,8 +1516,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     names.final_slots[place] = names.final_slots[place - 1];
                     place -= 1;
                 }
-                names.names[place] = units;
-                names.lengths[place] = length;
+                names.names[place] = record.name;
                 names.slots[place] = record.slot;
                 names.sources[place] = source;
                 names.owns[place] = own;

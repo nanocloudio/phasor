@@ -1226,6 +1226,10 @@ fn advance(state: &mut State) -> Advance {
         policy: &policy,
         collection_headroom: COLLECTION_HEADROOM,
         trace: TRACE,
+        // The shell runs on an application-class part, on a stack of its own,
+        // and finishes a collection where it starts.
+        host_stack: 0,
+        collection_budget: 0,
     };
     let storage = agent::Storage {
         arena: &mut state.arena,

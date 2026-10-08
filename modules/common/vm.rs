@@ -44,6 +44,8 @@ mod coercion;
 mod coroutines;
 #[path = "vm/date.rs"]
 mod date;
+#[path = "drbg.rs"]
+pub mod drbg;
 #[path = "vm/eval.rs"]
 mod eval;
 #[path = "vm/host.rs"]
@@ -389,6 +391,9 @@ pub struct Snapshot {
     /// The state `Math.random` draws from: a fixed seed, so the sequence
     /// replays exactly unless the host seeds it from an entropy capability.
     random_state: u64,
+    /// The generator `crypto.getRandomValues` draws from, once a host has
+    /// seeded it from an entropy capability.
+    entropy: drbg::Drbg,
     realms: [Option<Realm>; MAX_REALMS],
     unit_realm: [u8; MAX_UNIT_REALMS],
     pending_eval_realm: u8,
@@ -425,6 +430,7 @@ impl Default for Snapshot {
             outbox_length: 0,
             print_status: 0,
             random_state: RANDOM_SEED,
+            entropy: drbg::Drbg::UNSEEDED,
             realms: [None; MAX_REALMS],
             unit_realm: [0; MAX_UNIT_REALMS],
             pending_eval_realm: 0,
@@ -585,9 +591,18 @@ pub struct Vm<'a, 'u, 'h, 'atoms> {
     /// Where a host-installed `print` writes its text, when the host attached
     /// somewhere: the buffer and how much of it is filled.
     print_sink: Option<(&'a mut [u8], &'a mut usize)>,
+    /// The lowest host stack address the machine may reach, or 0 for no
+    /// bound. See `bound_host_stack`.
+    host_stack_limit: usize,
+    /// Collection slices one call may run before it yields, or 0 to finish a
+    /// collection where it starts. See `set_collection_budget`.
+    collection_budget: u32,
     /// The state `Math.random` draws from: a fixed seed, so the sequence
     /// replays exactly unless the host seeds it from an entropy capability.
     random_state: u64,
+    /// The generator `crypto.getRandomValues` draws from, once a host has
+    /// seeded it from an entropy capability. See `seed_entropy`.
+    entropy: drbg::Drbg,
     /// How many native operations on the host stack have entered JavaScript
     /// beneath them right now. Each is a real host frame, so the bound is
     /// explicit rather than whatever stack the platform happened to give.
@@ -689,7 +704,10 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             completing_binding: u32::MAX,
             print_status: 0,
             print_sink: None,
+            host_stack_limit: 0,
+            collection_budget: 0,
             random_state: RANDOM_SEED,
+            entropy: drbg::Drbg::UNSEEDED,
             realms: [Some(realm), None, None, None],
             unit_realm: [0; MAX_UNIT_REALMS],
             pending_eval_realm: 0,
@@ -758,6 +776,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             outbox_length: self.outbox_length,
             print_status: self.print_status,
             random_state: self.random_state,
+            entropy: self.entropy,
             realms: self.realms,
             unit_realm: self.unit_realm,
             pending_eval_realm: self.pending_eval_realm,
@@ -794,6 +813,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         self.outbox_length = snapshot.outbox_length;
         self.print_status = snapshot.print_status;
         self.random_state = snapshot.random_state;
+        self.entropy = snapshot.entropy;
         if snapshot.realms[0].is_some() {
             self.realms = snapshot.realms;
         }
@@ -918,6 +938,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
 
     /// Run until the frame that was current on entry returns.
     fn execute(&mut self) -> Completion {
+        // The re-entry point: every native that calls back into JavaScript
+        // nests here, so this is where the host stack is held to its bound.
+        if self.host_stack_exhausted() {
+            return Completion::Terminated(Termination::StackOverflow);
+        }
         let floor = self.depth;
         loop {
             match self.drive(floor, false) {
@@ -971,6 +996,12 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 // values the roots do not name.
                 if let Some(stop) = self.maybe_collect() {
                     return Some(stop);
+                }
+                // A collection the budget left open ends the slice here: the
+                // program does not run again until it has finished.
+                if self.collecting() {
+                    self.slice = 0;
+                    return None;
                 }
             }
 
@@ -1369,6 +1400,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
 
     /// Execute one instruction.
     fn step(&mut self, instruction: &Instruction, frame: &Frame) -> Result<Flow, Completion> {
+        self.host_stack_check()?;
         use Opcode as Op;
         let operands = instruction.operands;
         let signed = instruction.signed;
@@ -2163,6 +2195,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
 
     /// Build an error object of `kind`, with the realm's prototype for it.
     fn create_error(&mut self, kind: ErrorKind, message: Value) -> Result<Value, Completion> {
+        self.host_stack_check()?;
         let prototype = self.realm.prototype_of(kind);
         let object = object::create(self.heap, Value::object(prototype))
             .map_err(|_| Completion::HEAP_EXHAUSTED)?;

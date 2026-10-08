@@ -665,6 +665,25 @@ pub fn precision(value: f64, digits: u32, out: &mut [u16]) -> usize {
     written
 }
 
+/// The value of a positive double that is a whole number below 2^53, read
+/// from its bits: nothing else is, and zero is handled before this is asked.
+fn small_integer(magnitude: f64) -> Option<u64> {
+    let bits = magnitude.to_bits();
+    let biased = (bits >> 52) & 0x7ff;
+    if biased == 0 || biased > 1075 {
+        return None;
+    }
+    let significand = (bits & ((1 << 52) - 1)) | (1 << 52);
+    let shift = 1075 - biased;
+    if shift == 0 {
+        return Some(significand);
+    }
+    if shift > 52 || significand & ((1u64 << shift) - 1) != 0 {
+        return None;
+    }
+    Some(significand >> shift)
+}
+
 /// The text of a Number, as `ToString` defines it: the shortest digits that
 /// identify the value, in fixed or exponential form as its exponent decides.
 pub fn shortest_text(value: f64, out: &mut [u16]) -> usize {
@@ -678,6 +697,31 @@ pub fn shortest_text(value: f64, out: &mut [u16]) -> usize {
     let magnitude = f64::from_bits(value.to_bits() & !(1 << 63));
     if magnitude.is_infinite() {
         return put_text(out, if negative { b"-Infinity" } else { b"Infinity" });
+    }
+
+    // An integer below 2^53 is its own shortest text: every integer there is
+    // exact, so the digits that read back as it are its decimal digits. Read
+    // off the bits and written with integer division, which on a part with no
+    // floating-point unit is the difference between microseconds and the
+    // milliseconds the general algorithm's software doubles take.
+    if let Some(integer) = small_integer(magnitude) {
+        let mut digits = [0u8; 20];
+        let mut count = 0usize;
+        let mut rest = integer;
+        while rest > 0 && count < digits.len() {
+            digits[digits.len() - 1 - count] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            count += 1;
+        }
+        let mut written = 0usize;
+        if negative {
+            written += write_ascii(&mut out[written..], b"-");
+        }
+        written += write_ascii(
+            &mut out[written..],
+            digits.get(digits.len() - count..).unwrap_or(&[]),
+        );
+        return written;
     }
 
     let shortest = shortest(magnitude);

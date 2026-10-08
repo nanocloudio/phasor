@@ -535,6 +535,9 @@ pub mod native {
     pub const DECODE_UTF8: u32 = 345;
     /// `__encodeUtf8`: text encoded as UTF-8, one byte per unit.
     pub const ENCODE_UTF8: u32 = 346;
+    /// `crypto.getRandomValues`, which a host installs once it has seeded the
+    /// machine from an entropy capability.
+    pub const GET_RANDOM_VALUES: u32 = 347;
     pub const OBJECT_PREVENT_EXTENSIONS: u32 = 176;
     pub const OBJECT_IS_EXTENSIBLE: u32 = 177;
     pub const OBJECT_SEAL: u32 = 178;
@@ -805,267 +808,387 @@ impl Realm {
 
 /// Create a realm: a global object carrying `globalThis`, `undefined`, `NaN`,
 /// and `Infinity`, and the environment whose bindings are its properties.
-pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, ObjectError> {
-    // The intrinsic prototypes come first, because everything else has one.
-    let object_prototype = object::create(heap, Value::NULL)?;
-    // The function prototype is itself callable — a function that accepts
-    // any arguments and answers undefined — which is what the specification
-    // makes it.
-    let function_prototype = object::create_native(
-        heap,
-        Value::object(object_prototype),
-        native::FUNCTION_PROTOTYPE,
-        0,
-    )?;
-    let array_prototype = object::create(heap, Value::object(object_prototype))?;
+/// A realm being built a stage at a time.
+///
+/// Building a realm is some hundreds of objects, and on a microcontroller
+/// that is longer than one cooperative step may run: a scheduler that steps
+/// every module in turn cannot wait 16 ms for one of them. So the build is
+/// staged -- each stage one or two areas of the library -- and the realm in
+/// progress is the state between stages. Everything a later stage needs from
+/// an earlier one is a field of the realm itself, a handle and never a
+/// pointer, so it can sit in a module's state between steps.
+#[derive(Clone, Copy, Debug)]
+pub struct RealmBuild {
+    stage: u8,
+    realm: Realm,
+}
 
-    let method_attributes = attribute::WRITABLE | attribute::CONFIGURABLE;
-    for (target, name, id) in [
-        (object_prototype, &b"toString"[..], native::OBJECT_TO_STRING),
-        (object_prototype, &b"valueOf"[..], native::OBJECT_VALUE_OF),
-        (array_prototype, &b"toString"[..], native::ARRAY_TO_STRING),
-        (array_prototype, &b"join"[..], native::ARRAY_JOIN),
-    ] {
-        let function = object::create_native(heap, Value::object(function_prototype), id, 0)?;
-        let key = key_of(heap, atoms, name)?;
-        object::define_own_property(
-            heap,
-            target,
-            key,
-            Descriptor::data(Value::object(function), method_attributes),
-        )?;
+impl RealmBuild {
+    pub const fn new() -> Self {
+        Self {
+            stage: 0,
+            realm: Realm {
+                global: Handle::new(0, 0),
+                environment: Handle::new(0, 0),
+                lexical: Handle::new(0, 0),
+                var_names: Handle::new(0, 0),
+                object_prototype: Handle::new(0, 0),
+                array_prototype: Handle::new(0, 0),
+                function_prototype: Handle::new(0, 0),
+                error_prototype: Handle::new(0, 0),
+                error_prototypes: [Handle::new(0, 0); 9],
+                promise_prototype: Handle::new(0, 0),
+                promise_constructor: Handle::new(0, 0),
+                string_prototype: Handle::new(0, 0),
+                number_prototype: Handle::new(0, 0),
+                boolean_prototype: Handle::new(0, 0),
+                symbol_prototype: Handle::new(0, 0),
+                big_int_prototype: Handle::new(0, 0),
+                #[cfg(not(feature = "omit_regexp"))]
+                regexp_prototype: Handle::new(0, 0),
+                iterator_prototype: Handle::new(0, 0),
+                generator_function_prototype: Handle::new(0, 0),
+                generator_object_prototype: Handle::new(0, 0),
+                async_generator_function_prototype: Handle::new(0, 0),
+                async_function_prototype: Handle::new(0, 0),
+                async_generator_object_prototype: Handle::new(0, 0),
+                map_prototype: Handle::new(0, 0),
+                weak_ref_prototype: Handle::new(0, 0),
+                date_prototype: Handle::new(0, 0),
+                array_buffer_prototype: Handle::new(0, 0),
+                data_view_prototype: Handle::new(0, 0),
+                typed_array_prototype: Handle::new(0, 0),
+                typed_array_prototypes: [Handle::new(0, 0); TYPED_ARRAY_KINDS],
+                shared_array_buffer_prototype: Handle::new(0, 0),
+                set_prototype: Handle::new(0, 0),
+                weak_map_prototype: Handle::new(0, 0),
+                weak_set_prototype: Handle::new(0, 0),
+                iterator_symbol: Handle::new(0, 0),
+                async_iterator_symbol: Handle::new(0, 0),
+                dispose_symbol: Handle::new(0, 0),
+                async_dispose_symbol: Handle::new(0, 0),
+                has_instance_symbol: Handle::new(0, 0),
+                to_primitive_symbol: Handle::new(0, 0),
+                to_string_tag_symbol: Handle::new(0, 0),
+                species_symbol: Handle::new(0, 0),
+                unscopables_symbol: Handle::new(0, 0),
+                hint_default: Handle::new(0, 0),
+                hint_number: Handle::new(0, 0),
+                hint_string: Handle::new(0, 0),
+            },
+        }
     }
 
-    let (error_prototype, error_prototypes, global) = build_errors(
-        heap,
-        atoms,
-        function_prototype,
-        method_attributes,
-        object_prototype,
-    )?;
-    let (promise_prototype, promise_constructor) = build_promises(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        method_attributes,
-        object_prototype,
-    )?;
-    let symbols = build_symbols(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        method_attributes,
-        object_prototype,
-    )?;
-    // The bundle travels whole to the builders that need several of these;
-    // the rest of this function names them one by one.
-    let Symbols {
-        symbol_prototype,
-        iterator: iterator_symbol,
-        async_iterator: async_iterator_symbol,
-        dispose: dispose_symbol,
-        async_dispose: async_dispose_symbol,
-        to_primitive: to_primitive_symbol,
-        to_string_tag: to_string_tag_symbol,
-        species: species_symbol,
-        unscopables: unscopables_symbol,
-        hint_default,
-        hint_number,
-        hint_string,
-        has_instance: has_instance_symbol,
-    } = symbols;
-    let Prototypes {
-        string: string_prototype,
-        number: number_prototype,
-        boolean: boolean_prototype,
-        iterator: iterator_prototype,
-        generator_function: generator_function_prototype,
-        generator_object: generator_object_prototype,
-        async_generator_function: async_generator_function_prototype,
-        async_generator_object: async_generator_object_prototype,
-        async_function: async_function_prototype,
-        big_int: big_int_prototype,
-        #[cfg(not(feature = "omit_regexp"))]
-            regexp: regexp_prototype,
-    } = build_functions(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        method_attributes,
-        object_prototype,
-        symbols,
-    )?;
-    build_iterators(
-        heap,
-        atoms,
-        function_prototype,
-        iterator_prototype,
-        iterator_symbol,
-        method_attributes,
-    )?;
-    let (map_prototype, set_prototype) = build_collections(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        iterator_symbol,
-        method_attributes,
-        object_prototype,
-    )?;
-    build_reflect(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        method_attributes,
-        object_prototype,
-    )?;
-    build_object_intrinsics(heap, atoms, global, object_prototype, function_prototype)?;
-    build_array_intrinsics(
-        heap,
-        atoms,
-        global,
-        array_prototype,
-        function_prototype,
-        iterator_symbol,
-    )?;
-    build_string_intrinsics(
-        heap,
-        atoms,
-        global,
-        string_prototype,
-        function_prototype,
-        iterator_symbol,
-    )?;
-    // The string prototype's own `length` is zero: it is the empty string's
-    // shape, whatever carries it.
-    define(
-        heap,
-        atoms,
-        string_prototype,
-        b"length",
-        Value::number(0.0),
-        0,
-    )?;
-    build_number_intrinsics(
-        heap,
-        atoms,
-        global,
-        number_prototype,
-        boolean_prototype,
-        function_prototype,
-    )?;
-    build_math(heap, atoms, global, object_prototype, function_prototype)?;
-    build_function_intrinsics(heap, atoms, function_prototype)?;
-    let (weak_ref_prototype, weak_map_prototype, weak_set_prototype) = build_weak(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        object_prototype,
-        to_string_tag_symbol,
-    )?;
-    let date_prototype = build_date(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        object_prototype,
-        to_primitive_symbol,
-        to_string_tag_symbol,
-    )?;
-    build_proxy(heap, atoms, function_prototype, global)?;
-    let (
-        array_buffer_prototype,
-        shared_array_buffer_prototype,
-        typed_array_prototype,
-        typed_array_prototypes,
-        data_view_prototype,
-    ) = build_buffers(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        object_prototype,
-        symbols,
-    )?;
-    #[cfg(not(feature = "omit_json"))]
-    build_json(
-        heap,
-        atoms,
-        function_prototype,
-        global,
-        object_prototype,
-        to_string_tag_symbol,
-    )?;
-    let environment = env::create_object_environment(heap, Value::UNDEFINED, global)
-        .map_err(|_| ObjectError::Heap(crate::heap::HeapError::ArenaFull))?;
-    let lexical = env::create(
-        heap,
-        env::EnvironmentKind::Declarative,
-        Value::object(environment),
-        GLOBAL_LEXICAL_CAPACITY,
-    )
-    .map_err(|_| ObjectError::Heap(crate::heap::HeapError::ArenaFull))?;
-    let var_names = env::create(
-        heap,
-        env::EnvironmentKind::Declarative,
-        Value::UNDEFINED,
-        GLOBAL_LEXICAL_CAPACITY,
-    )
-    .map_err(|_| ObjectError::Heap(crate::heap::HeapError::ArenaFull))?;
-    Ok(Realm {
-        global,
-        environment,
-        lexical,
-        var_names,
-        object_prototype,
-        array_prototype,
-        function_prototype,
-        error_prototype,
-        error_prototypes,
-        promise_prototype,
-        promise_constructor,
-        string_prototype,
-        number_prototype,
-        boolean_prototype,
-        symbol_prototype,
-        big_int_prototype,
-        #[cfg(not(feature = "omit_regexp"))]
-        regexp_prototype,
-        iterator_prototype,
-        generator_function_prototype,
-        generator_object_prototype,
-        async_generator_function_prototype,
-        async_generator_object_prototype,
-        async_function_prototype,
-        map_prototype,
-        weak_ref_prototype,
-        date_prototype,
-        array_buffer_prototype,
-        data_view_prototype,
-        typed_array_prototype,
-        typed_array_prototypes,
-        shared_array_buffer_prototype,
-        set_prototype,
-        weak_map_prototype,
-        weak_set_prototype,
-        iterator_symbol,
-        async_iterator_symbol,
-        dispose_symbol,
-        async_dispose_symbol,
-        has_instance_symbol,
-        to_primitive_symbol,
-        to_string_tag_symbol,
-        species_symbol,
-        unscopables_symbol,
-        hint_default,
-        hint_number,
-        hint_string,
-    })
+    /// The stage the next call builds, for a host that reports progress.
+    pub const fn stage(&self) -> u8 {
+        self.stage
+    }
+}
+
+impl Default for RealmBuild {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The well-known symbols as a realm under construction holds them.
+fn symbols_of(r: &Realm) -> Symbols {
+    Symbols {
+        symbol_prototype: r.symbol_prototype,
+        iterator: r.iterator_symbol,
+        async_iterator: r.async_iterator_symbol,
+        dispose: r.dispose_symbol,
+        async_dispose: r.async_dispose_symbol,
+        to_primitive: r.to_primitive_symbol,
+        to_string_tag: r.to_string_tag_symbol,
+        species: r.species_symbol,
+        unscopables: r.unscopables_symbol,
+        hint_default: r.hint_default,
+        hint_number: r.hint_number,
+        hint_string: r.hint_string,
+        has_instance: r.has_instance_symbol,
+    }
+}
+
+/// Make a realm in one go.
+pub fn create(heap: &mut Heap<'_>, atoms: &mut Atoms<'_>) -> Result<Realm, ObjectError> {
+    let mut build = RealmBuild::new();
+    loop {
+        if let Some(realm) = create_step(heap, atoms, &mut build)? {
+            return Ok(realm);
+        }
+    }
+}
+
+/// Build the next stage of a realm, answering it once the last is done.
+pub fn create_step(
+    heap: &mut Heap<'_>,
+    atoms: &mut Atoms<'_>,
+    build: &mut RealmBuild,
+) -> Result<Option<Realm>, ObjectError> {
+    let method_attributes = attribute::WRITABLE | attribute::CONFIGURABLE;
+    let r = &mut build.realm;
+    match build.stage {
+        0 => {
+            let object_prototype = object::create(heap, Value::NULL)?;
+            let function_prototype = object::create_native(
+                heap,
+                Value::object(object_prototype),
+                native::FUNCTION_PROTOTYPE,
+                0,
+            )?;
+            let array_prototype = object::create(heap, Value::object(object_prototype))?;
+            for (target, name, id) in [
+                (object_prototype, &b"toString"[..], native::OBJECT_TO_STRING),
+                (object_prototype, &b"valueOf"[..], native::OBJECT_VALUE_OF),
+                (array_prototype, &b"toString"[..], native::ARRAY_TO_STRING),
+                (array_prototype, &b"join"[..], native::ARRAY_JOIN),
+            ] {
+                let function =
+                    object::create_native(heap, Value::object(function_prototype), id, 0)?;
+                let key = key_of(heap, atoms, name)?;
+                object::define_own_property(
+                    heap,
+                    target,
+                    key,
+                    Descriptor::data(Value::object(function), method_attributes),
+                )?;
+            }
+            let (error_prototype, error_prototypes, global) = build_errors(
+                heap,
+                atoms,
+                function_prototype,
+                method_attributes,
+                object_prototype,
+            )?;
+            r.object_prototype = object_prototype;
+            r.function_prototype = function_prototype;
+            r.array_prototype = array_prototype;
+            r.error_prototype = error_prototype;
+            r.error_prototypes = error_prototypes;
+            r.global = global;
+        }
+        1 => {
+            let (promise_prototype, promise_constructor) = build_promises(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                method_attributes,
+                r.object_prototype,
+            )?;
+            r.promise_prototype = promise_prototype;
+            r.promise_constructor = promise_constructor;
+        }
+        2 => {
+            let symbols = build_symbols(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                method_attributes,
+                r.object_prototype,
+            )?;
+            r.symbol_prototype = symbols.symbol_prototype;
+            r.iterator_symbol = symbols.iterator;
+            r.async_iterator_symbol = symbols.async_iterator;
+            r.dispose_symbol = symbols.dispose;
+            r.async_dispose_symbol = symbols.async_dispose;
+            r.to_primitive_symbol = symbols.to_primitive;
+            r.to_string_tag_symbol = symbols.to_string_tag;
+            r.species_symbol = symbols.species;
+            r.unscopables_symbol = symbols.unscopables;
+            r.hint_default = symbols.hint_default;
+            r.hint_number = symbols.hint_number;
+            r.hint_string = symbols.hint_string;
+            r.has_instance_symbol = symbols.has_instance;
+        }
+        3 => {
+            let prototypes = build_functions(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                method_attributes,
+                r.object_prototype,
+                symbols_of(r),
+            )?;
+            r.string_prototype = prototypes.string;
+            r.number_prototype = prototypes.number;
+            r.boolean_prototype = prototypes.boolean;
+            r.iterator_prototype = prototypes.iterator;
+            r.generator_function_prototype = prototypes.generator_function;
+            r.generator_object_prototype = prototypes.generator_object;
+            r.async_generator_function_prototype = prototypes.async_generator_function;
+            r.async_generator_object_prototype = prototypes.async_generator_object;
+            r.async_function_prototype = prototypes.async_function;
+            r.big_int_prototype = prototypes.big_int;
+            #[cfg(not(feature = "omit_regexp"))]
+            {
+                r.regexp_prototype = prototypes.regexp;
+            }
+        }
+        4 => {
+            build_iterators(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.iterator_prototype,
+                r.iterator_symbol,
+                method_attributes,
+            )?;
+            let (map_prototype, set_prototype) = build_collections(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                r.iterator_symbol,
+                method_attributes,
+                r.object_prototype,
+            )?;
+            r.map_prototype = map_prototype;
+            r.set_prototype = set_prototype;
+        }
+        5 => {
+            build_reflect(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                method_attributes,
+                r.object_prototype,
+            )?;
+            build_object_intrinsics(
+                heap,
+                atoms,
+                r.global,
+                r.object_prototype,
+                r.function_prototype,
+            )?;
+        }
+        6 => {
+            build_array_intrinsics(
+                heap,
+                atoms,
+                r.global,
+                r.array_prototype,
+                r.function_prototype,
+                r.iterator_symbol,
+            )?;
+        }
+        7 => {
+            build_string_intrinsics(
+                heap,
+                atoms,
+                r.global,
+                r.string_prototype,
+                r.function_prototype,
+                r.iterator_symbol,
+            )?;
+            define(
+                heap,
+                atoms,
+                r.string_prototype,
+                b"length",
+                Value::number(0.0),
+                0,
+            )?;
+        }
+        8 => {
+            build_number_intrinsics(
+                heap,
+                atoms,
+                r.global,
+                r.number_prototype,
+                r.boolean_prototype,
+                r.function_prototype,
+            )?;
+            build_math(
+                heap,
+                atoms,
+                r.global,
+                r.object_prototype,
+                r.function_prototype,
+            )?;
+        }
+        9 => {
+            build_function_intrinsics(heap, atoms, r.function_prototype)?;
+            let (weak_ref_prototype, weak_map_prototype, weak_set_prototype) = build_weak(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                r.object_prototype,
+                r.to_string_tag_symbol,
+            )?;
+            r.weak_ref_prototype = weak_ref_prototype;
+            r.weak_map_prototype = weak_map_prototype;
+            r.weak_set_prototype = weak_set_prototype;
+        }
+        10 => {
+            r.date_prototype = build_date(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                r.object_prototype,
+                r.to_primitive_symbol,
+                r.to_string_tag_symbol,
+            )?;
+            build_proxy(heap, atoms, r.function_prototype, r.global)?;
+        }
+        11 => {
+            let (
+                array_buffer_prototype,
+                shared_array_buffer_prototype,
+                typed_array_prototype,
+                typed_array_prototypes,
+                data_view_prototype,
+            ) = build_buffers(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                r.object_prototype,
+                symbols_of(r),
+            )?;
+            r.array_buffer_prototype = array_buffer_prototype;
+            r.shared_array_buffer_prototype = shared_array_buffer_prototype;
+            r.typed_array_prototype = typed_array_prototype;
+            r.typed_array_prototypes = typed_array_prototypes;
+            r.data_view_prototype = data_view_prototype;
+        }
+        _ => {
+            #[cfg(not(feature = "omit_json"))]
+            build_json(
+                heap,
+                atoms,
+                r.function_prototype,
+                r.global,
+                r.object_prototype,
+                r.to_string_tag_symbol,
+            )?;
+            r.environment = env::create_object_environment(heap, Value::UNDEFINED, r.global)
+                .map_err(|_| ObjectError::Heap(crate::heap::HeapError::ArenaFull))?;
+            r.lexical = env::create(
+                heap,
+                env::EnvironmentKind::Declarative,
+                Value::object(r.environment),
+                GLOBAL_LEXICAL_CAPACITY,
+            )
+            .map_err(|_| ObjectError::Heap(crate::heap::HeapError::ArenaFull))?;
+            r.var_names = env::create(
+                heap,
+                env::EnvironmentKind::Declarative,
+                Value::UNDEFINED,
+                GLOBAL_LEXICAL_CAPACITY,
+            )
+            .map_err(|_| ObjectError::Heap(crate::heap::HeapError::ArenaFull))?;
+            return Ok(Some(build.realm));
+        }
+    }
+    build.stage += 1;
+    Ok(None)
 }
 
 /// Give a host's realm a `print` function, which records its argument in the
@@ -1142,6 +1265,36 @@ pub fn install_random(
         native::MATH_RANDOM,
         realm.function_prototype,
     )
+}
+
+/// Put `crypto.getRandomValues` on the global object, for a host that has
+/// seeded the machine's generator: entropy is a grant, so `crypto` is what a
+/// host with one installs, as `print` is what a host with output installs.
+pub fn install_crypto(
+    heap: &mut Heap<'_>,
+    atoms: &mut Atoms<'_>,
+    realm: &Realm,
+) -> Result<(), ObjectError> {
+    let crypto = object::create(heap, Value::object(realm.object_prototype))?;
+    method(
+        heap,
+        atoms,
+        crypto,
+        b"getRandomValues",
+        native::GET_RANDOM_VALUES,
+        realm.function_prototype,
+    )?;
+    let key = key_of(heap, atoms, b"crypto")?;
+    object::define_own_property(
+        heap,
+        realm.global,
+        key,
+        Descriptor::data(
+            Value::object(crypto),
+            attribute::WRITABLE | attribute::CONFIGURABLE,
+        ),
+    )?;
+    Ok(())
 }
 
 pub fn install_print(
