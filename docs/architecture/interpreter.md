@@ -62,6 +62,19 @@ Fuel is spent per instruction. Exhausting it stops execution with a termination
 the program cannot catch, as do a full frame stack, a full register file, and an
 exhausted heap.
 
+Collection is spent from the same budget, a slice at a time, so what a loop
+costs in fuel is mostly whether it allocates: a turn that makes nothing costs
+its dispatches, some seventeen for `s += i`, and a turn that makes anything
+costs that and the collector's share, forty and up. The two things a plain
+loop reaches for are therefore made not to allocate. A named access — `o.s`,
+a global, a method — keys from the image: the name's units are read out of
+the constant pool and interned, so a key is looked up, not made, and no
+string is created to be collected. And a `for (let …)` whose span holds no
+function or class, in a program with no direct eval, copies no context
+between turns: nothing could tell one turn's binding from the next, so the
+loop keeps the one it pushed. `tests/e2e/density.sh` holds both, measured
+marginally over two loop sizes.
+
 ## 4. Semantics implemented
 
 The operators are the specification's: `ToPrimitive` with the hint each context

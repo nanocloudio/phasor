@@ -212,7 +212,36 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         Ok(Key::Name(interned))
     }
 
+    /// The key a named-access instruction's constant names. A name is read
+    /// out of the image into a buffer and interned from there: a key is
+    /// looked up, not made, so a property read or a global access allocates
+    /// nothing. A name longer than the buffer, or a constant that is not a
+    /// name, goes through a string as any value does.
     pub(super) fn constant_key(&mut self, index: u32) -> Result<Key, Completion> {
+        let Some(constant) = self.unit().constant(index) else {
+            return Err(Completion::MALFORMED);
+        };
+        if matches!(constant.kind, ConstantKind::String | ConstantKind::Key)
+            && constant.second as usize <= MAX_STRING_UNITS
+        {
+            let mut units = [0u16; MAX_STRING_UNITS];
+            let length = constant.second as usize;
+            if self
+                .unit()
+                .constant_units(&constant, &mut units[..length])
+                .is_none()
+            {
+                return Err(Completion::MALFORMED);
+            }
+            if let Some(index) = string::array_index(&units[..length]) {
+                return Ok(Key::Index(index));
+            }
+            let interned = self
+                .atoms
+                .intern(self.heap, &units[..length])
+                .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+            return Ok(Key::Name(interned));
+        }
         let value = self.load_constant(index)?;
         self.coerce_to_key(value)
     }

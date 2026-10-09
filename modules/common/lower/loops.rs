@@ -198,7 +198,7 @@ impl Lowering<'_, '_, '_, '_> {
         // Each turn of a loop whose header declares with `let` gets bindings of
         // its own, so a closure made in the body keeps the value that turn had
         // rather than the one the loop stopped at.
-        let per_iteration = if pushed {
+        let per_iteration = if pushed && self.may_capture(node) {
             self.program.scope(self.scope).count
         } else {
             0
@@ -280,6 +280,19 @@ impl Lowering<'_, '_, '_, '_> {
     }
 
     /// Replace the current context with a fresh one holding the same values.
+    /// Whether anything could tell one turn's bindings from the next: a
+    /// function or class within the loop, which may close over them, or a
+    /// direct eval anywhere, which may make one. Without either the copy is
+    /// unobservable, and a loop that makes no closure makes no context.
+    pub(super) fn may_capture(&self, node: &Node) -> bool {
+        self.dynamic_names
+            || self.arena.nodes().iter().any(|inner| {
+                matches!(inner.kind, NodeKind::Function | NodeKind::Class)
+                    && inner.start >= node.start
+                    && inner.end <= node.end
+            })
+    }
+
     pub(super) fn copy_iteration(&mut self, slots: u32) {
         let mark = self.registers;
         let first = self.registers;
