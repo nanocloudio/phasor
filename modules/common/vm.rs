@@ -504,6 +504,10 @@ pub struct Vm<'a, 'u, 'h, 'atoms> {
     frames: &'a mut [Frame],
     registers: &'a mut [Value],
     depth: u32,
+    /// Whether a frame was written other than by the dispatch loop's own
+    /// program counter, which is what tells the loop its copy of the frame
+    /// on top is stale.
+    frame_changed: bool,
     top: u32,
     accumulator: Value,
     fuel: u64,
@@ -656,6 +660,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             frames,
             registers,
             depth: 0,
+            frame_changed: true,
             top: 0,
             accumulator: Value::UNDEFINED,
             fuel,
@@ -969,6 +974,28 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// `sliced` marks the outermost invocation, which is the only one that may
     /// stop at a safe point and hand control back to the host.
     fn drive(&mut self, floor: u32, sliced: bool) -> Option<Completion> {
+        let outcome = self.drive_held(floor, sliced);
+        // A nested run — a native calling back into the program — may have
+        // written the frame an outer run holds a copy of, and cleared the
+        // flag as it refreshed its own; the outer run refreshes on return.
+        self.frame_changed = true;
+        outcome
+    }
+
+    fn drive_held(&mut self, floor: u32, sliced: bool) -> Option<Completion> {
+        // The running function's code, fetched when the frame on top changes
+        // rather than for every instruction: the record is twelve reads out
+        // of the image, and most instructions run in the frame the last one
+        // ran in.
+        let mut cached_module = u32::MAX;
+        let mut cached_code = u32::MAX;
+        let mut cached_bytes: &'u [u8] = &[];
+        // And the frame on top, copied when it changes rather than for every
+        // instruction: the loop keeps its own program counter in step, and
+        // every other write to a frame says so.
+        let mut frame_depth = u32::MAX;
+        let mut frame = self.frames[0];
+        self.frame_changed = true;
         loop {
             if self.depth < floor {
                 return Some(Completion::Value(self.accumulator));
@@ -993,9 +1020,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 }
                 self.slice -= 1;
                 // Only the outermost loop collects: a nested evaluation holds
-                // values the roots do not name.
-                if let Some(stop) = self.maybe_collect() {
-                    return Some(stop);
+                // values the roots do not name. The heap's pressure is judged
+                // every sixteenth instruction — it changes only when
+                // something is allocated, and a collection that is open is
+                // carried on every instruction regardless.
+                if self.collecting() || self.slice & 15 == 0 {
+                    if let Some(stop) = self.maybe_collect() {
+                        return Some(stop);
+                    }
                 }
                 // A collection the budget left open ends the slice here: the
                 // program does not run again until it has finished.
@@ -1005,21 +1037,38 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 }
             }
 
-            let frame = self.frames[self.depth as usize - 1];
-            let Some(function) = self.unit_of(frame.module).function(frame.code) else {
-                return Some(Completion::MALFORMED);
-            };
-            let Some(code) = self.unit_of(frame.module).code(&function) else {
-                return Some(Completion::MALFORMED);
-            };
+            if self.depth != frame_depth || self.frame_changed {
+                frame = self.frames[self.depth as usize - 1];
+                frame_depth = self.depth;
+                self.frame_changed = false;
+            }
+            if frame.module != cached_module || frame.code != cached_code {
+                let Some(function) = self.unit_of(frame.module).function(frame.code) else {
+                    return Some(Completion::MALFORMED);
+                };
+                let Some(code) = self.unit_of(frame.module).code(&function) else {
+                    return Some(Completion::MALFORMED);
+                };
+                cached_module = frame.module;
+                cached_code = frame.code;
+                cached_bytes = code;
+            }
+            let code = cached_bytes;
             let Ok(instruction) = decode(code, frame.pc) else {
                 return Some(Completion::MALFORMED);
             };
             let next = frame.pc + instruction.length;
+            // The live frame moves on before the step, so a throw unwinds
+            // from the right place; the copy moves on after it, so a jump
+            // measures from the instruction it is in.
             self.frames[self.depth as usize - 1].pc = next;
 
-            match self.step(&instruction, &frame) {
-                Ok(Flow::Continue) | Ok(Flow::Enter) => {}
+            let outcome = match self.step_fast(&instruction, &frame) {
+                Some(flow) => Ok(flow),
+                None => self.step(&instruction, &frame),
+            };
+            match outcome {
+                Ok(Flow::Continue) | Ok(Flow::Enter) => frame.pc = next,
                 Ok(Flow::Jump(target)) => {
                     // A backward edge is a safe point: it is where a loop can
                     // be interrupted, and the verifier proved one is declared
@@ -1030,6 +1079,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                         }
                     }
                     self.frames[self.depth as usize - 1].pc = target;
+                    frame.pc = target;
                 }
                 Ok(Flow::Return(value)) => {
                     // A return is a safe point.
@@ -1211,6 +1261,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                                 } else {
                                     resume::NEXT
                                 };
+                                self.frame_changed = true;
                                 if let Some(running) = self.frames.get_mut(self.depth as usize - 1)
                                 {
                                     running.resume_kind = kind;
@@ -1287,8 +1338,11 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     open -= 1;
                 }
                 let index = self.depth as usize - 1;
+                self.frame_changed = true;
                 self.frames[index].pc = region.handler;
+                self.frame_changed = true;
                 self.frames[index].environment = environment;
+                self.frame_changed = true;
                 self.frames[index].contexts = region.context_depth;
                 self.set_register(&frame, region.register, thrown);
                 self.accumulator = thrown;
@@ -1399,6 +1453,90 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     }
 
     /// Execute one instruction.
+    /// The instructions a loop is mostly made of, where their operands make
+    /// them unable to throw, call out, or allocate — register moves, small
+    /// literals, a jump on a boolean, and number arithmetic and comparison —
+    /// done in the dispatch loop itself. `step` is a large function with a
+    /// large frame, and entering and leaving it cost more than these do.
+    /// Anything else, or these on other operands, answers `None` and goes
+    /// to `step`, which does exactly what it always did.
+    #[inline(always)]
+    fn step_fast(&mut self, instruction: &Instruction, frame: &Frame) -> Option<Flow> {
+        use Opcode as Op;
+        let operands = &instruction.operands;
+        match instruction.opcode {
+            Op::Ldar => self.accumulator = self.register(frame, operands[0]),
+            Op::Star => {
+                let value = self.accumulator;
+                self.set_register(frame, operands[0], value);
+            }
+            Op::Mov => {
+                let value = self.register(frame, operands[0]);
+                self.set_register(frame, operands[1], value);
+            }
+            Op::LdaUndefined => self.accumulator = Value::UNDEFINED,
+            Op::LdaTrue => self.accumulator = Value::TRUE,
+            Op::LdaFalse => self.accumulator = Value::FALSE,
+            Op::LdaZero => self.accumulator = Value::number(0.0),
+            Op::LdaSmi => {
+                self.accumulator =
+                    Value::number(crate::softfloat::from_i64(i64::from(instruction.signed[0])));
+            }
+            Op::Jump => return Some(Flow::Jump(self.jump_target(frame, instruction.signed[0]))),
+            Op::JumpIfTrue
+            | Op::JumpIfFalse
+            | Op::JumpIfToBooleanTrue
+            | Op::JumpIfToBooleanFalse
+                if matches!(self.accumulator.tag(), Tag::Boolean) =>
+            {
+                let wanted = matches!(instruction.opcode, Op::JumpIfTrue | Op::JumpIfToBooleanTrue);
+                if self.accumulator.as_boolean() == wanted {
+                    return Some(Flow::Jump(self.jump_target(frame, instruction.signed[0])));
+                }
+            }
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::TestLess
+            | Op::TestGreater
+            | Op::TestLessEqual
+            | Op::TestGreaterEqual => {
+                let left = self.register(frame, operands[0]);
+                let right = self.accumulator;
+                if !matches!(left.tag(), Tag::Number) || !matches!(right.tag(), Tag::Number) {
+                    return None;
+                }
+                let (left, right) = (left.as_number(), right.as_number());
+                self.accumulator = match instruction.opcode {
+                    Op::Add => Value::number(value::add(left, right)),
+                    Op::Sub => Value::number(value::subtract(left, right)),
+                    Op::Mul => Value::number(value::multiply(left, right)),
+                    Op::Div => Value::number(value::divide(left, right)),
+                    opcode => Value::boolean(match value::compare_numbers(left, right) {
+                        value::Comparison::Undefined => false,
+                        comparison => match opcode {
+                            Op::TestLess => comparison == value::Comparison::Less,
+                            Op::TestGreater => comparison == value::Comparison::Greater,
+                            Op::TestLessEqual => comparison != value::Comparison::Greater,
+                            _ => comparison != value::Comparison::Less,
+                        },
+                    }),
+                };
+            }
+            Op::Inc | Op::Dec | Op::ToNumeric if matches!(self.accumulator.tag(), Tag::Number) => {
+                let number = self.accumulator.as_number();
+                match instruction.opcode {
+                    Op::Inc => self.accumulator = Value::number(value::add(number, 1.0)),
+                    Op::Dec => self.accumulator = Value::number(value::subtract(number, 1.0)),
+                    _ => {}
+                }
+            }
+            _ => return None,
+        }
+        Some(Flow::Continue)
+    }
+
     fn step(&mut self, instruction: &Instruction, frame: &Frame) -> Result<Flow, Completion> {
         self.host_stack_check()?;
         use Opcode as Op;
@@ -1427,6 +1565,8 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                 self.set_register(frame, operands[1], value);
             }
 
+            // Two numbers never reach the arithmetic and comparison arms
+            // here: `step_fast` answers them.
             Op::Add => {
                 let left = self.register(frame, operands[0]);
                 let right = self.accumulator;

@@ -15,6 +15,16 @@
 //! payload behind the completion. An `open` answers with a handle: an index
 //! and a generation the binding table checks, so a handle kept past its
 //! entry's life names nothing.
+//!
+//! A store with mesh roots, Loam's among them, admits nothing without a
+//! grant. For one of those the graph names a `scope` and the `capability`
+//! chain that authorises it, and this adapter presents them before it takes
+//! a call. Every op then runs under the grant, and the listing goes through
+//! the object surface, because such a store refuses its namespace surface.
+//! Writes such a store decides later are held, and the program's call is
+//! answered once they are decided. A store without roots answers the
+//! presentation `ENOSYS` and is served as before; a graph that names no
+//! scope presents nothing.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -43,6 +53,10 @@ mod digest;
 mod numeric;
 #[path = "../../common/softfloat.rs"]
 mod softfloat;
+#[path = "../../common/text.rs"]
+mod text;
+#[path = "../../common/trace.rs"]
+mod trace;
 #[path = "../../common/value.rs"]
 mod value;
 #[path = "../../common/wire.rs"]
@@ -96,6 +110,26 @@ const METHOD_READ_AT: u32 = 5;
 /// tried again, which is the whole difference between a store that streams
 /// from somewhere and one that only ever reads local memory.
 const EAGAIN: i32 = -11;
+/// A provider whose reads are all taken: the same call may be made again.
+const EBUSY: i32 = -16;
+/// `PRESENT` from a provider with no roots: an unguarded store, served as
+/// before with no grant.
+const ENOSYS: i32 = -38;
+/// `PRESENT` taken and not yet decided, as a write's is.
+const EINPROGRESS: i32 = -36;
+
+/// Longest scope a grant names, as the contract bounds it.
+const SCOPE_BYTES: usize = 255;
+/// Longest capability chain in its text form, `fxcap1.` and base64url.
+const CAPABILITY_TEXT_BYTES: usize = 1375;
+/// Longest chain decoded, as the contract bounds it.
+const CHAIN_BYTES: usize = 1027;
+
+/// Where this adapter stands with a provider that admits by grant.
+const STANDING_OPEN: u8 = 0;
+const STANDING_PRESENTING: u8 = 1;
+const STANDING_GRANTED: u8 = 2;
+const STANDING_REFUSED: u8 = 3;
 
 /// A read waiting on a provider that answered "not yet".
 #[derive(Clone, Copy)]
@@ -194,6 +228,30 @@ struct State {
     /// provider writes the fence on whichever ask decides it.
     fence: [u8; FENCE_BYTES],
     phase: u8,
+    /// The scope this adapter presents its capability for: a key prefix
+    /// ending `/`, which the namespace must lie inside. Empty for a store
+    /// that admits without a grant.
+    scope: [u8; SCOPE_BYTES],
+    scope_length: usize,
+    /// The chain that authorises the scope, as `fxcap1.` text. It may be
+    /// longer than one parameter entry, so it arrives in pieces appended here.
+    capability: [u8; CAPABILITY_TEXT_BYTES],
+    capability_length: usize,
+    /// One of the `STANDING_` values, and the grant handle once granted.
+    standing: u8,
+    grant: i32,
+}
+
+impl State {
+    /// The handle every op passes: the grant once one is held, else `-1`,
+    /// which an unguarded store admits and a guarded one refuses.
+    fn handle(&self) -> i32 {
+        if self.standing == STANDING_GRANTED {
+            self.grant
+        } else {
+            -1
+        }
+    }
 }
 
 define_params! {
@@ -211,6 +269,41 @@ define_params! {
                 unsafe {
                     core::ptr::copy_nonoverlapping(d, s.namespace.as_mut_ptr(), taken);
                 }
+            }
+        };
+    3, scope, str, 0
+        => |s, d, len| {
+            let taken = if len > SCOPE_BYTES { SCOPE_BYTES } else { len };
+            s.scope_length = taken;
+            if taken > 0 {
+                // SAFETY: as for the namespace above.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(d, s.scope.as_mut_ptr(), taken);
+                }
+            }
+        };
+    // Appended, not replaced: the packer splits a chain longer than one
+    // entry across several under this tag, and only a handler that appends
+    // puts it back together. One that overflows is cut short, which the
+    // decode then refuses rather than presenting half a chain.
+    4, capability, str_chunked, 0
+        => |s, d, len| {
+            let room = CAPABILITY_TEXT_BYTES.saturating_sub(s.capability_length);
+            let taken = if len > room { room } else { len };
+            if taken > 0 {
+                // SAFETY: as for the namespace above; `taken` fits what is
+                // left of the field.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        d,
+                        s.capability.as_mut_ptr().add(s.capability_length),
+                        taken,
+                    );
+                }
+            }
+            s.capability_length += taken;
+            if len > room {
+                s.capability_length = CAPABILITY_TEXT_BYTES + 1;
             }
         };
 }
@@ -291,7 +384,97 @@ fn object_open(state: &State, syscalls: &SyscallTable, key: &[u8]) -> i32 {
     };
     // SAFETY: `name` is live for `length` bytes and the table is the loader's
     // own; the provider reads the key and opens it or refuses.
-    unsafe { (syscalls.provider_call)(-1, obj::GET, name.as_mut_ptr(), length) }
+    unsafe { (syscalls.provider_call)(state.handle(), obj::GET, name.as_mut_ptr(), length) }
+}
+
+/// Present this adapter's capability for its scope, answering whether calls
+/// may now be taken.
+///
+/// A store with mesh roots admits nothing on its own say-so: every op runs
+/// under a grant, and the grant is had by presenting a chain whose leaf names
+/// the scope. The graph names both, because authority is the deployment's to
+/// give and never the program's. A provider answers "not yet" while it
+/// verifies, and no call is taken until it has decided -- a call taken first
+/// would be refused for want of a grant that was merely still coming.
+#[inline(never)]
+fn stand(state: &mut State, syscalls: &SyscallTable) -> bool {
+    if state.scope_length == 0
+        || state.standing == STANDING_GRANTED
+        || state.standing == STANDING_REFUSED
+    {
+        return true;
+    }
+    let scope = state.scope.get(..state.scope_length).unwrap_or(&[]);
+    let mut chain = [0u8; CHAIN_BYTES];
+    let text = state
+        .capability
+        .get(..state.capability_length)
+        .unwrap_or(&[]);
+    // A namespace outside the scope is a graph that cannot work: every key
+    // would be refused. Said once, here, rather than once per call.
+    let inside = state
+        .namespace
+        .get(..state.namespace_length)
+        .is_some_and(|namespace| namespace.starts_with(scope));
+    let decoded = if inside {
+        abi::contracts::mesh::capability::decode_text(text, &mut chain)
+    } else {
+        None
+    };
+    let mut arg = [0u8; 1 + 2 + SCOPE_BYTES + 2 + CHAIN_BYTES];
+    let length = decoded.and_then(|length| {
+        obj::grant::encode_present(&mut arg, scope, chain.get(..length).unwrap_or(&[]))
+    });
+    let Some(length) = length else {
+        state.standing = STANDING_REFUSED;
+        say(
+            syscalls,
+            if inside {
+                b"[store] capability is not a chain"
+            } else {
+                b"[store] namespace is outside the scope"
+            },
+            None,
+        );
+        return true;
+    };
+    // SAFETY: `arg` is live for `length` bytes and carries no pointer; the
+    // table is the loader's own.
+    let rc = unsafe { (syscalls.provider_call)(-1, obj::PRESENT, arg.as_mut_ptr(), length) };
+    if rc == EAGAIN || rc == EINPROGRESS {
+        state.standing = STANDING_PRESENTING;
+        return false;
+    }
+    if rc >= 0 {
+        state.grant = rc;
+        state.standing = STANDING_GRANTED;
+        say(syscalls, b"[store] granted", None);
+    } else if rc == ENOSYS {
+        // No roots: an unguarded store, which serves `-1` as it always has.
+        state.standing = STANDING_GRANTED;
+        state.grant = -1;
+        say(syscalls, b"[store] unguarded", None);
+    } else {
+        state.standing = STANDING_REFUSED;
+        say(
+            syscalls,
+            b"[store] refused rc=",
+            Some((rc, arg[obj::grant::REFUSAL_AT])),
+        );
+    }
+    true
+}
+
+/// One line to the kernel log, with an errno and the provider's reason.
+fn say(syscalls: &SyscallTable, text: &[u8], detail: Option<(i32, u8)>) {
+    let mut line = trace::Line::<64>::new();
+    line.text(text);
+    if let Some((rc, reason)) = detail {
+        line.number(rc.unsigned_abs())
+            .text(b" reason=")
+            .number(u32::from(reason));
+    }
+    trace::write(syscalls, line.bytes());
 }
 
 /// Read through an open descriptor from `offset`, answering how much came.
@@ -483,6 +666,12 @@ fn answer(
     if state.quota != 0 && state.answered >= u64::from(state.quota) {
         return refuse(record, Cause::Denied);
     }
+    // The store refused this adapter's capability, so every call it would
+    // make is one the store refuses too. Said as the deployment's refusal,
+    // which is what it is.
+    if state.standing == STANDING_REFUSED {
+        return refuse(record, Cause::Denied);
+    }
     let payload = state
         .payload
         .get(..state.payload_length)
@@ -579,6 +768,15 @@ fn answer(
                 return refuse(record, Cause::Busy);
             };
             let descriptor = object_open(state, syscalls, key);
+            // A store that looks the key up elsewhere has not got it yet:
+            // the open is asked again, and the provider knows it for the
+            // same one.
+            if descriptor == EAGAIN {
+                return hold_from_payload(state, record);
+            }
+            if descriptor == EBUSY {
+                return refuse(record, Cause::Busy);
+            }
             if descriptor < 0 {
                 return refuse(record, Cause::Malformed);
             }
@@ -600,6 +798,12 @@ fn answer(
         }
         METHOD_READ => {
             let descriptor = object_open(state, syscalls, key);
+            if descriptor == EAGAIN {
+                return hold_from_payload(state, record);
+            }
+            if descriptor == EBUSY {
+                return refuse(record, Cause::Busy);
+            }
             if descriptor < 0 {
                 // A key the store does not hold is not a failure of the
                 // provider: the call was answered, and the answer is that
@@ -692,7 +896,7 @@ fn answer(
             // state, live until the write is decided, and the table is the
             // loader's own.
             let rc = match write_answer(unsafe {
-                (syscalls.provider_call)(-1, obj::PUT, arg.as_mut_ptr(), at)
+                (syscalls.provider_call)(state.handle(), obj::PUT, arg.as_mut_ptr(), at)
             }) {
                 // Taken, not yet decided. That is not a store that failed,
                 // and answering as though it were would tell a program its
@@ -739,7 +943,7 @@ fn answer(
             let at = put_u16(&mut arg, at, FENCE_BYTES as u16);
             // SAFETY: as for the write above.
             let rc = match write_answer(unsafe {
-                (syscalls.provider_call)(-1, obj::DELETE, arg.as_mut_ptr(), at)
+                (syscalls.provider_call)(state.handle(), obj::DELETE, arg.as_mut_ptr(), at)
             }) {
                 // Worse here than anywhere else: this member answers with
                 // whether the key went, so reading "not yet" as a number
@@ -765,6 +969,12 @@ fn answer(
             // namespace prefix is stripped: a program never sees where its
             // keys actually live.
             let asked = if key == b"*" { &[][..] } else { key };
+            // A store that admits by grant refuses its namespace surface,
+            // which has no way to carry one; its listing is the object
+            // surface's, and that is keyed whole.
+            if state.handle() >= 0 {
+                return list_granted(state, syscalls, record, asked, out);
+            }
             // A directory-shaped provider lists the children of a directory,
             // named relative to it; a key-shaped one lists whole keys that
             // begin with the prefix. So the one asks for this adapter's
@@ -829,6 +1039,84 @@ fn answer(
         }
         _ => refuse(record, Cause::Malformed),
     }
+}
+
+/// A listing under a grant: `storage.object`'s `LIST` over the program's
+/// prefix, the namespace stripped from every key.
+#[inline(never)]
+fn list_granted(
+    state: &mut State,
+    syscalls: &SyscallTable,
+    record: &CallRecord,
+    asked: &[u8],
+    out: &mut [u8],
+) -> (CompletionRecord, usize) {
+    let mut prefix = [0u8; KEY_BYTES * 2];
+    let Some(plen) = qualify(state, asked, &mut prefix) else {
+        return refuse(record, Cause::Malformed);
+    };
+    let mut page = [0u8; VALUE_BYTES];
+    let mut fence = [0u8; FENCE_BYTES];
+    let mut arg = [0u8; KEY_BYTES * 2 + 32];
+    let request = obj::list::Request {
+        prefix: prefix.get(..plen).unwrap_or(&[]),
+        cursor: &[],
+        // First page only, as the namespace listing is: a cursor is
+        // something this capability does not yet carry.
+        max_keys: 128,
+        out_ptr: page.as_mut_ptr() as u64,
+        out_cap: VALUE_BYTES as u32,
+        fence_out_ptr: fence.as_mut_ptr() as u64,
+        fence_out_cap: FENCE_BYTES as u16,
+    };
+    let Some(at) = obj::list::encode_request(&mut arg, &request) else {
+        return refuse(record, Cause::Internal);
+    };
+    // SAFETY: every pointer in `arg` names a buffer live for the call, and
+    // the table is the loader's own.
+    let written =
+        unsafe { (syscalls.provider_call)(state.handle(), obj::LIST, arg.as_mut_ptr(), at) };
+    if written == EAGAIN {
+        return hold_from_payload(state, record);
+    }
+    if written < 0 {
+        return refuse(record, Cause::Unavailable);
+    }
+    let Some(decoded) = obj::list::decode_page(page.get(..written as usize).unwrap_or(&[])) else {
+        return refuse(record, Cause::Internal);
+    };
+    let mut length = 0usize;
+    for entry in decoded.entries() {
+        let Some(shown) = entry.key.get(state.namespace_length..) else {
+            continue;
+        };
+        if shown.is_empty() {
+            continue;
+        }
+        let gap = usize::from(length > 0);
+        if length + gap + shown.len() > out.len() {
+            break;
+        }
+        if let Some(slot) = out.get_mut(length).filter(|_| gap == 1) {
+            *slot = 0;
+        }
+        copy_into(
+            out.get_mut(length + gap..length + gap + shown.len())
+                .unwrap_or(&mut []),
+            shown,
+        );
+        length += gap + shown.len();
+    }
+    (
+        CompletionRecord {
+            request: record.request,
+            disposition: Disposition::Fulfilled,
+            cause: Cause::None,
+            trace: record.trace,
+            answer: Answer::Payload(u32::try_from(length).unwrap_or(0)),
+        },
+        length,
+    )
 }
 
 /// A bounded copy of the staged payload, so the answer may borrow the store
@@ -937,6 +1225,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
     if state.phase == 1 {
         return 1;
+    }
+    // No call is taken before the store has decided on this adapter's
+    // capability: one taken first would be refused for want of a grant that
+    // was only still coming.
+    if !stand(state, syscalls) {
+        return 0;
     }
 
     // One request is taken only when there is room for its answer and the

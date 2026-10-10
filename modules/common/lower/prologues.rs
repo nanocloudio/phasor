@@ -392,6 +392,11 @@ impl Lowering<'_, '_, '_, '_> {
     /// Give every `var`-kind slot of `scope` its starting `undefined`.
     pub(super) fn initialise_hoisted(&mut self, scope: u32) {
         let record = self.program.scope(scope);
+        if record.registers {
+            // A call leaves every register `undefined`, and the prologue
+            // set the ones the arguments did not.
+            return;
+        }
         let first = record.first as usize;
         let mut index = 0u32;
         while index < record.count {

@@ -1,5 +1,5 @@
 version          = "0.0.1"
-hardware_targets = ["rp2350", "bcm2712", "wasm"]
+hardware_targets = ["rp2350", "bcm2712", "wasm", "linux"]
 
 # A program and the answer it must produce, for a graph that has no standard
 # input to take the one from and no standard output to hold the other to.

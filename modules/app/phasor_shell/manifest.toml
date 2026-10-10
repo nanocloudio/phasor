@@ -1,6 +1,6 @@
 version          = "0.0.1"
 type             = "Cli"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 timer_class      = "agnostic"
 
 # One NUL-separated argv record from the cli stack: the mode, the grants, and

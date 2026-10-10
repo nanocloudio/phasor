@@ -2,7 +2,7 @@ version = "0.0.1"
 
 # The oracle stages one whole case in module state, so it declares only the
 # targets with room for a 32 KiB staging buffer.
-hardware_targets = ["bcm2712", "wasm"]
+hardware_targets = ["bcm2712", "wasm", "linux"]
 
 [[ports]]
 name         = "cases_in"

@@ -484,7 +484,57 @@ pub(super) fn emit_function(
         }
     }
 
-    let slots = program.scope(scope).count;
+    // A function nothing inside can capture keeps its bindings in registers:
+    // no closure or class within it, no eval it might direct, no `with`, no
+    // `arguments`, a plain parameter list, and nothing lexical at its top
+    // level — so every binding is a parameter or a `var`, with no dead zone
+    // to keep, and the arguments are already where the names resolve.
+    let register_scope = match body {
+        Body::Function(function_node) => {
+            let function =
+                arena
+                    .node(function_node)
+                    .copied()
+                    .unwrap_or(Node::new(NodeKind::Null, 0, 0));
+            let captured = arena.nodes().iter().any(|inner| {
+                matches!(
+                    inner.kind,
+                    NodeKind::Function | NodeKind::Class | NodeKind::With
+                ) && inner.start >= function.start
+                    && inner.end <= function.end
+                    && !(inner.start == function.start && inner.end == function.end)
+            });
+            let record = program.scope(scope);
+            let first = record.first as usize;
+            let plain = (0..record.count as usize).all(|index| {
+                program.bindings.get(first + index).is_some_and(|binding| {
+                    matches!(binding.kind, binding_kind::VARIABLE | binding_kind::SELF)
+                })
+            });
+            simple
+                && !has_rest
+                && !polluted
+                && !uses_arguments
+                && !captured
+                && plain
+                && !program.eval_goal
+        }
+        _ => false,
+    };
+    // A register scope is still a context for the names outside it: the
+    // call makes the callee an environment record whatever it binds, which
+    // is where `this` and `new.target` live, so the records outside sit one
+    // further out. Its record just has no slots.
+    if register_scope {
+        if let Some(record) = program.scopes.get_mut(scope as usize) {
+            record.registers = true;
+        }
+    }
+    let slots = if register_scope {
+        0
+    } else {
+        program.scope(scope).count
+    };
     if matches!(body, Body::Function(_) | Body::DefaultConstructor) {
         // A call always makes the callee an environment, so its scope owns a
         // context even when it declares nothing.
@@ -492,6 +542,11 @@ pub(super) fn emit_function(
             record.context = true;
         }
     }
+    let bound_registers = if register_scope {
+        program.scope(scope).count
+    } else {
+        0
+    };
 
     let module_body = program.module && matches!(body, Body::Script(_));
     // Any direct eval in the source can create a binding a closure compiled
@@ -536,13 +591,14 @@ pub(super) fn emit_function(
             builder: &mut builder,
             program,
             function_index: index,
-            registers: 0,
+            // Bindings in registers come first; the temporaries start above.
+            registers: bound_registers,
             high_water: if uses_arguments || has_rest {
                 MAX_CALL_ARGUMENTS
             } else if parameters > 1 {
-                parameters
+                parameters.max(bound_registers)
             } else {
-                1
+                bound_registers.max(1)
             },
             scope,
             context_depth: 0,
@@ -1049,6 +1105,37 @@ impl Lowering<'_, '_, '_, '_> {
     ) {
         let record = self.program.scope(self.scope);
         let first = record.first as usize;
+        if record.registers {
+            // The arguments are in the first registers already, which is
+            // where the parameters resolve; the rest of the bindings start
+            // `undefined` — a call that supplied more arguments than there
+            // are parameters left them in those registers — and a named
+            // function expression's own name is the callee.
+            let mut slot = parameters;
+            while slot < record.count {
+                let Some(binding) = self.program.bindings.get(first + slot as usize).copied()
+                else {
+                    break;
+                };
+                if binding.kind == binding_kind::SELF {
+                    self.emit(Opcode::LdaCallee, &[]);
+                } else {
+                    self.emit(Opcode::LdaUndefined, &[]);
+                }
+                self.emit(Opcode::Star, &[i64::from(binding.slot)]);
+                slot += 1;
+            }
+            let _ = (
+                self_name,
+                function,
+                simple,
+                parameter_bindings,
+                list,
+                length,
+                concise,
+            );
+            return;
+        }
         let mut slot = 0u32;
         while slot < record.count {
             let Some(binding) = self.program.bindings.get(first + slot as usize).copied() else {

@@ -86,6 +86,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             self.set_register(&frame, register, arguments[index]);
             index += 1;
         }
+        self.frame_changed = true;
         self.frames[self.depth as usize - 1].argument_count = u32::try_from(index).unwrap_or(0);
         // The nested run is bounded by fuel like any other, and what it burns
         // is charged against the outer slice when one is open, so a module
@@ -149,6 +150,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         self.bind_new_target(environment, construct, callee)?;
         self.push_frame(code, environment, this, callee, module)?;
         let index = self.depth as usize - 1;
+        self.frame_changed = true;
         self.frames[index].construct = construct;
         let frame = self.frames[index];
         let mut position = 0usize;
@@ -160,6 +162,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             self.set_register(&frame, register, arguments[position]);
             position += 1;
         }
+        self.frame_changed = true;
         self.frames[index].argument_count = u32::try_from(position).unwrap_or(0);
         Ok(true)
     }
@@ -425,7 +428,9 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         while index < self.depth as usize {
             let running = self.frames[index];
             if running.construct && value::same_value(running.callee, constructor) {
+                self.frame_changed = true;
                 self.frames[index].this = this;
+                self.frame_changed = true;
                 self.frames[index].this_pending = false;
             }
             index += 1;
@@ -504,6 +509,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         } else {
             Value::UNDEFINED
         };
+        self.frame_changed = true;
         self.frames[self.depth as usize] = Frame {
             code,
             pc: 0,
@@ -639,7 +645,9 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             self.set_register(&frame, register, arguments[index]);
             index += 1;
         }
+        self.frame_changed = true;
         self.frames[self.depth as usize - 1].argument_count = u32::try_from(index).unwrap_or(0);
+        self.frame_changed = true;
         self.frames[self.depth as usize - 1].construct = true;
         let before = self.fuel;
         self.nested += 1;
@@ -1069,6 +1077,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         let made =
             self.super_call_native(parent, this, values.get(..count).unwrap_or(&[]), callee)?;
         if !arrow {
+            self.frame_changed = true;
             if let Some(running) = self.frames.get_mut(self.depth as usize - 1) {
                 running.this = made;
             }
@@ -1124,6 +1133,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         // base — runs on the host stack; the instance stays `this`.
         let made = self.super_call_native(parent, this, &arguments[..passed], callee)?;
         if !arrow {
+            self.frame_changed = true;
             if let Some(running) = self.frames.get_mut(self.depth as usize - 1) {
                 running.this = made;
             }

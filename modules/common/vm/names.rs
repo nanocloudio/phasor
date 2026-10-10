@@ -695,6 +695,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
 
     /// Count a context the running frame entered or left.
     pub(super) fn adjust_contexts(&mut self, change: i32) {
+        self.frame_changed = true;
         if let Some(frame) = self.frames.get_mut(self.depth.saturating_sub(1) as usize) {
             frame.contexts = if change >= 0 {
                 frame.contexts.saturating_add(1)
@@ -707,6 +708,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// Replace the running frame's environment, which is what entering and
     /// leaving a block scope does.
     pub(super) fn set_frame_environment(&mut self, environment: Value) {
+        self.frame_changed = true;
         if let Some(frame) = self.frames.get_mut(self.depth.saturating_sub(1) as usize) {
             frame.environment = environment;
         }
@@ -846,6 +848,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     }
 
     /// The template object a tagged-template site answers, made once per site and frozen.
+    #[inline(never)]
     pub(super) fn op_cache_template(&mut self, frame: &Frame, operands: &[u32; 3]) -> Step {
         let site = operands[0];
         let built = self.accumulator;
@@ -1031,12 +1034,14 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             // constructor has run, which is why the check sits here.
             return Err(self.throw_reference_error());
         }
+        self.frame_changed = true;
         self.frames[index].this_pending = false;
         // `super()` may answer another object — a parent constructor
         // overriding its return — and that object is `this` now,
         // in the frame and in the environment reads resolve through.
         let answered = self.accumulator;
         if answered.is_object() {
+            self.frame_changed = true;
             self.frames[index].this = answered;
             self.rebind_environment_this(self.frames[index].environment, answered)?;
         }

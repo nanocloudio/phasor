@@ -1,5 +1,5 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Call frames a router or a shell forwarded, each followed by its payload.
 [[ports]]

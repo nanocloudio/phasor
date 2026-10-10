@@ -1,7 +1,7 @@
 version          = "0.0.1"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["rp2350", "bcm2712", "wasm"]
+hardware_targets = ["rp2350", "bcm2712", "wasm", "linux"]
 
 # One input stream ending in HUP is one seed expression. Reads are staged so
 # Fluxor's permitted partial-read behavior cannot truncate an expression.

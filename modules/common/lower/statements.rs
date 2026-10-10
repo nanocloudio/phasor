@@ -521,7 +521,10 @@ impl Lowering<'_, '_, '_, '_> {
                 }
             }
             _ => {
-                if matches!(self.resolve(node.first, node.second), Resolved::Slot { .. }) {
+                if matches!(
+                    self.resolve(node.first, node.second),
+                    Resolved::Slot { .. } | Resolved::Register { .. }
+                ) {
                     return;
                 }
                 let constant = self.identifier_constant(&node);

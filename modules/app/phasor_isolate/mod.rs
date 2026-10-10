@@ -1598,16 +1598,21 @@ entry! {
 // The stack this module may reach, for a part where every module steps on
 // the kernel's one stack. Every recursion in the engine passes a check against
 // `HOST_STACK_BYTES` (see `Vm::bound_host_stack`), so the depth is bounded by
-// three measured terms, read off the call graph of the `embedded_lean` build
+// four measured terms, read off the call graph of the `embedded_lean` build
 // on rp2350 with the checked functions cut:
 //
-//   12,880  the deepest path that recurses nowhere, which contains the path
-//           from `module_step` to where the limit is set;
+//   14,784  W1, the deepest path that recurses nowhere: `module_step`,
+//           `advance`, the dispatch loop, `step`;
+//   10,216  E, the stack above where the limit is set — `agent::run` is
+//           inlined into `advance` and `start`, so it is `module_step` and
+//           the larger of those two frames;
 //   16,384  the budget the recursions may spend below that point;
-//    9,368  the deepest path below a check that passed, to the next check
-//           or a leaf.
+//    9,368  D, the deepest path below a check that passed, to the next
+//           check or a leaf.
 //
-// 38,632 bytes, declared as 38 KiB. It holds only where every recursion is
+// max(W1, E + budget) + D = 35,968 bytes, declared as 38 KiB. (W1 + budget
+// + D, which needs no E, is 40,536: over the declaration, and no longer the
+// figure to use now the limit's point is resolved.) It holds only where every recursion is
 // checked: the regular expression engine and JSON's nesting are not, so a
 // build carrying either declares nothing and an RP graph refuses it, rather
 // than admitting it on a figure its code can exceed.
@@ -1769,7 +1774,16 @@ fn say(state: &mut State, syscalls: &SyscallTable) {
     // is the last one before execution. Tracing from there gives a tight
     // bracket without putting a line on the wire for every step of a wait
     // that can be tens of thousands of them.
-    let close_to_work = state.phase == 1 || state.image_length > 0;
+    //
+    // A surfaced task is the exception: it is an event loop, in the running
+    // phase for as long as the board is up, so "every step while running"
+    // is every step for good — a line a step floods the kernel's log ring
+    // and evicts the boot lines before anything attaches to read them. It
+    // has no single step to bracket either, so it takes the rate like an
+    // idle wait does, and only its staging step is traced unconditionally.
+    let one_shot_running = state.phase == 1 && !state.surface;
+    let staging = state.phase == 0 && state.image_length > 0;
+    let close_to_work = one_shot_running || staging;
     if !close_to_work && !state.trace_steps.is_multiple_of(state.trace) {
         return;
     }

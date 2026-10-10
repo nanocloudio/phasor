@@ -24,6 +24,12 @@ impl Lowering<'_, '_, '_, '_> {
                     break;
                 };
                 if self.same_name(self.span(binding.start, binding.end), text) {
+                    if record.registers {
+                        return Resolved::Register {
+                            register: binding.slot,
+                            kind: binding.kind,
+                        };
+                    }
                     if record.parent == NONE
                         && !self.program.eval_goal
                         && !self.program.module
@@ -145,6 +151,9 @@ impl Lowering<'_, '_, '_, '_> {
                 self.note_depth(depth);
                 self.emit(Opcode::LdaContextSlot, &[i64::from(slot), i64::from(depth)]);
             }
+            Resolved::Register { register, .. } => {
+                self.emit(Opcode::Ldar, &[i64::from(register)]);
+            }
             Resolved::Global => {
                 let constant = self.identifier_constant(node);
                 let opcode = if self.dynamic_names || self.with_depth > 0 {
@@ -259,6 +268,19 @@ impl Lowering<'_, '_, '_, '_> {
                     self.emit(Opcode::StaContextSlot, &[i64::from(slot), i64::from(depth)]);
                 }
             }
+            Resolved::Register { register, kind } => {
+                if kind == binding_kind::CONST {
+                    self.emit(Opcode::ThrowSelfAssignment, &[]);
+                    return;
+                }
+                if kind == binding_kind::SELF {
+                    if self.strict {
+                        self.emit(Opcode::ThrowSelfAssignment, &[]);
+                    }
+                    return;
+                }
+                self.emit(Opcode::Star, &[i64::from(register)]);
+            }
             Resolved::Global => {
                 let constant = self.identifier_constant(node);
                 // Strict code assigns only what exists; sloppy code creates.
@@ -283,6 +305,9 @@ impl Lowering<'_, '_, '_, '_> {
                     Opcode::InitContextSlot,
                     &[i64::from(slot), i64::from(depth)],
                 );
+            }
+            Resolved::Register { register, .. } => {
+                self.emit(Opcode::Star, &[i64::from(register)]);
             }
             Resolved::Global => {
                 let constant = self.identifier_constant(node);

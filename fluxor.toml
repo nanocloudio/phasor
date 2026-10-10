@@ -13,6 +13,10 @@ fluxor = "0.0.1"
 # protocol of its own: what version carried a request, and how its body was
 # framed, is the provider's business and reaches no program.
 wave = "0.0.1"
+# A store is the deployment's, and Loam is one a deployment can wire behind
+# `phasor_store`: `examples/capabilities/store-loam.yaml` composes its node
+# modules, and nothing in this project's own modules depends on it.
+loam = "0.0.1"
 
 [ci]
 targets = ["rp2350", "bcm2712", "wasm"]

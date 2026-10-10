@@ -979,7 +979,9 @@ impl Lowering<'_, '_, '_, '_> {
                     // A declared binding does not go away: `delete x` answers
                     // false without reading the binding, so a name still in
                     // its dead zone is not an error here.
-                    Resolved::Slot { .. } => self.emit(Opcode::LdaFalse, &[]),
+                    Resolved::Slot { .. } | Resolved::Register { .. } => {
+                        self.emit(Opcode::LdaFalse, &[])
+                    }
                     // A free name is a property of the global object, or of
                     // nothing: deleting answers whether it is gone, and a
                     // `var` global refuses because it is not configurable.

@@ -183,13 +183,26 @@ somewhere it would not survive.
 
 A provider may answer a read with "not yet" rather than with bytes or a
 refusal: Fluxor's `EAGAIN`, which the contract says a consumer must treat as
-ask-again and never as absent. The adapter holds the call and asks on its
-next step. No provider on Linux answers that way, so the path is exercised on
-WebAssembly, where both the object and the filesystem providers fetch from
-the host and the first answer for a key or a file is pending by construction.
+ask-again and never as absent. A write's "not yet" is `EINPROGRESS`: taken,
+not yet decided, and asked again with the same request until the decision
+comes back. The adapter holds either call and asks on its next step. On
+WebAssembly both the object and the filesystem providers fetch from the
+host, so the first answer for a key or a file is pending by construction;
 `examples/wasm/store.yaml` and `examples/wasm/fs.yaml` are those two, and
 `tests/wasm/run.sh` refuses a pass in which either provider never said "not
-yet".
+yet". On Linux, Loam's storage node answers every op that way, because its
+admin plane decides after the call returns; `examples/capabilities/store-loam.yaml`
+is that graph and `tests/e2e/loam.sh` drives it.
+
+A store with mesh roots, as Loam's is, admits nothing without a grant. The
+graph gives `phasor_store` a `scope` and the `capability` chain that
+authorises it, and the adapter presents them before it takes a call; until
+the store has decided, calls wait. Every op then runs under the grant, and a
+listing goes through the object surface, since such a store refuses its
+namespace surface. A chain the store refuses makes every call the
+deployment's refusal, `Denied`; a chain that only reads leaves writes refused
+by the store. The scope is the deployment's to name and the namespace must
+lie inside it, so a program still sees only its own keys.
 
 Holding it is not the same as holding it once. A call the provider defers a
 second time stays held; a whole-file read is retried by re-opening, since the
@@ -295,28 +308,34 @@ build the graph at all.
 These are the limits of the verifier the engine carries, which is what
 decides a chain on a target that offers no `trust` provider. A graph that
 sets `trust: system` asks the platform instead, and reaches whatever the host
-itself would; none of the four apply to it. `packaging/cli/linux.yaml` is
+itself would; none of what follows applies to it. `packaging/cli/linux.yaml` is
 such a graph.
 
-Four things are tolerated so that anything works at all where the engine
-verifies. Each is named, each is held by `tests/e2e/tls.sh`, and each has the
-one change that deletes it — not a setting that hides it.
+What the engine verifies: P-256, P-384, Ed25519 and ML-DSA signatures, and
+RSA from 2048 to 4096 bits (PKCS#1 v1.5 in certificates, PSS in
+CertificateVerify), against an anchor that may be a bundle of authorities —
+so a deployment that mounts the public roots it trusts reaches public
+issuers. RSA-PSS as a *certificate* signature is named and refused.
+
+Two things are still tolerated. Each is named, each is held by
+`tests/e2e/tls.sh`, and each has the one change that deletes it — not a
+setting that hides it.
 
 | Tolerated | Why | Deleted by |
 |---|---|---|
-| Certificate lifetimes unchecked (`clock_policy: unchecked`) | The silicon reports no `time.wall`, so the validity window is not a check that can run | A target with a trusted clock |
-| No public certificate authority reaches us | P-256, P-384, RSA (2048 to 4096 bits, PKCS#1 v1.5 and PSS) and ML-DSA signatures are verified; only one anchor is held | A multi-anchor store to hold the issuers |
-| One trust anchor, so an issuer is pinned rather than a root trusted | The anchor is a single certificate, not a store | A multi-anchor store, with the bundle mounted by the deployment |
+| Certificate lifetimes unchecked (`clock_policy: unchecked`) on a target with no trusted clock | RP parts and wasm report no `time.wall`; the Pi 5 reports one only once a time-sync module (`sntp`) anchors it | A trusted clock on that target. The Linux host has one, so its graphs require it and an expired certificate is refused (`reason=expired`) |
 | A privately issued leaf with no extended key usage is refused | The certificate omits `serverAuth` | Reissuing that certificate — this one is the world being wrong, not the code |
 
-The lane asserts the tolerations as well as the refusals: an expired
-certificate is served, and it says so out loud. When a target gains a trusted
-clock that line fails, which is the point of writing it down — the gap closes
-loudly rather than being forgotten.
+The lane asserts the refusals as well as the acceptances: an expired
+certificate is refused on the host by name. A chain signed in a suite the
+engine names but does not verify — RSA-PSS as a certificate signature — is
+refused as `unsupported-suite` rather than accepted unverified, which
+Fluxor's own TLS suite holds.
 
-Until all four are gone, `ca_dns` does not mean the same thing on every
-target, and anything relying on it says which target it means — and whether
-the engine or the platform is the one deciding.
+`ca_dns` therefore still differs between targets in one respect — whether a
+certificate's lifetime is a check that runs — and anything relying on it
+says which target it means, and whether the engine or the platform is the
+one deciding.
 
 ## What is not here
 

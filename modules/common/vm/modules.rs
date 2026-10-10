@@ -884,6 +884,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             None => 0,
         };
         if resume != 0 {
+            self.frame_changed = true;
             self.frames[self.depth as usize - 1].pc = resume;
         }
         let before = self.fuel;
@@ -1043,6 +1044,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             None => 0,
         };
         if resume != 0 {
+            self.frame_changed = true;
             self.frames[self.depth as usize - 1].pc = resume;
         }
         self.started = true;

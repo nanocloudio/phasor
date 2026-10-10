@@ -1,5 +1,5 @@
 version          = "0.0.1"
-hardware_targets = ["rp2350", "bcm2712", "wasm"]
+hardware_targets = ["rp2350", "bcm2712", "wasm", "linux"]
 
 [[ports]]
 name         = "report"

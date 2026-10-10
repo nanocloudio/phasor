@@ -205,16 +205,30 @@ impl Handle {
     /// Write the handle as its index and generation, little-endian.
     pub fn write_at(self, out: &mut [u8], at: usize) {
         if let Some(field) = out.get_mut(at..at + 8) {
-            field[..4].copy_from_slice(&self.index.to_le_bytes());
-            field[4..].copy_from_slice(&self.generation.to_le_bytes());
+            // Fixed-size writes: a copy of a slice whose length the compiler
+            // cannot see is a call to memcpy, on every write of a value.
+            let (index, generation) = field.split_at_mut(4);
+            if let (Ok(index), Ok(generation)) = (
+                <&mut [u8; 4]>::try_from(index),
+                <&mut [u8; 4]>::try_from(generation),
+            ) {
+                *index = self.index.to_le_bytes();
+                *generation = self.generation.to_le_bytes();
+            }
         }
     }
 
     /// Write the "no handle" sentinel.
     pub fn write_none_at(out: &mut [u8], at: usize) {
         if let Some(field) = out.get_mut(at..at + 8) {
-            field[..4].copy_from_slice(&Self::NONE_INDEX.to_le_bytes());
-            field[4..].copy_from_slice(&0u32.to_le_bytes());
+            let (index, generation) = field.split_at_mut(4);
+            if let (Ok(index), Ok(generation)) = (
+                <&mut [u8; 4]>::try_from(index),
+                <&mut [u8; 4]>::try_from(generation),
+            ) {
+                *index = Self::NONE_INDEX.to_le_bytes();
+                *generation = 0u32.to_le_bytes();
+            }
         }
     }
 
@@ -243,19 +257,22 @@ impl Value {
     pub fn encode_at(self, out: &mut [u8], at: usize) {
         if let Some(field) = out.get_mut(at..at + Self::ENCODED) {
             field[0] = self.tag as u8;
-            field[1..].copy_from_slice(&self.payload.to_le_bytes());
+            if let Ok(payload) = <&mut [u8; 8]>::try_from(&mut field[1..9]) {
+                *payload = self.payload.to_le_bytes();
+            }
         }
     }
 
     /// Decode a value written by `encode_at`; `undefined` for a field that
     /// is not there or a tag that is not one.
     pub fn decode_at(bytes: &[u8], at: usize) -> Self {
-        let Some(field) = field::<9>(bytes, at) else {
+        // A tag byte and an eight-byte payload, read as those: a nine-byte
+        // field would be copied through memcpy on every read of a value.
+        let (Some(tag), Some(payload)) = (bytes.get(at), field::<8>(bytes, at + 1)) else {
             return Self::UNDEFINED;
         };
-        let payload = u64::from_le_bytes([
-            field[1], field[2], field[3], field[4], field[5], field[6], field[7], field[8],
-        ]);
+        let field = [*tag];
+        let payload = u64::from_le_bytes(payload);
         let handle = Handle::unpack(payload);
         match field[0] {
             1 => Self::NULL,
@@ -275,21 +292,29 @@ impl Value {
         if let Some(field) = out.get_mut(at..at + Self::ENCODED_SHORT) {
             field[0] = self.tag as u8;
             let handle = self.as_handle();
-            field[1..5].copy_from_slice(&handle.index.to_le_bytes());
-            field[5..7].copy_from_slice(&(handle.generation as u16).to_le_bytes());
+            if let Ok(index) = <&mut [u8; 4]>::try_from(&mut field[1..5]) {
+                *index = handle.index.to_le_bytes();
+            }
+            if let Ok(generation) = <&mut [u8; 2]>::try_from(&mut field[5..7]) {
+                *generation = (handle.generation as u16).to_le_bytes();
+            }
         }
     }
 
     /// Decode the short form: an object reference, or `undefined`.
     pub fn decode_short_at(bytes: &[u8], at: usize) -> Self {
-        let Some(field) = field::<7>(bytes, at) else {
+        let (Some(&tag), Some(index), Some(generation)) = (
+            bytes.get(at),
+            field::<4>(bytes, at + 1),
+            field::<2>(bytes, at + 5),
+        ) else {
             return Self::UNDEFINED;
         };
-        if field[0] != Tag::Object as u8 {
+        if tag != Tag::Object as u8 {
             return Self::UNDEFINED;
         }
-        let index = u32::from_le_bytes([field[1], field[2], field[3], field[4]]);
-        let generation = u32::from(u16::from_le_bytes([field[5], field[6]]));
+        let index = u32::from_le_bytes(index);
+        let generation = u32::from(u16::from_le_bytes(generation));
         Self::object(Handle::new(index, generation))
     }
 }
@@ -597,7 +622,19 @@ pub enum Comparison {
 }
 
 pub fn compare_numbers(left: f64, right: f64) -> Comparison {
-    match softfloat::compare(left, right) {
+    // A comparison is exactly specified, so a target with hardware doubles
+    // answers it with the instruction; the integer routine is for the one
+    // without.
+    #[cfg(not(target_arch = "arm"))]
+    let ordering = match left.partial_cmp(&right) {
+        Some(core::cmp::Ordering::Less) => -1,
+        Some(core::cmp::Ordering::Equal) => 0,
+        Some(core::cmp::Ordering::Greater) => 1,
+        None => 2,
+    };
+    #[cfg(target_arch = "arm")]
+    let ordering = softfloat::compare(left, right);
+    match ordering {
         -1 => Comparison::Less,
         0 => Comparison::Equal,
         1 => Comparison::Greater,

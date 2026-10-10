@@ -899,7 +899,39 @@ pub enum DecodeError {
     MisplacedPrefix,
 }
 
+/// Every byte's opcode and signature, built once at compile time, so that
+/// decoding an instruction is two table reads rather than two matches over
+/// the whole opcode set.
+#[derive(Clone, Copy)]
+struct Entry {
+    opcode: Option<Opcode>,
+    signature: Signature,
+}
+
+const ENTRIES: [Entry; 256] = {
+    let mut entries = [Entry {
+        opcode: None,
+        signature: Signature::new(0, [OperandKind::Count; 3]),
+    }; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        if let Some(opcode) = Opcode::from_byte(byte as u8) {
+            entries[byte] = Entry {
+                opcode: Some(opcode),
+                signature: opcode.signature(),
+            };
+        }
+        byte += 1;
+    }
+    entries
+};
+
 /// Decode the instruction at `offset`.
+///
+/// Inlined into the dispatch loop: called, its answer comes back through
+/// memory and is copied out, and a target that requires aligned access
+/// makes that copy a call to memcpy, once an instruction.
+#[inline(always)]
 pub fn decode(code: &[u8], offset: u32) -> Result<Instruction, DecodeError> {
     let mut cursor = offset as usize;
     let first = *code.get(cursor).ok_or(DecodeError::TruncatedOperand)?;
@@ -916,13 +948,37 @@ pub fn decode(code: &[u8], offset: u32) -> Result<Instruction, DecodeError> {
     if byte == PREFIX_WIDE || byte == PREFIX_EXTRA_WIDE {
         return Err(DecodeError::MisplacedPrefix);
     }
-    let opcode = Opcode::from_byte(byte).ok_or(DecodeError::UnknownOpcode)?;
+    let entry = &ENTRIES[usize::from(byte)];
+    let opcode = entry.opcode.ok_or(DecodeError::UnknownOpcode)?;
     cursor += 1;
 
-    let signature = opcode.signature();
-    let size = width.bytes() as usize;
+    let signature = entry.signature;
     let mut operands = [0u32; 3];
     let mut signed = [0i32; 3];
+    // Narrow operands are one byte each, which is most instructions: read
+    // them straight, with one bounds check for the lot.
+    if matches!(width, Width::Narrow) {
+        let count = signature.count as usize;
+        let bytes = code
+            .get(cursor..cursor + count)
+            .ok_or(DecodeError::TruncatedOperand)?;
+        let mut index = 0usize;
+        while index < count {
+            let value = u32::from(bytes[index]);
+            operands[index] = value;
+            signed[index] = value as u8 as i8 as i32;
+            index += 1;
+        }
+        cursor += count;
+        return Ok(Instruction {
+            opcode,
+            width,
+            operands,
+            signed,
+            length: u32::try_from(cursor - offset as usize).unwrap_or(u32::MAX),
+        });
+    }
+    let size = width.bytes() as usize;
     let mut index = 0usize;
     while index < signature.count as usize {
         let bytes = code

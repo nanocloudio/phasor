@@ -498,21 +498,40 @@ const fn is_nan(bits: u64) -> bool {
 }
 
 /// The double nearest a signed 64-bit integer.
+///
+/// A conversion is exactly specified, so a target with the instruction
+/// gives the same bits as the assembly below; the assembly is for the
+/// target without it, which would otherwise call back into this module for
+/// the intrinsic.
 pub fn from_i64(value: i64) -> f64 {
-    if value == 0 {
-        return 0.0;
+    #[cfg(not(target_arch = "arm"))]
+    {
+        value as f64
     }
-    let negative = value < 0;
-    let magnitude = value.unsigned_abs();
-    f64::from_bits(assemble(negative, 0, magnitude, false))
+    #[cfg(target_arch = "arm")]
+    {
+        if value == 0 {
+            return 0.0;
+        }
+        let negative = value < 0;
+        let magnitude = value.unsigned_abs();
+        f64::from_bits(assemble(negative, 0, magnitude, false))
+    }
 }
 
 /// The double nearest an unsigned 64-bit integer.
 pub fn from_u64(value: u64) -> f64 {
-    if value == 0 {
-        return 0.0;
+    #[cfg(not(target_arch = "arm"))]
+    {
+        value as f64
     }
-    f64::from_bits(assemble(false, 0, value, false))
+    #[cfg(target_arch = "arm")]
+    {
+        if value == 0 {
+            return 0.0;
+        }
+        f64::from_bits(assemble(false, 0, value, false))
+    }
 }
 
 /// Truncate a double towards zero into a signed 64-bit integer, saturating.

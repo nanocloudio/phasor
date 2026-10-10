@@ -1203,7 +1203,9 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
 
 fn write_u32(bytes: &mut [u8], at: usize, value: u32) {
     if let Some(field) = bytes.get_mut(at..at + 4) {
-        field.copy_from_slice(&value.to_le_bytes());
+        if let Ok(field) = <&mut [u8; 4]>::try_from(field) {
+            *field = value.to_le_bytes();
+        }
     }
 }
 
@@ -1213,7 +1215,9 @@ fn read_u64(bytes: &[u8], at: usize) -> u64 {
 
 fn write_u64(bytes: &mut [u8], at: usize, value: u64) {
     if let Some(field) = bytes.get_mut(at..at + 8) {
-        field.copy_from_slice(&value.to_le_bytes());
+        if let Ok(field) = <&mut [u8; 8]>::try_from(field) {
+            *field = value.to_le_bytes();
+        }
     }
 }
 

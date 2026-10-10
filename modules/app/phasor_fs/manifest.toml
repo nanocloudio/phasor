@@ -1,5 +1,5 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712", "wasm"]
+hardware_targets = ["bcm2712", "wasm", "linux"]
 
 # wasm is claimed for reading and not for writing. The `fs` contract's wasm
 # provider serves OPEN / READ / CLOSE over the page origin and answers WRITE,

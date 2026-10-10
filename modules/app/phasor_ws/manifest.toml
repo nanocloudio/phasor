@@ -3,7 +3,7 @@ version          = "0.0.1"
 # this adapter's addressed open and carries its frames both ways,
 # so nothing here is target-conditional and the wasm graph is the Linux
 # one with a different module named in one place.
-hardware_targets = ["bcm2712", "wasm"]
+hardware_targets = ["bcm2712", "wasm", "linux"]
 
 # Call frames a router or a shell forwarded, each followed by its payload.
 [[ports]]

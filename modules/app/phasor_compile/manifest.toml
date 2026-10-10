@@ -1,5 +1,5 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712", "wasm"]
+hardware_targets = ["bcm2712", "wasm", "linux"]
 
 # One input stream ending in HUP is one source; the output is the unit image
 # the front end produced, which is content-addressed and safe to carry anywhere.

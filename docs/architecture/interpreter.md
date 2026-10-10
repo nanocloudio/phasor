@@ -101,6 +101,89 @@ loop, two thirds off an array walk, a few percent off an allocation.
 capability-call rate did not move. What bounds wall-clock from here is the
 cost of a dispatch, not of what a program allocates.
 
+So the dispatch was made cheaper where it was paying for nothing. The loop
+fetched the running function's record — twelve reads out of the image —
+for every instruction; it now fetches it when the frame on top changes.
+It copied the whole frame for every instruction, a memmove past the
+inline threshold; it now holds a copy and refreshes it when the frame is
+written, which every write to a frame other than the loop's own program
+counter says (`frame_changed`), and a nested run says on its way out. It
+judged the heap's pressure every instruction; it does so every sixteenth,
+since pressure changes only when something is allocated, and a collection
+left open is still carried on every instruction. And the decoder read its
+opcode and signature from two matches over the whole opcode set and its
+operands through a loop of bounds checks; it reads both from a table built
+at compile time, and narrow operands — nearly all of them — in one checked
+slice. A turn of the plain loop fell from 6,000 instructions to 2,700, and
+the load lane reads 1,167,000 iterations a second.
+
+Below that, what a value costs to move. A value is nine bytes in a cell — a
+tag and an eight-byte payload — and reading it as a nine-byte field, or
+writing a handle through a slice whose length the compiler cannot see, was
+a call to memcpy on every load and store of a binding; they are read and
+written as a byte and a word now. A small integer literal was assembled
+into a double in software on every target, where the conversion is exactly
+specified and a hard-float target has the instruction; it is a cast there.
+And the string branch of `ToNumber` carried its buffer into the frame of
+every instruction, so it is a function of its own. What is left per opcode
+is the dispatch itself — some 120 instructions of loop, bounds, decode and
+the switch — and, for a binding, the environment record: a `var` in a
+function was a context slot, not a register, so `s = r` was two records
+read and written, ~160 instructions each.
+
+So a function nothing inside can capture keeps its bindings in registers.
+The lowering decides it once the declarations are known: a plain parameter
+list, no function or class within the body, no `eval` it might direct, no
+`with`, no `arguments`, and nothing lexical at the function's own level —
+so every binding is a parameter or a `var`, with no dead zone to keep. The
+arguments are in the first registers already, which is where the parameters
+resolve; the `var`s start `undefined` behind them, which the prologue makes
+true since a call may have supplied more arguments than there are
+parameters; a named function expression's own name is the callee. Blocks
+inside keep their contexts, and a closure anywhere in the body keeps the
+whole function on contexts. Its scope is still a context for the names
+outside it — a call makes the callee a record whatever it binds, which is
+where `this` and `new.target` live — only one with no slots. `s = r` is a
+`Ldar` and a `Star`.
+
+Then the operators. `+`, `-`, `*`, `/` and the four relational comparisons
+went through the general path whatever their operands — two `ToPrimitive`,
+the string and BigInt checks, two `ToNumber`, and for a comparison the
+integer routine even where the target compares doubles in hardware. Two
+numbers now go straight to the arithmetic, and `compare_numbers` uses the
+instruction on a hard-float target. And `step` is a large function with a
+large frame: entering and leaving it saved twelve registers and probed six
+kilobytes of stack, for every instruction, `Ldar` included. The dispatch
+loop now does the instructions loops are made of — register moves, small
+literals, a jump on a boolean, number arithmetic and comparison, `++` and
+`--` on a number — itself, where their operands make them unable to throw,
+call out or allocate (`step_fast`); anything else goes to `step` as before.
+`decode` is inlined, so an instruction is not returned through memory and
+copied out again — on bcm2712 the module target is `aarch64-unknown-none`,
+which assumes strict alignment, and that copy was a call to memcpy. A turn
+of the plain loop is now 1,650 instructions, and the load lane reads
+1,550,000 iterations a second.
+
+That assumption was the last of it. `aarch64-unknown-none` builds for a part
+whose MMU may be off, so LLVM never emits an unaligned access: a struct copy
+it cannot prove aligned becomes a call to memcpy, and a word read from a
+byte slice becomes a chain of byte loads. An engine that keeps its image,
+heap cells and environment records as byte slices pays that on nearly every
+read. Module code never runs with the MMU off — on the Pi 5 and on QEMU virt
+the kernel enables it before any module is loaded — so Fluxor builds bcm2712
+modules without strict alignment (Fluxor `f1cc70a7`). The load lane reads
+2,280,000 iterations a second, and code that touches the heap, environments
+or calls spends a fifth to a third less time; the bare arithmetic loop,
+already free of copies, is unchanged.
+
+Two things in the profile are not the engine's. The kernel hashes module
+state once a step (its attestation), and the isolate reads the clock twice
+a step; both are per step, so the slice length is what sets their share —
+and the slice is a policy knob rather than a dispatch cost: at 32,768 fuel
+the loop runs a third faster again and capability calls take half as long
+to come back, since each step holds the scheduler for longer. It stays at
+4,096.
+
 ## 4. Semantics implemented
 
 The operators are the specification's: `ToPrimitive` with the hint each context

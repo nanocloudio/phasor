@@ -156,6 +156,11 @@ pub struct Scope {
     /// Whether entering this scope creates a context at run time. A scope that
     /// declares nothing does not, so a block costs nothing unless it binds.
     pub context: bool,
+    /// Whether this scope's bindings live in the frame's registers, numbered
+    /// by slot, rather than in a context: a function nothing inside can
+    /// capture — no closure, no class, no eval, no `with`, no `arguments` —
+    /// keeps its parameters and `var`s where a call put them.
+    pub registers: bool,
 }
 
 impl Scope {
@@ -164,6 +169,7 @@ impl Scope {
         first: 0,
         count: 0,
         context: false,
+        registers: false,
     };
 }
 
@@ -900,6 +906,7 @@ impl Program<'_> {
             first: u32::try_from(self.binding_count).unwrap_or(0),
             count: 0,
             context: false,
+            registers: false,
         };
         self.scope_count += 1;
         Ok(u32::try_from(index).unwrap_or(0))
@@ -940,6 +947,9 @@ impl Program<'_> {
 enum Resolved {
     /// A context slot, `depth` contexts out and at `slot`.
     Slot { depth: u32, slot: u32, kind: u8 },
+    /// A register of the running frame: a binding of a scope that keeps its
+    /// bindings in registers.
+    Register { register: u32, kind: u8 },
     /// Not declared anywhere the program can see: the isolate resolves it.
     Global,
 }

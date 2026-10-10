@@ -1,5 +1,5 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712", "wasm", "rp2350"]
+hardware_targets = ["bcm2712", "wasm", "rp2350", "linux"]
 
 # Call frames a router forwarded.
 [[ports]]

@@ -385,6 +385,15 @@ struct State {
     /// whether one has been asked for, and what the last one said.
     snapshot_ready: bool,
     snapshot_asked: bool,
+    /// The seed `crypto.getRandomValues` and `Math.random` are keyed with when
+    /// entropy is granted: eight words drawn from the entropy adapter before
+    /// anything runs, as the isolate draws them. A program asks for random
+    /// values synchronously; the only unpredictability it may have is a
+    /// granted capability, which answers later — so the shell asks first.
+    seed: [u32; 8],
+    seed_taken: u8,
+    seed_asked: bool,
+    seed_done: bool,
     /// The most recent reading the adapter has answered with. Updated
     /// whenever one lands, which may be part-way through a task.
     snapshot_value: f64,
@@ -1250,6 +1259,8 @@ fn advance(state: &mut State) -> Advance {
         payloads: Some(&mut state.call_payloads),
         resources: Some(&mut state.resources),
     };
+    let seed = state.seed;
+    let seeded = usize::from(state.seed_taken) == state.seed.len();
     let step = |machine: &mut Vm<'_, '_, '_, '_>| -> Advance {
         // The wall clock the task about to run reads. Supplied every
         // advance, not only the first: a task's reading is latched afresh at
@@ -1303,6 +1314,15 @@ fn advance(state: &mut State) -> Advance {
             if machine.install_print().is_err() {
                 emit(&mut state.out, b"phasor: heap-exhausted\n");
                 return Advance::Failed;
+            }
+            // With entropy granted and a whole seed drawn, `crypto` and a
+            // seeded `Math.random`, exactly as the isolate installs them.
+            if seeded {
+                machine.seed_entropy(&seed);
+                if machine.install_entropy().is_err() {
+                    emit(&mut state.out, b"phasor: heap-exhausted\n");
+                    return Advance::Failed;
+                }
             }
         }
         if starting {
@@ -1776,6 +1796,89 @@ fn pull_replies(state: &mut State, syscalls: &SyscallTable) {
 /// timing a single short wait sees less than it waited. Only the FIRST
 /// reading is worth blocking for, because until one arrives there is no hour
 /// to run on at all.
+/// Draw the entropy seed, a word at a time, before the first task. Answers
+/// whether drawing is over: a whole seed, or none — no entropy grant, no
+/// wire, or an answer that is not a number, in which case nothing installs
+/// `crypto` and `Math.random` keeps its fixed sequence.
+///
+/// Each request goes on the entropy wire under the shell's own identifier,
+/// `u64::MAX`, so its answer is routed to the wire's snapshot slot and never
+/// taken for an answer to a program's `entropy.random()`.
+fn draw_seed(state: &mut State, syscalls: &SyscallTable) -> bool {
+    let held = (0..state.grant_count)
+        .find(|&grant| state.grants.get(grant).copied() == Some(GRANT_ENTROPY));
+    let (call_port, reply_port) = ports_of(state, GRANT_ENTROPY);
+    let (members, member_count) = members(GRANT_ENTROPY);
+    let method = members
+        .get(..member_count)
+        .unwrap_or(&[])
+        .iter()
+        .find(|member| member.name() == b"random")
+        .map(|member| member.method);
+    let (Some(grant), Some(method)) = (held, method) else {
+        state.seed_done = true;
+        return true;
+    };
+    if call_port < 0 || reply_port < 0 {
+        state.seed_done = true;
+        return true;
+    }
+    if !state.seed_asked {
+        let record = CallRecord {
+            request: u64::MAX,
+            binding: method,
+            payload_length: 0,
+            trace: TRACE,
+            payload: digest::digest(b""),
+        };
+        let frame = record.encode();
+        let Some(wire) = state.wires.get_mut(grant) else {
+            state.seed_done = true;
+            return true;
+        };
+        let at = wire.staged;
+        if !copy_into(
+            wire.calls.get_mut(at..at + CALL_FRAME).unwrap_or(&mut []),
+            &frame,
+        ) {
+            return false;
+        }
+        wire.staged = at + CALL_FRAME;
+        state.seed_asked = true;
+    }
+    push_calls(state, syscalls);
+    pull_replies(state, syscalls);
+    let Some(wire) = state.wires.get_mut(grant) else {
+        state.seed_done = true;
+        return true;
+    };
+    if !wire.snapshot_ready {
+        return false;
+    }
+    wire.snapshot_ready = false;
+    state.seed_asked = false;
+    let word =
+        CompletionRecord::decode(&wire.snapshot_reply).and_then(|record| match record.answer {
+            Answer::Number(value) => Some(value::to_uint32(value)),
+            _ => None,
+        });
+    let Some(word) = word else {
+        // Refused: no seed, so nothing is keyed and no `crypto` appears.
+        state.seed_taken = 0;
+        state.seed_done = true;
+        return true;
+    };
+    if let Some(slot) = state.seed.get_mut(usize::from(state.seed_taken)) {
+        *slot = word;
+    }
+    state.seed_taken = state.seed_taken.saturating_add(1);
+    if usize::from(state.seed_taken) == state.seed.len() {
+        state.seed_done = true;
+        return true;
+    }
+    false
+}
+
 fn take_snapshot(state: &mut State, syscalls: &SyscallTable) -> bool {
     let held =
         (0..state.grant_count).find(|&grant| state.grants.get(grant).copied() == Some(GRANT_CLOCK));
@@ -2149,6 +2252,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // The standard surface goes into the realm before anything a person
         // typed, as a program like any other: compiled by the same front end,
         // verified, and run under the same bounds.
+        if !state.seed_done && !draw_seed(state, syscalls) {
+            return 0;
+        }
         if !state.facade_done && !state.bare && !state.task_running {
             // The surface arrives from the module that holds it, whole, ended
             // by a hang-up. A graph that wired none has no façade at all,

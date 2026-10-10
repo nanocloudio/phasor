@@ -290,6 +290,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     /// A string cell holding a payload's bytes, one unit a byte, which is how
     /// a payload reaches a program. No byte is a program error and none is
     /// interpreted: what the provider answered is what the string holds.
+    #[inline(never)]
     pub(super) fn payload_string(&mut self, bytes: &[u8]) -> Result<Value, Completion> {
         // One byte, one unit. A payload is bytes, and the string a program
         // receives is those bytes exactly — not a reading of them. Decoding

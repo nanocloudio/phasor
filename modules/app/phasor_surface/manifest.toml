@@ -1,5 +1,5 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712", "wasm"]
+hardware_targets = ["bcm2712", "wasm", "linux"]
 
 # The surface's source, written once and ended by a hang-up. Whatever reads
 # it compiles and runs it; nothing here interprets it.

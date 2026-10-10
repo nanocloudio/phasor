@@ -45,22 +45,26 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         }
     }
 
+    /// A string's number, kept out of the line of `coerce_to_number` — and of
+    /// every instruction's frame — by the buffer it needs.
+    #[inline(never)]
+    fn string_to_number(&mut self, handle: Handle) -> Result<f64, Completion> {
+        let mut units = [0u16; MAX_STRING_UNITS];
+        let length = string::length(self.heap, handle).map_err(|_| Completion::MALFORMED)? as usize;
+        if length > units.len() {
+            return Ok(f64::NAN);
+        }
+        string::copy_units(self.heap, handle, &mut units[..length])
+            .map_err(|_| Completion::MALFORMED)?;
+        Ok(value::string_to_number(&units[..length]))
+    }
+
     pub(super) fn coerce_to_number(&mut self, value: Value) -> Result<f64, Completion> {
         if let Some(number) = value::to_number_primitive(&value) {
             return Ok(number);
         }
         match value.tag() {
-            Tag::String => {
-                let mut units = [0u16; MAX_STRING_UNITS];
-                let length = string::length(self.heap, value.as_handle())
-                    .map_err(|_| Completion::MALFORMED)? as usize;
-                if length > units.len() {
-                    return Ok(f64::NAN);
-                }
-                string::copy_units(self.heap, value.as_handle(), &mut units[..length])
-                    .map_err(|_| Completion::MALFORMED)?;
-                Ok(value::string_to_number(&units[..length]))
-            }
+            Tag::String => self.string_to_number(value.as_handle()),
             Tag::Object => {
                 let primitive = self.coerce_to_primitive(value, Hint::Number)?;
                 if primitive.is_object() {
@@ -573,6 +577,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
     }
 
     /// The Number a string denotes when a program asks for it by name.
+    #[inline(never)]
     pub(super) fn parse_number(
         &mut self,
         text: Handle,

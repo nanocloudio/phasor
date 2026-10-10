@@ -870,6 +870,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
             }
             index += 1;
         }
+        self.frame_changed = true;
         self.frames[self.depth as usize] = Frame {
             code: scalar[0],
             pc: scalar[1],
@@ -896,6 +897,7 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         if star {
             // A delegating yield reads the kind itself and forwards it to
             // the inner iterator, so nothing is thrown or returned here.
+            self.frame_changed = true;
             if let Some(running) = self.frames.get_mut(self.depth as usize - 1) {
                 running.resume_kind = kind;
             }

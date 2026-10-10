@@ -1,7 +1,7 @@
 version          = "0.0.1"
 # Not rp2040: its whole module-state arena is 64 KiB, and the realm a
 # program starts with takes 69,240 bytes of heap before a line of it runs.
-hardware_targets = ["bcm2712", "wasm", "rp2350"]
+hardware_targets = ["bcm2712", "wasm", "rp2350", "linux"]
 
 # One input stream ending in HUP is one unit image, wherever it was compiled.
 # The buffer holds a whole image: a payload larger than one buffer stalls the

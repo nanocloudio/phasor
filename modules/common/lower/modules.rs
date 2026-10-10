@@ -72,7 +72,7 @@ impl Lowering<'_, '_, '_, '_> {
                         };
                         let slot = match self.resolve(local.first, local.second) {
                             Resolved::Slot { slot, .. } => slot,
-                            Resolved::Global => 0,
+                            Resolved::Register { .. } | Resolved::Global => 0,
                         };
                         if let Some(record) = self.program.imports.get_mut(import) {
                             *record = ImportRecord {

@@ -1,5 +1,5 @@
 version          = "0.0.1"
-hardware_targets = ["bcm2712", "wasm"]
+hardware_targets = ["bcm2712", "wasm", "linux"]
 
 # A stream of compiled modules: each record is its specifier and its image,
 # each with its length in front. The stream ends with a hang-up.
