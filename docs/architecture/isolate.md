@@ -204,7 +204,12 @@ Admission proved them once; `Unit::parse_admitted` and
 150 MHz core the kernel's worst step fell from about 1,700 µs to about 420
 with that one change, which is what a two-kilobyte SHA-256 costs there.
 What is left of the rebuild is the state's own copies — the saves and the
-realm, a few kilobytes — and the engine's work.
+realm, a few kilobytes — and the attachments. Measured on the board with
+the slice report, an advance of a task that is waiting on its clock is
+about 330 µs: 190 of setup — the view of the image, the adoption of the
+heap, atoms, queue and bindings, the attachments — 35 of the machine
+finding nothing to run, and the rest the ports and the save. The task's
+first advance, which stages the realm, is 11 ms.
 
 ## 6. What a step must not do
 

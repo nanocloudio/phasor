@@ -81,7 +81,9 @@ string's, a Map's or a Set's — steps it without the result object the
 protocol would make and the loop would only read and drop: the loop asks
 first (`StepNativeIterator`), and calls `next` as the protocol says only when
 the iterator is not the engine's, which is what keeps a generator or a
-program's own iterator on the ordinary path. And an array's element is read
+program's own iterator on the ordinary path. `IteratorNext` — destructuring,
+a spread — steps the same way, so what those still make is the iterator
+object, and a spread its argument array: one allocation a use. And an array's element is read
 where it was appended: `object::find` tries record `i + 1` for index `i` —
 record 0 being `length` — before it scans, so a read of an element costs
 one comparison however long the array, where it cost a scan of everything
@@ -93,9 +95,11 @@ plain loop costs some 6,000 for its thirteen bytecodes — a few hundred per
 bytecode, in decoding, bounds, the function record and the frame — and a
 collection slice costs far less than the 512 fuel it is charged. So the
 changes above moved time less than they moved fuel: a third off the script
-loop, two thirds off an array walk, a few percent off an allocation. What
-bounds wall-clock from here is the cost of a dispatch, not of what a
-program allocates.
+loop, two thirds off an array walk, a few percent off an allocation.
+`tests/load/run.sh`, which times the script loop, went from 413,000 to
+634,000 iterations a second on the Pi 5 (2,419 to 1,577 ns each), and its
+capability-call rate did not move. What bounds wall-clock from here is the
+cost of a dispatch, not of what a program allocates.
 
 ## 4. Semantics implemented
 

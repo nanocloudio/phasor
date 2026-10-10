@@ -267,6 +267,30 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         if !self.is_callable_value(next) {
             return Err(self.throw_type_error());
         }
+        // An iterator the engine made itself, with the engine's own `next`,
+        // steps without the result object: what `IteratorNext` gives
+        // destructuring and a spread is what `StepNativeIterator` gives a
+        // `for`-`of`.
+        if next.is_object() && iterator.is_object() {
+            let function = next.as_handle();
+            if object::is_native(self.heap, function).unwrap_or(false)
+                && object::function_code(self.heap, function).map_err(|_| Completion::MALFORMED)?
+                    == native::ITERATOR_NEXT
+                && object::iterator_state(self.heap, iterator.as_handle())
+                    .map_err(|_| Completion::HEAP_EXHAUSTED)?
+                    .is_some()
+            {
+                let saved = self.realm;
+                let index = self.realm_index_of_function(function);
+                if let Some(realm) = self.realms.get(usize::from(index)).copied().flatten() {
+                    self.realm = realm;
+                }
+                let outcome = self.iterator_native_step(iterator);
+                self.realm = saved;
+                let (value, done) = outcome?;
+                return Ok(if done { None } else { Some(value) });
+            }
+        }
         let result = self.call_value(next, iterator, &[])?;
         if !result.is_object() {
             return Err(self.throw_type_error());
