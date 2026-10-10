@@ -132,7 +132,7 @@ impl Lowering<'_, '_, '_, '_> {
             if start == end {
                 continue;
             }
-            if self.record_region(start, end, handler, exception, region_depth) {
+            if self.record_region(start, end, handler, exception, region_depth, u32::MAX) {
                 return;
             }
         }

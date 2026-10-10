@@ -2004,6 +2004,37 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
                     }
                 }
             }
+            Op::StepNativeIterator => {
+                let next = self.register(frame, operands[0]);
+                let iterator = self.register(frame, operands[1]);
+                self.accumulator = Value::UNDEFINED;
+                if !next.is_object() || !iterator.is_object() {
+                    return Ok(Flow::Continue);
+                }
+                let function = next.as_handle();
+                let served = object::is_native(self.heap, function).unwrap_or(false)
+                    && object::function_code(self.heap, function)
+                        .map_err(|_| Completion::MALFORMED)?
+                        == crate::realm::native::ITERATOR_NEXT
+                    && object::iterator_state(self.heap, iterator.as_handle())
+                        .map_err(|_| Completion::HEAP_EXHAUSTED)?
+                        .is_some();
+                if !served {
+                    return Ok(Flow::Continue);
+                }
+                // As a call would: the step runs in the realm `next` belongs
+                // to, so what it makes takes that realm's prototypes.
+                let saved = self.realm;
+                let index = self.realm_index_of_function(function);
+                if let Some(realm) = self.realms.get(usize::from(index)).copied().flatten() {
+                    self.realm = realm;
+                }
+                let outcome = self.iterator_native_step(iterator);
+                self.realm = saved;
+                let (value, done) = outcome?;
+                self.set_register(frame, operands[2], value);
+                self.accumulator = Value::boolean(done);
+            }
             Op::IteratorClose => {
                 let done = self.register(frame, operands[1]);
                 if !(matches!(done.tag(), Tag::Boolean) && done.as_boolean()) {

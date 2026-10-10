@@ -265,7 +265,14 @@ impl Lowering<'_, '_, '_, '_> {
             if region_start != region_end {
                 let handler = self.builder.length();
                 self.emit_dispose(stack, Some(caught), awaited);
-                if self.record_region(region_start, region_end, handler, caught, region_depth) {
+                if self.record_region(
+                    region_start,
+                    region_end,
+                    handler,
+                    caught,
+                    region_depth,
+                    u32::try_from(self.finaliser_count + 1).unwrap_or(u32::MAX),
+                ) {
                     return;
                 }
             }
@@ -439,6 +446,20 @@ impl Lowering<'_, '_, '_, '_> {
         let top = self.builder.label();
         let again = self.builder.label();
         let done = self.builder.label();
+        // A binding nothing can capture is made once, ahead of the loop,
+        // and takes each turn's value in place: a context a turn is an
+        // allocation a turn, and without a closure in the loop no one can
+        // tell the turns' bindings apart. A `using` keeps its turn's context,
+        // which its disposal is tied to.
+        let hoisted = lexical && !using && !self.may_capture(node);
+        if hoisted {
+            self.scope = scope;
+            if let Some(record) = self.program.scopes.get_mut(scope as usize) {
+                record.context = true;
+            }
+            let slots = self.program.scope(scope).count.max(1);
+            self.push_context(slots);
+        }
         self.builder.safe_point();
         self.builder.bind(top);
 
@@ -463,6 +484,8 @@ impl Lowering<'_, '_, '_, '_> {
         // break or continue to an outer label, a return, or a throw —
         // closes the iterator the loop still holds.
         let escape_depth = self.context_depth;
+        // The loop's own finaliser comes next; what follows it is nested inside.
+        let inside_from = u32::try_from(self.finaliser_count + 1).unwrap_or(u32::MAX);
         let body_start = if of {
             match self.finalisers.get_mut(self.finaliser_count) {
                 Some(slot) => {
@@ -489,14 +512,16 @@ impl Lowering<'_, '_, '_, '_> {
         // The name takes the turn's value, in a binding of its own where the
         // header declared one.
         if lexical {
-            self.scope = scope;
-            // A pushed environment counts in resolution even when the
-            // pattern declares nothing.
-            if let Some(record) = self.program.scopes.get_mut(scope as usize) {
-                record.context = true;
+            if !hoisted {
+                self.scope = scope;
+                // A pushed environment counts in resolution even when the
+                // pattern declares nothing.
+                if let Some(record) = self.program.scopes.get_mut(scope as usize) {
+                    record.context = true;
+                }
+                let slots = self.program.scope(scope).count.max(1);
+                self.push_context(slots);
             }
-            let slots = self.program.scope(scope).count.max(1);
-            self.push_context(slots);
             self.emit(Opcode::Ldar, &[i64::from(value)]);
             self.bind_target(name_node, true);
             if using {
@@ -553,7 +578,7 @@ impl Lowering<'_, '_, '_, '_> {
             continuable: true,
             break_label: done,
             continue_label: again,
-            context_depth: if lexical {
+            context_depth: if lexical && !hoisted {
                 self.context_depth.saturating_sub(1)
             } else {
                 self.context_depth
@@ -580,7 +605,7 @@ impl Lowering<'_, '_, '_, '_> {
             if using {
                 self.emit_dispose(stack, None, awaited);
             }
-            if lexical {
+            if lexical && !hoisted {
                 self.pop_context();
             }
             self.builder.bind(again);
@@ -590,7 +615,7 @@ impl Lowering<'_, '_, '_, '_> {
                 self.emit(Opcode::Star, &[i64::from(position)]);
             }
             self.builder.jump(Opcode::Jump, top);
-        } else if lexical {
+        } else if lexical && !hoisted {
             self.context_depth = self.context_depth.saturating_sub(1);
         }
         self.builder.bind(done);
@@ -624,11 +649,21 @@ impl Lowering<'_, '_, '_, '_> {
                     self.emit(Opcode::Ldar, &[i64::from(caught)]);
                     self.emit(Opcode::Throw, &[]);
                 }
-                if self.record_region(body_start, body_end, handler, caught, escape_depth) {
+                if self.record_region(
+                    body_start,
+                    body_end,
+                    handler,
+                    caught,
+                    escape_depth,
+                    inside_from,
+                ) {
                     return;
                 }
                 self.builder.bind(after);
             }
+        }
+        if hoisted {
+            self.pop_context();
         }
         self.scope = outer;
         self.release(mark);
@@ -678,6 +713,22 @@ impl Lowering<'_, '_, '_, '_> {
             self.release(inner);
         } else if of {
             let inner = self.registers;
+            // An iterator the engine made itself steps without the result
+            // object: the turn's value lands in its register and the done
+            // flag in the accumulator. Any other `next` is called as the
+            // protocol says, which is what the accumulator being `undefined`
+            // sends the loop on to.
+            let fast = self.builder.label();
+            let merged = self.builder.label();
+            self.emit(
+                Opcode::StepNativeIterator,
+                &[
+                    i64::from(registers.next_method),
+                    i64::from(registers.source),
+                    i64::from(registers.value),
+                ],
+            );
+            self.builder.jump(Opcode::JumpIfNotUndefined, fast);
             let callee = self.allocate();
             let receiver = self.allocate();
             let result = self.allocate();
@@ -702,6 +753,11 @@ impl Lowering<'_, '_, '_, '_> {
                 &[i64::from(result), i64::from(value_key)],
             );
             self.emit(Opcode::Star, &[i64::from(registers.value)]);
+            self.builder.jump(Opcode::Jump, merged);
+            self.builder.bind(fast);
+            self.emit(Opcode::Star, &[i64::from(registers.flag_register)]);
+            self.builder.jump(Opcode::JumpIfTrue, done);
+            self.builder.bind(merged);
             self.release(inner);
         } else {
             // A comparison takes its left operand from the register and its

@@ -39,6 +39,8 @@ impl Lowering<'_, '_, '_, '_> {
 
         let exception = self.allocate();
         let region_depth = self.context_depth;
+        // What is registered from here on is nested inside the `try`.
+        let inside_from = u32::try_from(self.finaliser_count).unwrap_or(u32::MAX);
         let region_start = self.builder.length();
         self.statement(node.first);
         let region_end = self.builder.length();
@@ -72,6 +74,7 @@ impl Lowering<'_, '_, '_, '_> {
             handler_offset,
             exception,
             region_depth,
+            inside_from,
         ) {
             return;
         }
@@ -139,6 +142,7 @@ impl Lowering<'_, '_, '_, '_> {
                     rethrow,
                     catch_exception,
                     region_depth,
+                    inside_from,
                 ) {
                     return;
                 }
@@ -184,17 +188,23 @@ impl Lowering<'_, '_, '_, '_> {
         handler: u32,
         register: u32,
         context_depth: u32,
+        inside_from: u32,
     ) -> bool {
-        // The range is split around every inline finaliser copy whose owning
-        // `try` is this one or one outside it: the copy runs after the exit
-        // has left this `try`, so a throw from it belongs to whatever
-        // encloses the owner, never to this region.
+        // The range is split around every finaliser copy an exit left in it
+        // that belongs to this region or to one enclosing it — a `finally`
+        // of this `try`, an iterator's close on the way out of this loop or
+        // past it: the copy runs after the exit has left here, so a throw
+        // from it belongs to whatever encloses the owner, never to this
+        // region. A copy of a finaliser nested inside — `inside_from` is
+        // the first such index — is left covered: an inner loop's close on
+        // the way out of this one is still inside this one, and a throw
+        // from it closes this iterator, or reaches this `catch`, too.
         let mut cursor = start;
         let mut hole = 0usize;
         while hole < self.hole_count {
-            let (owner_depth, from, to) = self.holes[hole];
+            let (from, to, owner) = self.holes[hole];
             hole += 1;
-            if owner_depth > self.try_depth || to <= cursor || from >= end {
+            if owner >= inside_from || to <= cursor || from >= end {
                 continue;
             }
             if from > cursor && self.push_region(cursor, from, handler, register, context_depth) {

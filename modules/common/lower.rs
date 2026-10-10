@@ -1058,6 +1058,8 @@ struct Lowering<'a, 'b, 'c, 'p> {
     /// `try`'s depth: a region belonging to a `try` nested that deep or
     /// deeper must not cover the copy, or a throwing `finally` would run
     /// itself again.
+    /// Ranges of code an exit copied a finaliser into — a `finally`, an
+    /// iterator's close — as (from, to, the finaliser's index).
     holes: [(u32, u32, u32); MAX_HOLES],
     hole_count: usize,
     /// Whether `return` is admitted here.

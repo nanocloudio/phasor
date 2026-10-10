@@ -1091,10 +1091,12 @@ fn advance(state: &mut State) -> Advance {
     // it may keep reading it while the rest of the state moves.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
     // The image was verified when it was admitted; parsing it again only
-    // rebuilds the view of bytes that have not changed since.
+    // rebuilds the view of bytes that have not changed since — without the
+    // two digests, each a hash over the build's whole opcode table or
+    // feature list, which on a 150 MHz part were most of a step.
     let mut units = [Unit::EMPTY; MAX_MODULES];
     if state.linked {
-        let Ok(closure) = Closure::parse(bytes) else {
+        let Ok(closure) = Closure::parse_admitted(bytes) else {
             return Advance::Failed;
         };
         let mut index = 0u32;
@@ -1102,14 +1104,14 @@ fn advance(state: &mut State) -> Advance {
             let Some(image) = closure.image(index) else {
                 return Advance::Failed;
             };
-            let Ok(unit) = Unit::parse(image) else {
+            let Ok(unit) = Unit::parse_admitted(image) else {
                 return Advance::Failed;
             };
             units[index as usize] = unit;
             index += 1;
         }
     } else {
-        let Ok(unit) = Unit::parse(bytes) else {
+        let Ok(unit) = Unit::parse_admitted(bytes) else {
             return Advance::Failed;
         };
         units[0] = unit;

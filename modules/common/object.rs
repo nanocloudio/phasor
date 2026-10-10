@@ -996,6 +996,17 @@ fn find(heap: &Heap<'_>, object: Handle, key: Key) -> Result<Option<(Handle, u32
     };
     let count = table_count(heap, table)?;
     let cell = heap.cell(table)?;
+    // An array's elements sit where they were appended, after its `length`
+    // in record 0, so element `i` is record `i + 1` unless something was
+    // deleted or defined out of order. The record is tried before the table
+    // is scanned, and compared like any other, so a guess that is wrong
+    // costs one read and a right one makes an element read constant.
+    if let Key::Index(element) = key {
+        let guess = element.saturating_add(1);
+        if guess < count && same_key(read_key(cell, guess)?, key) {
+            return Ok(Some((table, guess)));
+        }
+    }
     let mut index = 0u32;
     while index < count {
         if same_key(read_key(cell, index)?, key) {

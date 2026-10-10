@@ -57,6 +57,18 @@ impl<'a> Closure<'a> {
         if bytes.get(36..68) != Some(&feature::digest().0[..]) {
             return Err(ClosureError::FeatureDigest);
         }
+        Self::parse_admitted(bytes)
+    }
+
+    /// The view over a container `parse` has already admitted, without the
+    /// two digests: see `Unit::parse_admitted`.
+    pub fn parse_admitted(bytes: &'a [u8]) -> Result<Self, ClosureError> {
+        if bytes.len() < HEADER_SIZE {
+            return Err(ClosureError::Truncated);
+        }
+        if bytes.get(..4) != Some(&MAGIC[..]) {
+            return Err(ClosureError::Magic);
+        }
         let count = read_u32(bytes, 68).ok_or(ClosureError::Truncated)?;
         let entry = read_u32(bytes, 72).ok_or(ClosureError::Truncated)?;
         // Everything after the header is covered by a digest, so a container

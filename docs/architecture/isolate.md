@@ -195,6 +195,17 @@ What this buys is that a step is bounded by its own slice rather than by how
 long an answer takes, and that a task waiting for a completion costs nothing
 while it waits.
 
+What it costs is the rebuild, and most of that was not the state at all. A
+step parsed the image again to rebuild its view, and `Unit::parse` proved
+the image's two digests — the format's and the feature list's — each a hash
+over this build's whole opcode table or feature list, computed afresh.
+Admission proved them once; `Unit::parse_admitted` and
+`Closure::parse_admitted` rebuild the view without them. On the Pico 2 W's
+150 MHz core the kernel's worst step fell from about 1,700 µs to about 420
+with that one change, which is what a two-kilobyte SHA-256 costs there.
+What is left of the rebuild is the state's own copies — the saves and the
+realm, a few kilobytes — and the engine's work.
+
 ## 6. What a step must not do
 
 - No step may allocate outside the admitted arena, or grow a table beyond its

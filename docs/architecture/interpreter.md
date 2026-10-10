@@ -72,8 +72,30 @@ the constant pool and interned, so a key is looked up, not made, and no
 string is created to be collected. And a `for (let …)` whose span holds no
 function or class, in a program with no direct eval, copies no context
 between turns: nothing could tell one turn's binding from the next, so the
-loop keeps the one it pushed. `tests/e2e/density.sh` holds both, measured
-marginally over two loop sizes.
+loop keeps the one it pushed; a `for (const x of …)` does the same, taking
+each turn's value into the binding it made ahead of the loop. A number keys
+without becoming a string: an array index as the index it is, any other by
+its decimal form interned from a buffer, so `a[i]` makes nothing either. And
+a `for`-`of` over an iterator the engine made itself — an array's, a
+string's, a Map's or a Set's — steps it without the result object the
+protocol would make and the loop would only read and drop: the loop asks
+first (`StepNativeIterator`), and calls `next` as the protocol says only when
+the iterator is not the engine's, which is what keeps a generator or a
+program's own iterator on the ordinary path. And an array's element is read
+where it was appended: `object::find` tries record `i + 1` for index `i` —
+record 0 being `length` — before it scans, so a read of an element costs
+one comparison however long the array, where it cost a scan of everything
+before it. `tests/e2e/density.sh` holds all of this, measured marginally
+over two loop sizes.
+
+Fuel is not time. Measured in instructions the processor runs, a turn of a
+plain loop costs some 6,000 for its thirteen bytecodes — a few hundred per
+bytecode, in decoding, bounds, the function record and the frame — and a
+collection slice costs far less than the 512 fuel it is charged. So the
+changes above moved time less than they moved fuel: a third off the script
+loop, two thirds off an array walk, a few percent off an allocation. What
+bounds wall-clock from here is the cost of a dispatch, not of what a
+program allocates.
 
 ## 4. Semantics implemented
 

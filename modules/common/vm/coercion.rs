@@ -187,6 +187,27 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         if matches!(value.tag(), Tag::Symbol) {
             return Ok(Key::Symbol(value.as_handle()));
         }
+        if matches!(value.tag(), Tag::Number) {
+            // A number keys without becoming a string: an array index as the
+            // index it is, and any other number by its decimal form interned
+            // from a buffer. `a[i]` makes nothing.
+            let number = value.as_number();
+            let truncated = crate::softfloat::to_i64(number);
+            if truncated >= 0
+                && truncated < i64::from(u32::MAX)
+                && crate::softfloat::from_u64(truncated as u64) == number
+            {
+                // `-0` lands here too, as index 0: its string is "0".
+                return Ok(Key::Index(truncated as u32));
+            }
+            let mut units = [0u16; 40];
+            let written = string::number_to_string(number, &mut units);
+            let interned = self
+                .atoms
+                .intern(self.heap, &units[..written])
+                .map_err(|_| Completion::HEAP_EXHAUSTED)?;
+            return Ok(Key::Name(interned));
+        }
         let text = self.coerce_to_string(value)?;
         let handle = text.as_handle();
         let length = string::length(self.heap, handle).map_err(|_| Completion::MALFORMED)? as usize;

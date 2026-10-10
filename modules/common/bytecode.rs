@@ -369,6 +369,14 @@ pub enum Opcode {
     /// function declarations hold their closures. An instantiation pass
     /// stops here; an evaluation walks straight through.
     InstantiationEnd = 0xE2,
+    /// One turn of a `for`-`of` over an iterator the engine made itself,
+    /// without the result object the protocol would make and discard. The
+    /// operands are the loop's `next` method, its iterator, and the register
+    /// the turn's value goes to. When `next` is the engine's own and the
+    /// iterator is one it serves, the step is taken and the accumulator is
+    /// the done flag; otherwise nothing happens and the accumulator is
+    /// `undefined`, for the loop to call `next` as the protocol says.
+    StepNativeIterator = 0xE3,
     /// Give the closure in the accumulator its `name`, from a key constant:
     /// what the specification calls named evaluation. A closure that already
     /// carries a name keeps it.
@@ -597,6 +605,7 @@ impl Opcode {
             0xE0 => Self::DefineAutoAccessor,
             0xE1 => Self::DynamicImport,
             0xE2 => Self::InstantiationEnd,
+            0xE3 => Self::StepNativeIterator,
             0x40 => Self::TestEqual,
             0x41 => Self::TestNotEqual,
             0x42 => Self::TestStrictEqual,
@@ -838,7 +847,9 @@ impl Opcode {
             Self::LdaImport => Signature::new(1, [Immediate, NONE, NONE]),
 
             Self::Call | Self::Construct => Signature::new(3, [Register, Register, Count]),
-            Self::CallWithArray => Signature::new(3, [Register, Register, Register]),
+            Self::CallWithArray | Self::StepNativeIterator => {
+                Signature::new(3, [Register, Register, Register])
+            }
             Self::CallProperty | Self::TailCall => Signature::new(3, [Register, Register, Count]),
         }
     }
@@ -864,7 +875,7 @@ impl Opcode {
     }
 
     /// The highest assigned opcode byte, which bounds the format descriptor.
-    pub const MAX_BYTE: u8 = 0xE0;
+    pub const MAX_BYTE: u8 = 0xE3;
 }
 
 /// One decoded instruction.
@@ -1320,6 +1331,22 @@ impl<'a> Unit<'a> {
         // features is refused rather than run under these ones.
         if bytes.get(36..68) != Some(&crate::feature::digest().0[..]) {
             return Err(ImageError::FeatureDigest);
+        }
+        Self::parse_admitted(bytes)
+    }
+
+    /// The view over an image `parse` has already admitted: the layout is
+    /// checked again, which is cheap, and the two digests are not. Each is
+    /// a hash over this build's whole opcode table or feature list, and a
+    /// host that rebuilds its view of the image every step — the isolate
+    /// does, and a step on a 150 MHz part is a millisecond or two — would
+    /// spend most of the step proving what admission proved once.
+    pub fn parse_admitted(bytes: &'a [u8]) -> Result<Self, ImageError> {
+        if bytes.len() < HEADER_SIZE {
+            return Err(ImageError::Truncated);
+        }
+        if bytes.get(..4) != Some(&UNIT_MAGIC[..]) {
+            return Err(ImageError::Magic);
         }
 
         let header = Header {

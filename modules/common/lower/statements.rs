@@ -99,7 +99,14 @@ impl Lowering<'_, '_, '_, '_> {
             // throw suppressing it — and throws what remains.
             let handler = self.builder.length();
             self.emit_dispose(stack, Some(caught), awaited);
-            if self.record_region(region_start, region_end, handler, caught, region_depth) {
+            if self.record_region(
+                region_start,
+                region_end,
+                handler,
+                caught,
+                region_depth,
+                u32::try_from(self.finaliser_count + 1).unwrap_or(u32::MAX),
+            ) {
                 return;
             }
         }
@@ -163,7 +170,14 @@ impl Lowering<'_, '_, '_, '_> {
             &[i64::from(stack), i64::from(pending), i64::from(scratch)],
         );
         self.builder.jump(Opcode::Jump, top);
-        if self.record_region(region_start, region_end, handler, scratch, region_depth) {
+        if self.record_region(
+            region_start,
+            region_end,
+            handler,
+            scratch,
+            region_depth,
+            u32::MAX,
+        ) {
             return;
         }
         self.builder.bind(done);
@@ -715,7 +729,7 @@ impl Lowering<'_, '_, '_, '_> {
                 let to = self.builder.length();
                 match self.holes.get_mut(self.hole_count) {
                     Some(slot) => {
-                        *slot = (finaliser.try_depth, from, to);
+                        *slot = (from, to, u32::try_from(index).unwrap_or(u32::MAX));
                         self.hole_count += 1;
                     }
                     None => {
@@ -739,7 +753,7 @@ impl Lowering<'_, '_, '_, '_> {
             self.scope = outer_scope;
             match self.holes.get_mut(self.hole_count) {
                 Some(slot) => {
-                    *slot = (finaliser.try_depth, from, to);
+                    *slot = (from, to, u32::try_from(index).unwrap_or(u32::MAX));
                     self.hole_count += 1;
                 }
                 None => {

@@ -16,17 +16,35 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         if !this.is_object() {
             return Err(self.throw_type_error());
         }
-        let Some((target, index, kind)) = object::iterator_state(self.heap, this.as_handle())
+        if object::iterator_state(self.heap, this.as_handle())
             .map_err(|_| Completion::HEAP_EXHAUSTED)?
-        else {
+            .is_none()
+        {
             return Err(self.throw_type_error());
-        };
+        }
+        let (value, done) = self.iterator_native_step(this)?;
         let result = object::create(self.heap, Value::object(self.realm.object_prototype))
             .map_err(|_| Completion::HEAP_EXHAUSTED)?;
         let result = Value::object(result);
         let value_key = self.ascii_key(b"value")?;
         let done_key = self.ascii_key(b"done")?;
+        self.define_property(result, value_key, value)?;
+        self.define_property(result, done_key, Value::boolean(done))?;
+        Ok(result)
+    }
 
+    /// The turn itself: the value and whether the iterator is done, with its
+    /// position moved on. `StepNativeIterator` takes this without the result
+    /// object, which a `for`-`of` would only read and drop.
+    pub(in crate::vm) fn iterator_native_step(
+        &mut self,
+        this: Value,
+    ) -> Result<(Value, bool), Completion> {
+        let Some((target, index, kind)) = object::iterator_state(self.heap, this.as_handle())
+            .map_err(|_| Completion::HEAP_EXHAUSTED)?
+        else {
+            return Err(self.throw_type_error());
+        };
         let (value, done, next) = if kind == ITERATE_MAP_ENTRIES || kind == ITERATE_SET_ENTRIES {
             let held = self.collection_arrays(target, false)?;
             let Some((keys, vals)) = held else {
@@ -91,8 +109,6 @@ impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {
         };
         object::set_iterator_index(self.heap, this.as_handle(), next)
             .map_err(|_| Completion::HEAP_EXHAUSTED)?;
-        self.define_property(result, value_key, value)?;
-        self.define_property(result, done_key, Value::boolean(done))?;
-        Ok(result)
+        Ok((value, done))
     }
 }
