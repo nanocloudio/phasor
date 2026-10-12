@@ -13,7 +13,7 @@ hardware_targets = ["bcm2712", "wasm", "rp2350", "linux"]
 name         = "image_in"
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = { default = 65536, rp2350 = 2048 }
+buffer_size  = { default = 65536, thumbv8m = 2048 }
 
 # Completion frames answering the calls this isolate made, each followed by
 # the bytes it answers with.
@@ -22,7 +22,7 @@ name         = "completion_in"
 index        = 1
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = { default = 8192, rp2350 = 4096 }
+buffer_size  = { default = 8192, thumbv8m = 4096 }
 
 # What a build may be that the default is not. A flag names something left
 # out or sized down, and the default declares none, so the unsuffixed fmod is
@@ -85,7 +85,7 @@ name         = "call_out"
 index        = 1
 direction    = "output"
 content_type = "OctetStream"
-buffer_size  = { default = 8192, rp2350 = 4096 }
+buffer_size  = { default = 8192, thumbv8m = 4096 }
 
 # Why a run produced no value: a termination, a rejection, or an image that
 # could not be admitted. Numbers, not words.

@@ -6,7 +6,7 @@ hardware_targets = ["bcm2712", "wasm", "rp2350", "linux"]
 name         = "call_in"
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = { default = 8192, rp2350 = 512 }
+buffer_size  = { default = 8192, thumbv8m = 512 }
 
 # Completion frames from an adapter, answering what this router forwarded,
 # each followed by the bytes it answers with.
@@ -15,14 +15,14 @@ name         = "reply_in"
 index        = 1
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = { default = 8192, rp2350 = 512 }
+buffer_size  = { default = 8192, thumbv8m = 512 }
 
 # Completion frames back to the isolate.
 [[ports]]
 name         = "completion_out"
 direction    = "output"
 content_type = "OctetStream"
-buffer_size  = { default = 8192, rp2350 = 512 }
+buffer_size  = { default = 8192, thumbv8m = 512 }
 
 # Call frames on to the adapter that serves the binding.
 [[ports]]
@@ -30,7 +30,7 @@ name         = "request_out"
 index        = 1
 direction    = "output"
 content_type = "OctetStream"
-buffer_size  = { default = 8192, rp2350 = 512 }
+buffer_size  = { default = 8192, thumbv8m = 512 }
 
 # The second leg, for a second adapter: an isolate granted two interfaces
 # has one call port, and the router splits it by interface.
@@ -39,14 +39,14 @@ name         = "reply_in_b"
 index        = 2
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = { default = 8192, rp2350 = 512 }
+buffer_size  = { default = 8192, thumbv8m = 512 }
 
 [[ports]]
 name         = "request_out_b"
 index        = 2
 direction    = "output"
 content_type = "OctetStream"
-buffer_size  = { default = 8192, rp2350 = 512 }
+buffer_size  = { default = 8192, thumbv8m = 512 }
 
 [observability]
 exempt = "protocol component whose evidence is the completions it emits and the calls it refuses"

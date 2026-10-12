@@ -83,7 +83,7 @@ const LEGS: usize = 2;
 // what a part with a 240 KiB state arena can spare, sized for capabilities
 // that answer in a few bytes -- a clock, an entropy source. A payload over
 // the profile's bound is refused as busy rather than cut.
-#[cfg(not(fluxor_silicon = "rp2350"))]
+#[cfg(not(fluxor_abi = "thumbv8m"))]
 mod profile {
     /// Calls that may be outstanding at once. One more is refused as busy,
     /// which the caller may retry.
@@ -93,7 +93,7 @@ mod profile {
     /// Frames that may be staged for each output at once, each with its payload.
     pub const STAGE: usize = 4;
 }
-#[cfg(fluxor_silicon = "rp2350")]
+#[cfg(fluxor_abi = "thumbv8m")]
 mod profile {
     pub const IN_FLIGHT: usize = 4;
     pub const PAYLOAD_BYTES: usize = 256;

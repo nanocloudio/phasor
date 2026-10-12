@@ -134,11 +134,11 @@ use vm::{Completion, Frame, ModuleInstance, Progress, Saves, Vm};
 /// alone — the intrinsics a program starts with, before it allocates anything
 /// — takes 69,240 bytes of heap.
 mod profile {
-    #[cfg(not(any(fluxor_silicon = "rp2350", feature = "profile_embedded")))]
+    #[cfg(not(any(fluxor_abi = "thumbv8m", feature = "profile_embedded")))]
     pub use application::*;
-    #[cfg(any(fluxor_silicon = "rp2350", feature = "profile_embedded"))]
+    #[cfg(any(fluxor_abi = "thumbv8m", feature = "profile_embedded"))]
     pub use embedded::*;
-    #[cfg(fluxor_silicon = "rp2040")]
+    #[cfg(fluxor_abi = "thumbv6m")]
     compile_error!(
         "phasor_isolate has no storage profile for rp2040: its 64 KiB module-state arena is smaller than the 69,240 bytes the realm alone takes"
     );
@@ -212,9 +212,9 @@ mod profile {
         /// A figure measured on Thumb frames, so it binds on that silicon
         /// only: the same profile on an application-class part, where frames
         /// are larger and a module has a stack of its own, is unbounded.
-        #[cfg(fluxor_silicon = "rp2350")]
+        #[cfg(fluxor_abi = "thumbv8m")]
         pub const HOST_STACK_BYTES: u32 = 16 * 1024;
-        #[cfg(not(fluxor_silicon = "rp2350"))]
+        #[cfg(not(fluxor_abi = "thumbv8m"))]
         pub const HOST_STACK_BYTES: u32 = 0;
         /// Modules one linked closure may hold. Each is a parsed unit on the
         /// host stack while the task starts and while it advances, so four,
@@ -1617,7 +1617,7 @@ entry! {
 // build carrying either declares nothing and an RP graph refuses it, rather
 // than admitting it on a figure its code can exceed.
 declare_module_stack_bytes!(if cfg!(all(
-    fluxor_silicon = "rp2350",
+    fluxor_abi = "thumbv8m",
     feature = "omit_regexp",
     feature = "omit_json"
 )) {
