@@ -23,6 +23,13 @@ own, and they are not the same capability. The whole of the name is therefore
 function, `capability::name_of`: two implementations of one name are two
 names.
 
+An image is not itself a capability. It arrives with the graph -- on a board
+in the bundle's program section, under the slot's digest and, where the
+firmware has a slot root, its signature -- so the authority that admits the
+modules admits the program too, and a grant over the same bytes would be a
+second authority over one decision. What the isolate adds is its own
+admission: the image's format and feature digests and the verifier.
+
 An image states what it requires through an import carrying a scheme, and the
 deployment checks each requirement against what it granted before anything
 runs. A capability that was not granted is `binding-not-granted` at admission,
@@ -173,8 +180,11 @@ The store is not here. `phasor_store` holds no keys and no bytes: it turns a
 granted call into one operation on Fluxor's `storage.object` and
 `storage.namespace` contracts and answers with what came back. Which provider
 serves those is the deployment's to wire -- the local versioned store, the
-browser's OPFS, or anything else that conforms -- and a program cannot tell
-one from another. A key is a flat name under the prefix the graph gave the
+browser's OPFS, Fluxor's `fs_object` (files over the `fs` contract, which is
+how a Pi 5 or a Pico keeps a store on FAT32 without a storage cluster), Loam's
+node, or anything else that conforms -- and a program cannot tell one from
+another. `examples/capabilities/store-fs.yaml` is the `fs_object` graph and
+`tests/e2e/store_fs.sh` drives it. A key is a flat name under the prefix the graph gave the
 adapter; the prefix is joined on the way in and stripped on the way out, so
 two programs in one graph reach the same provider and never each other's
 keys, and the separator that would express "outside" is not a character a key

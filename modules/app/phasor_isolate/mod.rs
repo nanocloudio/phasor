@@ -232,7 +232,13 @@ mod profile {
         /// Jobs one step runs. A job runs to its end, so this is the bound a
         /// step's reactions have, and two keeps a turn's to one step.
         pub const JOB_SLICE: u32 = 2;
+        /// The image staged from a parameter, a stream, or a program the
+        /// kernel cannot map. A build that runs only programs read in place
+        /// (`image_in_place`) stages none, and gives these bytes back.
+        #[cfg(not(feature = "image_in_place"))]
         pub const IMAGE_CAPACITY: usize = 8 * 1024;
+        #[cfg(feature = "image_in_place")]
+        pub const IMAGE_CAPACITY: usize = 0;
         pub const ARENA_BYTES: usize = 96 * 1024;
         pub const SLOT_COUNT: usize = 1536;
         pub const WORKLIST: usize = 512;
@@ -833,6 +839,14 @@ struct State {
     /// The image arrived whole as the `image` parameter, so nothing is
     /// staged from `image_in`.
     preloaded: bool,
+    /// Where the image comes from when the graph carried no parameter: the
+    /// bundle's program section, asked once (`PROGRAM_*`).
+    program_phase: u8,
+    /// The program's address where it can be read in place -- flash on a
+    /// board, the mapped bundle on a host -- or 0, when it is copied into
+    /// `image` instead.
+    program_addr: usize,
+    program_size: u32,
     /// What `print` wrote that has not yet gone to the log.
     printed: [u8; PRINT_BYTES],
     printed_length: usize,
@@ -866,8 +880,7 @@ fn start(state: &mut State) -> bool {
         // never be admitted by any path.
         return false;
     }
-    let image_length = state.image_length;
-    let Some(bytes) = state.image.get(..image_length) else {
+    let Some(bytes) = image_bytes(state) else {
         return false;
     };
     // The image is staged once and never written again while it runs.
@@ -1083,8 +1096,7 @@ fn start(state: &mut State) -> bool {
 /// Run one bounded slice of the task, apply any answer that arrived, and stage
 /// any call the program made.
 fn advance(state: &mut State) -> Advance {
-    let image_length = state.image_length;
-    let Some(bytes) = state.image.get(..image_length) else {
+    let Some(bytes) = image_bytes(state) else {
         return Advance::Failed;
     };
     // SAFETY: the image is staged and not written while the machine runs, so
@@ -1782,7 +1794,8 @@ fn say(state: &mut State, syscalls: &SyscallTable) {
     // has no single step to bracket either, so it takes the rate like an
     // idle wait does, and only its staging step is traced unconditionally.
     let one_shot_running = state.phase == 1 && !state.surface;
-    let staging = state.phase == 0 && state.image_length > 0;
+    let image_length = image_bytes(state).map_or(0, <[u8]>::len);
+    let staging = state.phase == 0 && image_length > 0;
     let close_to_work = one_shot_running || staging;
     if !close_to_work && !state.trace_steps.is_multiple_of(state.trace) {
         return;
@@ -1800,7 +1813,7 @@ fn say(state: &mut State, syscalls: &SyscallTable) {
     line.text(b"[iso] step=").number(state.trace_steps);
     line.text(b" phase=").number(u32::from(state.phase));
     line.text(b" img=")
-        .number(u32::try_from(state.image_length).unwrap_or(u32::MAX));
+        .number(u32::try_from(image_length).unwrap_or(u32::MAX));
     line.text(b" fuel=")
         .number(u32::try_from(state.fuel_spent).unwrap_or(u32::MAX));
     line.text(b" calls=").number(state.calls_made);
@@ -1913,7 +1926,7 @@ fn drain_control(state: &mut State, syscalls: &SyscallTable) {
 /// next and says what is wrong with it, rather than this saying something is
 /// not granted when nothing was asked for.
 fn requirements_granted(state: &State) -> Option<bool> {
-    let bytes = state.image.get(..state.image_length)?;
+    let bytes = image_bytes(state)?;
     if bytes.is_empty() {
         // Nothing arrived. Whatever was to produce an image said why on its
         // own port, and an image that does not exist requires nothing.
@@ -1978,6 +1991,142 @@ fn requirements_granted(state: &State) -> Option<bool> {
 /// admitted for a binding that is not there to use.
 fn granted(state: &State, want: crate::digest::Digest) -> bool {
     binding_of(state, want).is_some()
+}
+
+/// The admitted image: the program in place where the kernel mapped it, or
+/// what was staged into `image`.
+fn image_bytes(state: &State) -> Option<&[u8]> {
+    if state.program_addr != 0 {
+        // SAFETY: the kernel answered this span as the caller's own program,
+        // readable for the module's lifetime; a slot that is running is never
+        // written, so the bytes do not change under the machine.
+        return Some(unsafe {
+            core::slice::from_raw_parts(
+                state.program_addr as *const u8,
+                state.program_size as usize,
+            )
+        });
+    }
+    state.image.get(..state.image_length)
+}
+
+const PROGRAM_UNASKED: u8 = 0;
+const PROGRAM_COPYING: u8 = 1;
+const PROGRAM_LOADED: u8 = 2;
+const PROGRAM_ABSENT: u8 = 3;
+/// Bytes of a program copied a step: a flash read, well inside a deadline.
+const PROGRAM_CHUNK: usize = 2048;
+/// The `kind` a graph names a Phasor image by, hashed as the packer hashes
+/// it (the SDK's FNV-1a).
+const PROGRAM_KIND: u32 = fnv1a(b"phasor");
+
+enum Program {
+    /// Still being copied: ask again next step.
+    Pending,
+    /// The image is staged, or readable in place.
+    Loaded,
+    /// The bundle carries no program for this instance.
+    Absent,
+    /// It carries one this build will not run, said by name.
+    Refused(Diagnostic),
+}
+
+/// The image from the bundle's program section, when the graph named one for
+/// this instance: refused by its declared kind or format before a byte is
+/// copied, then read in place where the kernel gives an address, or copied a
+/// chunk a step where it does not. Admission still checks the image's own
+/// digests and verifies it, as it does an image from anywhere.
+fn load_program(state: &mut State, syscalls: &SyscallTable) -> Program {
+    use abi::kernel_abi::{program as section, PROGRAM_INFO, PROGRAM_READ};
+    match state.program_phase {
+        PROGRAM_LOADED => return Program::Loaded,
+        PROGRAM_ABSENT => return Program::Absent,
+        PROGRAM_COPYING => {}
+        _ => {
+            let mut info = [0u8; section::INFO_LEN];
+            // SAFETY: `info` is valid for `INFO_LEN` bytes; slot 0 is asked.
+            let answered = unsafe {
+                (syscalls.provider_call)(-1, PROGRAM_INFO, info.as_mut_ptr(), info.len())
+            };
+            if answered < 0 {
+                state.program_phase = PROGRAM_ABSENT;
+                return Program::Absent;
+            }
+            let word = |at: usize| {
+                u32::from_le_bytes([info[at], info[at + 1], info[at + 2], info[at + 3]])
+            };
+            let address = u64::from(word(0)) | (u64::from(word(4)) << 32);
+            let size = word(8);
+            let kind = word(12);
+            if kind != 0 && kind != PROGRAM_KIND {
+                state.program_phase = PROGRAM_ABSENT;
+                return Program::Refused(
+                    Diagnostic::at(code::MALFORMED_IMAGE, Severity::Error, 0)
+                        .with(diagnostic::image::MAGIC),
+                );
+            }
+            let format = &info[32..64];
+            if format.iter().any(|byte| *byte != 0) && format != &bytecode::format_digest().0[..] {
+                state.program_phase = PROGRAM_ABSENT;
+                return Program::Refused(
+                    Diagnostic::at(code::BYTECODE_FORMAT_MISMATCH, Severity::Error, 0)
+                        .with(diagnostic::image::FORMAT_DIGEST),
+                );
+            }
+            state.program_size = size;
+            state.image_length = 0;
+            if let Ok(address) = usize::try_from(address) {
+                if address != 0 {
+                    state.program_addr = address;
+                    state.program_phase = PROGRAM_LOADED;
+                    return Program::Loaded;
+                }
+            }
+            if size as usize > IMAGE_CAPACITY {
+                state.overflowed = true;
+                state.program_phase = PROGRAM_LOADED;
+                return Program::Loaded;
+            }
+            state.program_phase = PROGRAM_COPYING;
+        }
+    }
+    let size = state.program_size as usize;
+    let at = state.image_length;
+    if at < size {
+        let want = core::cmp::min(PROGRAM_CHUNK, IMAGE_CAPACITY - at);
+        // The request rides at the head of the buffer it is answered in.
+        let mut small = [0u8; 8];
+        let (buffer, length): (*mut u8, usize) = match state.image.get_mut(at..at + want) {
+            Some(room) if room.len() >= 8 => (room.as_mut_ptr(), room.len()),
+            _ => (small.as_mut_ptr(), small.len()),
+        };
+        let offset = (at as u32).to_le_bytes();
+        // SAFETY: `buffer` is valid for `length` (at least 8) bytes.
+        let got = unsafe {
+            core::ptr::write_bytes(buffer, 0, 4);
+            core::ptr::copy_nonoverlapping(offset.as_ptr(), buffer.add(4), 4);
+            (syscalls.provider_call)(-1, PROGRAM_READ, buffer, length)
+        };
+        if got <= 0 {
+            // Ended short of its size: what is staged is not the program.
+            state.program_phase = PROGRAM_ABSENT;
+            return Program::Refused(
+                Diagnostic::at(code::MALFORMED_IMAGE, Severity::Error, 0)
+                    .with(diagnostic::image::TRUNCATED),
+            );
+        }
+        let got = got as usize;
+        if buffer == small.as_mut_ptr() {
+            let tail = state.image.get_mut(at..at + got).filter(|_| got <= 8);
+            if !tail.is_some_and(|room| copy_into(room, &small[..got])) {
+                state.overflowed = true;
+            }
+        }
+        state.image_length = at + got;
+        return Program::Pending;
+    }
+    state.program_phase = PROGRAM_LOADED;
+    Program::Loaded
 }
 
 /// Stage the whole image before admitting it: a partial image is not an image,
@@ -2077,7 +2226,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // The image comes on `image_in` unless the graph carried it as a
     // parameter; the result goes out on `result_out` when one is wired. A
     // program that runs for the life of the board has no result to wait on.
-    if state.syscalls.is_null() || (state.image_in < 0 && !state.preloaded) {
+    if state.syscalls.is_null() {
         return -2;
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
@@ -2092,8 +2241,28 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     drain_control(state, syscalls);
 
     if state.phase == 0 {
-        if !state.preloaded && !stage_image(state, syscalls) {
-            return 0;
+        if !state.preloaded {
+            match load_program(state, syscalls) {
+                Program::Pending => return 0,
+                Program::Loaded => {}
+                Program::Refused(diagnostic) => {
+                    state.diagnostic = diagnostic.encode();
+                    state.has_diagnostic = true;
+                    state.failed = true;
+                    state.phase = 2;
+                    return 0;
+                }
+                // No parameter and no program: the image comes on the
+                // stream, or from nowhere.
+                Program::Absent => {
+                    if state.image_in < 0 {
+                        return -2;
+                    }
+                    if !stage_image(state, syscalls) {
+                        return 0;
+                    }
+                }
+            }
         }
         // Longer than this build stages: what is staged is a prefix, not an
         // image, and nothing read from it means anything. Said with the
@@ -2121,7 +2290,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.phase = 2;
             return 0;
         }
-        if state.image_length == 0 {
+        if image_bytes(state).map_or(0, <[u8]>::len) == 0 {
             // Zero bytes is not an image, and a hang-up on an empty stream is
             // not always an image that ended -- it can be one that has not
             // arrived.
