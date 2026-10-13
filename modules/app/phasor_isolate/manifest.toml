@@ -62,6 +62,15 @@ features = ["profile_embedded"]
 name     = "embedded_lean"
 features = ["profile_embedded", "omit_json", "omit_regexp"]
 
+# `embedded_lean` for a board whose program is in the bundle's program
+# section and read in place: no image buffer, so 8 KiB of module state given
+# back. It runs only a program the kernel maps (flash on an RP part); an
+# `image` parameter, an `image_in` stream, or a program it would have to copy
+# is refused as image-too-large.
+[[variant]]
+name     = "embedded_lean_in_place"
+features = ["profile_embedded", "omit_json", "omit_regexp", "image_in_place"]
+
 # Task control: cancellation, the deadline, and the reported time, as small
 # fixed records. A graph that wires nothing here runs tasks to their budgets.
 [[ports]]

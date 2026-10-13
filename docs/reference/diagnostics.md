@@ -227,7 +227,17 @@ front end: source the lowering cannot express is refused where it is written,
 so a program either compiles whole or not at all.
 
 `image-too-large` is the isolate's: the image is longer than the storage
-profile stages, and the argument is the length it does stage.
+profile stages, and the argument is the length it does stage. A build with no
+image buffer (`embedded_lean_in_place`) stages nothing, so it raises this,
+with 0, for any image it would have to copy: a parameter, a stream, or a
+program the kernel cannot map.
+
+A program from the bundle's program section is refused by what the graph
+declared for it before a byte is read: a `kind` other than `phasor` is
+`malformed-image` with the magic argument, and a declared `format` other than
+this build's bytecode format digest is `bytecode-format-mismatch`. Admission
+then checks the image's own digests and verifies it, as it does an image from
+anywhere.
 
 ## 6a. Termination codes
 

@@ -5,8 +5,8 @@ Source: `modules/common/policy.rs`, `modules/common/agent.rs`,
 
 This document defines what an isolate is admitted against, the states it moves
 through, the outcomes a task can end with, and how a task is stopped.
-`phasor_isolate` takes an image on one port, answers on another, puts its
-calls on a third, and says on a fourth why a run produced no value. A control
+`phasor_isolate` takes an image (§1a), answers on one port, puts its
+calls on another, and says on a fourth why a run produced no value. A control
 port carries cancellation, the deadline, and the reported time as small fixed
 records: a cancel is sticky and stops the task at its next safe point, and a
 deadline passes only when a reported time reaches it, so a graph that wires no
@@ -21,6 +21,36 @@ An isolate owns one ECMAScript Agent: one heap, one execution stack, one job
 queue, and its realms. Only one task runs at a time, and a physical yield does
 not let another task in, because run-to-completion is a language guarantee
 rather than a scheduling preference.
+
+## 1a. Where the image comes from
+
+The isolate takes the first of three sources a graph gives it:
+
+1. **The `image` parameter**, a compiled image carried in the graph's config
+   as a blob. It arrives in TLV chunks and is copied into the image buffer as
+   the module is instantiated. This is the Linux and development path.
+2. **The bundle's program section**, named in the graph as the instance's
+   `program:` (`{ file, kind: phasor, format }`). The packer lays it out
+   contiguous and aligned beside the module table, under the bundle's digest,
+   so a signed slot signs the program with the modules. The isolate asks the
+   kernel for it (`PROGRAM_INFO`). Where the kernel answers an address --
+   flash on an RP board, the mapped bundle on a host -- the image is run where
+   it lies and never copied; an `isolated` instance is granted a read-only,
+   execute-never region over exactly its own programs for this. Where it does
+   not (WebAssembly), the program is copied in through `PROGRAM_READ`, 2 KiB
+   a step. A declared `kind` or `format` this build does not run is refused
+   by name before anything is read.
+3. **The `image_in` stream**, one stream ending in a hang-up, from a compiler
+   or a linker in the same graph.
+
+Whichever it is, admission is the same: the format and feature digests, the
+verifier, and the grants an image's imports require. The source changes where
+the bytes come from, never what is accepted.
+
+A board build that runs only from the program section, `embedded_lean_in_place`,
+has no image buffer: 8 KiB of module state given back (the Pico 2 W graph's
+slack goes from 5,760 to 13,568 bytes). It refuses any image it would have to
+stage as `image-too-large`.
 
 ## 2. Policy
 
