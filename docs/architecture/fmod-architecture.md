@@ -223,7 +223,7 @@ modules/
     phasor_fault_host/          host completion fault injector fmod
     phasor_test262/             Test262 front-end oracle fmod
     phasor_run262/              Test262 execution oracle fmod
-packaging/cli/                  the shell's applet graph and workload manifest
+packaging/applet/phasor/        the shell's applet graph and workload manifest
 tests/                          shadow graph scenarios and orchestration only
 examples/                       shadow runnable graph compositions
 ```

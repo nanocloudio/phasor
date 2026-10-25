@@ -32,7 +32,7 @@ runs, and held to a per-file baseline.
 modules/common/             allocation-free language and VM cores
 modules/app/                Fluxor stream components: compiler, linker, isolate, router, adapters
 modules/fixtures/           on-graph conformance probes and Test262 oracles
-packaging/cli/              the shell's applet graph and workload manifest
+packaging/applet/phasor/    the shell's applet graph and workload manifest
 docs/                       canonical architecture and guarantees
 tests/                      shadow-tracked graph orchestration only
 examples/                   shadow-tracked runnable Fluxor graphs
@@ -71,7 +71,7 @@ clock, entropy, store, filesystem and network bindings, which are the only
 authority a program can have.
 
 ```sh
-fluxor install packaging/cli/workload.toml --link ~/.cargo/bin
+fluxor install phasor --link ~/.cargo/bin
 printf '40 + 2' | phasor
 ```
 

@@ -22,7 +22,7 @@ installed once and dispatched by `fluxor exec`, or by name through a busybox
 link.
 
 ```sh
-fluxor install packaging/cli/workload.toml --link ~/.cargo/bin
+fluxor install phasor --link ~/.cargo/bin
 printf 'function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } fib(18)' | phasor
 # 2584
 phasor -e '[1, 2, 3].map(n => n * n)'
@@ -55,7 +55,7 @@ phasor --grant store -e 'store.write("k", "bytes").then(() => store.read("k"))'
 at the task boundary rather than a call. Everything else is a call and answers
 a promise. `store.open(key)` answers a handle the program passes back to
 `store.readAt`; one it invents is refused. The shell prints what it granted,
-and the graph is `packaging/cli/linux.yaml`.
+and the graph is `packaging/applet/phasor/linux.yaml`.
 
 The store is the deployment's, not the program's. It is served by whatever is
 wired behind Fluxor's `storage.object` contract, which on Linux is the local

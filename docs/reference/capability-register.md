@@ -318,8 +318,8 @@ build the graph at all.
 These are the limits of the verifier the engine carries, which is what
 decides a chain on a target that offers no `trust` provider. A graph that
 sets `trust: system` asks the platform instead, and reaches whatever the host
-itself would; none of what follows applies to it. `packaging/cli/linux.yaml` is
-such a graph.
+itself would; none of what follows applies to it.
+`packaging/applet/phasor/linux.yaml` is such a graph.
 
 What the engine verifies: P-256, P-384, Ed25519 and ML-DSA signatures, and
 RSA from 2048 to 4096 bits (PKCS#1 v1.5 in certificates, PSS in
