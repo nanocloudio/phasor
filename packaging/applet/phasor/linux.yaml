@@ -15,6 +15,25 @@ platform:
   cli: {}
   net: {}
 
+include:
+  # Two open clients, one per leg. Neither names an authority: each dials
+  # the one the record carries. `https://` goes down the TLS leg and
+  # `http://` down the plain one.
+  # Each is the stack this project binds to `@http_client` under
+  # [uses.stacks]; its exports are the client's own ports.
+  - stack: "@http_client"
+    as: http_tls
+    params: { protocol: 0 }   # HTTP/1.1
+  - stack: "@http_client"
+    as: http_plain
+    params: { protocol: 0 }   # HTTP/1.1
+  # The WebSocket client, bound to `@ws_client`: the endpoint the graph names
+  # and no program can.
+  - stack: "@ws_client"
+    as: websocket
+    params:
+      authority: "localhost:8080"
+
 modules:
   - name: phasor_shell
   - name: phasor_time
@@ -44,21 +63,6 @@ modules:
   # which version, is the provider's business and reaches no program.
   # `origins` is left unset: `--grant http` admits every origin.
   - name: phasor_http
-  # Two open clients, one per leg. Neither names an authority: each dials
-  # the one the record carries. `https://` goes down the TLS leg and
-  # `http://` down the plain one.
-  - name: http_tls
-    type: http
-    variant: exchange
-    params:
-      mode: 1              # client
-      protocol: 0          # HTTP/1.1
-  - name: http_plain
-    type: http
-    variant: exchange
-    params:
-      mode: 1              # client
-      protocol: 0          # HTTP/1.1
   # The TLS leg takes the identity it verifies from each dial it forwards,
   # and asks the PLATFORM whether the chain is good: `trust: system` is the
   # `trust` contract (class 0x1D), where the host applies its own policy --
@@ -89,10 +93,6 @@ modules:
     params:
       # What the endpoint is called, so a URL naming another host is refused
       # rather than quietly answered by this one.
-      authority: "localhost:8080"
-  - name: websocket
-    params:
-      # The endpoint the graph names and no program can.
       authority: "localhost:8080"
 
 wiring:

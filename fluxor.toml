@@ -9,14 +9,16 @@ version = "0.0.1"
 # store. Phasor does not vendor Fluxor and does not publish a sibling runtime.
 [dependencies]
 fluxor = "0.0.1"
-# HTTP is Wave's. This project speaks the exchange surface to it and owns no
-# protocol of its own: what version carried a request, and how its body was
-# framed, is the provider's business and reaches no program.
-wave = "0.0.1"
-# A store is the deployment's, and Loam is one a deployment can wire behind
-# `phasor_store`: `examples/capabilities/store-loam.yaml` composes its node
-# modules, and nothing in this project's own modules depends on it.
-loam = "0.0.1"
+
+# The stack behind each bound name this project's graphs include. HTTP and
+# WebSocket are Wave's, and a store is the deployment's: this project speaks
+# the exchange and storage surfaces to whichever stack fills the name, and
+# nothing in its own modules depends on any of them. Each is pinned on its
+# own, not through a dependency on its publisher.
+[uses.stacks]
+http_client = "wave_http_client"   # examples/net/https.yaml, the applet
+ws_client   = "wave_ws_client"     # the applet
+store       = "loam-node"          # examples/capabilities/store-loam.yaml
 
 [ci]
 targets = ["rp2350", "bcm2712", "wasm"]

@@ -872,7 +872,7 @@ fn answer(
                 return refuse(record, Cause::Internal);
             }
             let body = staged_value.as_ptr() as u64;
-            let mut arg = [0u8; KEY_BYTES * 2 + 32];
+            let mut arg = [0u8; KEY_BYTES * 2 + 32 + obj::KEPT_FIXED_LEN];
             let at = put_u16(&mut arg, 0, u16::try_from(length).unwrap_or(0));
             if !copy_into(
                 arg.get_mut(at..at + length).unwrap_or(&mut []),
@@ -890,7 +890,14 @@ fn answer(
             let at = put_u64(&mut arg, at, value.len() as u64);
             arg[at] = obj::precondition::ANY;
             arg[at + 1] = 0;
-            let at = put_u64(&mut arg, at + 2, state.fence.as_mut_ptr() as u64);
+            // Nothing kept: no key reference, no retention, no hold. A
+            // program's `write` asks for none of them, and a store refuses a
+            // PUT without the block.
+            let Some(kept) = obj::Kept::none().encode(arg.get_mut(at + 2..).unwrap_or(&mut []))
+            else {
+                return refuse(record, Cause::Internal);
+            };
+            let at = put_u64(&mut arg, at + 2 + kept, state.fence.as_mut_ptr() as u64);
             let at = put_u16(&mut arg, at, FENCE_BYTES as u16);
             // SAFETY: every pointer in `arg` names a buffer in the module's
             // state, live until the write is decided, and the table is the
