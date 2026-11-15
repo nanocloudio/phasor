@@ -3,16 +3,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -108,9 +105,9 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // SAFETY: `module_new` initialized the arena as `State`; Fluxor owns
@@ -119,7 +116,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.source_in < 0 || state.result_out < 0 {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the syscall table is supplied by Fluxor and remains live for the
     // module instance's lifetime.
@@ -129,13 +126,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     announce_ready!(state);
 
     if state.phase == 2 {
-        return 1;
+        return StepReturn::Done;
     }
 
     // SAFETY: pending offsets and lengths are maintained within `result` by
     // this module, and the syscall table follows the Fluxor channel ABI.
     if !unsafe { flush_pending(state, syscalls) } {
-        return 0;
+        return StepReturn::Continue;
     }
     if state.phase == 1 {
         if state.exit_out >= 0 {
@@ -145,23 +142,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let written =
                 unsafe { (syscalls.channel_write)(state.exit_out, code.as_ptr(), code.len()) };
             if written != i32::try_from(code.len()).unwrap_or(i32::MAX) {
-                return 0;
+                return StepReturn::Continue;
             }
         }
         state.phase = 2;
-        return 1;
+        return StepReturn::Done;
     }
 
     // SAFETY: both channel handles were supplied by Fluxor for this instance.
     let output_poll = unsafe { (syscalls.channel_poll)(state.result_out, POLL_OUTPUT) };
     if output_poll <= 0 || (output_poll as u32) & POLL_OUTPUT == 0 {
         state.bp_steps = state.bp_steps.saturating_add(1);
-        return 0;
+        return StepReturn::Continue;
     }
     // SAFETY: both channel handles were supplied by Fluxor for this instance.
     let input_poll = unsafe { (syscalls.channel_poll)(state.source_in, POLL_INPUT | POLL_HUP) };
     if input_poll <= 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     if (input_poll as u32) & POLL_INPUT != 0 {
@@ -189,11 +186,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     .saturating_add(u16::try_from(count).unwrap_or(u16::MAX));
             }
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if (input_poll as u32) & POLL_HUP == 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let source_len = usize::from(state.source_len).min(state.source.len());
@@ -227,7 +224,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     state.phase = 1;
     // SAFETY: the just-encoded pending range is within `result`.
     let _ = unsafe { flush_pending(state, syscalls) };
-    0
+    StepReturn::Continue
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

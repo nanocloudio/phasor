@@ -11,7 +11,7 @@
 //! isolate checks the admitted call-stack limit before every call.
 
 use crate::bytecode::{decode, DecodeError, ImageError, Opcode, OperandKind, Unit};
-use crate::diagnostic::{code, image as image_argument, image_feature, Diagnostic, Severity};
+use crate::diagnostic::{code, image as image_argument, Diagnostic, Severity};
 
 /// Per-byte verification state for one function's code.
 ///

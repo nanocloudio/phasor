@@ -1,8 +1,9 @@
 //! The entry points every fmod exports, written once.
 //!
-//! The loader calls four functions by name: the state size, an init hook, a
-//! constructor that lays the module's `State` over the arena it was given,
-//! and the step. The first three are the same in every module but for the
+//! The loader calls three functions by name: an init hook, a constructor that
+//! lays the module's `State` over the arena it was given, and the step; the
+//! state size is a manifest fact. The first two, and the facts, are the same
+//! in every module but for the
 //! `State` type, the names of the two primary port fields, the extra ports
 //! `dev_channel_port` resolves, and whether a parameter block is applied.
 //! `entry!` writes them from exactly that list; `module_step` stays the
@@ -16,7 +17,7 @@
 //! textual macro, consumed through `#[macro_use] mod entry;` in the entry
 //! file, never `#[macro_export]`.
 
-/// Emit `module_state_size`, `module_init`, and `module_new` for `$state`.
+/// Emit `module_facts!`, `module_init`, and `module_new` for `$state`.
 ///
 /// ```ignore
 /// entry! {
@@ -31,6 +32,7 @@
 /// `primary` names the fields that take the loader's `in_chan` and
 /// `out_chan`; `inputs` and `outputs` name the fields resolved by port
 /// index; `params` names an `unsafe fn(&mut State, *const u8, usize)`, or is
+/// omitted; `stack` states a stack depth the build cannot measure, or is
 /// omitted. Every field not named is zero.
 #[allow(unused_macros, reason = "consumed by the fmods that include this file")]
 macro_rules! entry {
@@ -40,16 +42,11 @@ macro_rules! entry {
         inputs { $($in_port:ident = $in_index:expr),* $(,)? }
         outputs { $($out_port:ident = $out_index:expr),* $(,)? }
         $(params $apply:ident)?
+        $(stack $stack:expr)?
     ) => {
-        #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-        #[link_section = ".text.module_state_size"]
-        pub extern "C" fn module_state_size() -> u32 {
-            u32::try_from(core::mem::size_of::<$state>()).unwrap_or(u32::MAX)
-        }
-        // The same size as data, beside the function that measures it: a
-        // part whose packer admits a graph only on a complete sum of its
-        // modules' state reads this rather than running anything.
-        declare_module_state_bytes!($state);
+        // The module's facts, as data the packer writes into the manifest:
+        // its state, and a stack the build cannot measure where one is named.
+        fluxor_rt::module_facts! { state: $state $(, stack: $stack)? }
 
         #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
         #[link_section = ".text.module_init"]
@@ -111,16 +108,11 @@ macro_rules! entry {
         inputs { $($in_port:ident = $in_index:expr),* $(,)? }
         outputs { $($out_port:ident = $out_index:expr),* $(,)? }
         $(params $apply:ident)?
+        $(stack $stack:expr)?
     ) => {
-        #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-        #[link_section = ".text.module_state_size"]
-        pub extern "C" fn module_state_size() -> u32 {
-            u32::try_from(core::mem::size_of::<$state>()).unwrap_or(u32::MAX)
-        }
-        // The same size as data, beside the function that measures it: a
-        // part whose packer admits a graph only on a complete sum of its
-        // modules' state reads this rather than running anything.
-        declare_module_state_bytes!($state);
+        // The module's facts, as data the packer writes into the manifest:
+        // its state, and a stack the build cannot measure where one is named.
+        fluxor_rt::module_facts! { state: $state $(, stack: $stack)? }
 
         #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
         #[link_section = ".text.module_init"]
@@ -195,7 +187,7 @@ macro_rules! announce_ready {
     ($state:expr) => {
         if !$state.announced {
             $state.announced = true;
-            return 3;
+            return fluxor_rt::StepReturn::Ready;
         }
     };
 }

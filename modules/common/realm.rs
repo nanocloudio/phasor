@@ -17,7 +17,6 @@ use crate::heap::Heap;
 use crate::object::{self, attribute, Descriptor, ObjectError};
 use crate::string::{Atoms, Key};
 use crate::value::{Handle, Value};
-use crate::{name_table_len, NameTable};
 
 // One realm across these files: each child builds one family of intrinsics
 // at the point `create` calls it, so the order of every definition — and
@@ -57,23 +56,91 @@ mod strings;
 mod symbols;
 #[path = "realm/weak.rs"]
 mod weak;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use arrays::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use buffers::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use collections::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use date::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use errors::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use functions::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use iterators::*;
 #[cfg(not(feature = "omit_json"))]
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use json::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use math::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use numbers::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use objects::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use promises::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use proxy::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use reflect::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use strings::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use symbols::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use weak::*;
 
 /// The functions the engine implements itself.
@@ -663,7 +730,7 @@ impl ErrorKind {
 // `match` returning the literals is a table of their addresses on 32-bit Arm,
 // and a module image is placed at a load-time address with nothing relocating
 // it, so each entry would read the wrong place at run time.
-name_table!(
+fluxor_rt::name_table!(
     ERROR_NAMES = [
         b"Error",
         b"TypeError",

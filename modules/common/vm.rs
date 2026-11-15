@@ -72,25 +72,97 @@ mod realms;
 #[path = "vm/regexps.rs"]
 #[cfg(not(feature = "omit_regexp"))]
 mod regexps;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use bigints::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use buffers::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use calls::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use coercion::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use coroutines::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use date::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use eval::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use host::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use iteration::*;
 #[cfg(not(feature = "omit_json"))]
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use json::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use modules::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use names::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use natives::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use privates::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use properties::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use proxy::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use realms::*;
 #[cfg(not(feature = "omit_regexp"))]
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use regexps::*;
 
 /// How a suspended frame is being resumed.

@@ -12,7 +12,7 @@
               finaliser this layer does not use"
 )]
 mod sdk {
-    include!("../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+    pub use fluxor_sdk::crypto::sha256::*;
 }
 
 /// A 256-bit content identity.

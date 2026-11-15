@@ -27,17 +27,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this fixture consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -153,7 +149,7 @@ struct State {
     labels: [u32; ASSEMBLED_MARKS],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     1, source, str, 0
@@ -408,15 +404,15 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.source_out < 0 || state.result_in < 0 {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
@@ -438,18 +434,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // this module gets and what it can count; the graph converts, knowing its
     // own tick.
     if state.steps <= state.delay {
-        return 0;
+        return StepReturn::Continue;
     }
 
     if state.phase == 2 {
-        return 1;
+        return StepReturn::Done;
     }
 
     if state.phase == 0 {
         if state.assemble > 0 && state.assembled == 0 {
             match assemble_sum(state) {
                 Some(written) => state.assembled = written,
-                None => return -3,
+                None => return StepReturn::error(-3),
             }
         }
         let source = if state.assemble > 0 {
@@ -463,7 +459,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             source,
             &mut state.source_written,
         ) {
-            return 0;
+            return StepReturn::Continue;
         }
         // The stream is whole: the hang-up is what tells the compiler so, and
         // this module stays to read what comes back.
@@ -479,16 +475,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             )
         };
         if hung_up < 0 {
-            return -3;
+            return StepReturn::error(-3);
         }
         state.phase = 1;
-        return 0;
+        return StepReturn::Continue;
     }
 
     // A module's image goes round through the linker before anything can
     // come back.
     if !carry_image(state, syscalls) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // The result is one stream; the exit status is one little-endian word.
@@ -511,15 +507,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         state.exit_ready = true;
     }
     if staged != wire::Staged::Complete {
-        return 0;
+        return StepReturn::Continue;
     }
     state.phase = 2;
     let exit = i32::from_le_bytes(state.exit);
     if state.exit_ready && exit == 0 && accepted(state) {
-        1
+        StepReturn::Done
     } else {
-        -3
+        StepReturn::error(-3)
     }
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

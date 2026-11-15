@@ -9,17 +9,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -68,17 +64,12 @@ mod verify;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use arena::{Arena, Node, NodeKind};
+use arena::Node;
 use bytecode::{Constant, ExceptionRegion, ExportRecord, Function, ImportRecord};
 use diagnostic::{code, Diagnostic, Severity};
 use emit::Patch;
-use lex::Lexer;
-use lower::{
-    lower_expression, lower_module, Binding as LexicalBinding, Pending as PendingFunction, Scope,
-    Storage as LowerStorage,
-};
-use parse::Parser;
-use source::{Limits, LineStart, LineTable};
+use lower::{Binding as LexicalBinding, Pending as PendingFunction, Scope};
+use source::{Limits, LineStart};
 
 // Sized for a real program rather than a snippet: a conformance case carries
 // its harness, and this fmod runs on the application targets, where the state
@@ -104,7 +95,7 @@ const FUEL: u32 = 4_000_000;
 const GOAL_SCRIPT: u8 = 0;
 const GOAL_MODULE: u8 = 1;
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     1, goal, u8, 0, enum { script=0, module=1 }
@@ -252,15 +243,15 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.source_in < 0 || state.image_out < 0 {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
@@ -268,7 +259,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     announce_ready!(state);
 
     if state.phase == 3 {
-        return 1;
+        return StepReturn::Done;
     }
 
     // Stage the whole source before compiling it: a partial read is not a
@@ -282,7 +273,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             &mut state.overflowed,
         );
         if staged != wire::Staged::Complete {
-            return 0;
+            return StepReturn::Continue;
         }
         // Zero bytes is not a program, and a hang-up on an empty stream is
         // not always a source that ended -- it can be one that has not
@@ -309,11 +300,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // holds its source back longer than that says so.
         if state.source_length == 0 && state.empty_waited < state.empty_wait {
             state.empty_waited = state.empty_waited.saturating_add(1);
-            return 0;
+            return StepReturn::Continue;
         }
         state.failed = !compile(state);
         state.phase = 1;
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Write the image out, one bounded write at a time.
@@ -330,25 +321,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     &mut state.diagnostic_written,
                 )
             {
-                return 0;
+                return StepReturn::Continue;
             }
             state.phase = 2;
-            return 0;
+            return StepReturn::Continue;
         }
         let image = state.image.get(..state.image_length).unwrap_or(&[]);
         if wire::push_progress(syscalls, state.image_out, image, &mut state.written) {
             state.phase = 2;
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if !wire::push_exit(syscalls, state.exit_out, state.failed) {
-        return 0;
+        return StepReturn::Continue;
     }
     state.phase = 3;
     // A source that does not compile is an outcome, not a fault: the exit status
     // says what happened and the diagnostic says why.
-    1
+    StepReturn::Done
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -3,16 +3,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this fixture consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -82,15 +79,15 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
@@ -103,7 +100,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let input = [u8::try_from(state.byte).unwrap_or(u8::MAX)];
         let _ = evaluate(&input, 2, &mut output);
         state.byte = state.byte.saturating_add(1);
-        return 0;
+        return StepReturn::Continue;
     }
     probe::step(
         &mut state.progress,
@@ -116,4 +113,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     )
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -36,12 +36,40 @@ mod patterns;
 mod primary;
 #[path = "parse/statements.rs"]
 mod statements;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use classes::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use expressions::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use functions::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use modules::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use patterns::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use primary::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use statements::*;
 
 /// The expression parser over one source.

@@ -17,24 +17,19 @@ SECTIONS
 {
     .text : {
         _code_start = .;
-        KEEP(*(.text.module_state_size*))
+        /* The entry points (the registry's `entry_point` list, held equal
+         * by `tools/tests/module_ld_keeps_the_entry_points.rs`): the kernel
+         * finds them by export hash, so nothing in the module references
+         * them and --gc-sections would discard them unless kept here. */
         KEEP(*(.text.module_init*))
         KEEP(*(.text.module_new*))
         KEEP(*(.text.module_step*))
         KEEP(*(.text.module_pipeline_refill*))
         KEEP(*(.text.module_post_tick_flush*))
-        KEEP(*(.text.module_channel_hints*))
-        KEEP(*(.text.module_in_place_safe*))
-        KEEP(*(.text.module_mailbox_safe*))
-        KEEP(*(.text.module_deferred_ready*))
         KEEP(*(.text.module_drain*))
-        KEEP(*(.text.module_arena_size*))
-        KEEP(*(.text.module_provider_dispatch*))
-        KEEP(*(.text.module_provides_contract*))
-        KEEP(*(.text.module_flash_store_dispatch*))
-        KEEP(*(.text.module_isr_init*))
         KEEP(*(.text.module_isr_entry*))
-        KEEP(*(.text.backing_provider_dispatch*))
+        KEEP(*(.text.module_provider_dispatch*))
+        KEEP(*(.text.module_provider_selector*))
         *(.text*)
         . = ALIGN(8);
     } > FLASH
@@ -43,13 +38,15 @@ SECTIONS
         *(.rodata*)
         /* LLVM emits switch-table dispatch tables to `.data.rel.ro` when
          * a `match` over a small enum of references is large enough to
-         * be jump-tableable. These tables hold pointers into .rodata
-         * that the kernel module loader must relocate at load time —
-         * they're conceptually rodata, not .data, so funnel them here
-         * (the .data output section is `_data_size = 0` and would
-         * otherwise be discarded at load). Without this the dispatch
-         * tables land in a discarded section and the first call
-         * SIGSEGVs (seen in aac_codec's huffman_2step_pair/quad). */
+         * be jump-tableable. They are conceptually rodata, not .data, so
+         * funnel them here (the .data output section is `_data_size = 0`
+         * and would otherwise be discarded at load, and a dispatch table
+         * in a discarded section faults on its first call). The loader
+         * applies no relocations, so a table that holds addresses is
+         * only correct if the code never reads them as addresses; module
+         * sources compute such references in code instead (see
+         * docs/architecture/module_architecture.md, "Position-independent
+         * data"). */
         *(.data.rel.ro*)
         . = ALIGN(8);
         _code_end = .;

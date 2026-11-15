@@ -21,17 +21,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -585,7 +581,7 @@ fn dispatch(state: &mut State, record: &CallRecord, payload: &[u8]) {
     }
 }
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     1, authority, str, 0
@@ -626,21 +622,21 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: the loader owns this arena for the module's lifetime and hands
     // the same pointer to every step.
     let state = unsafe { &mut *(state as *mut State) };
     if state.syscalls.is_null() || state.request_in < 0 || state.reply_out < 0 {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: stored by `module_new` and checked non-null above.
     let syscalls = unsafe { &*state.syscalls };
     announce_ready!(state);
     if state.phase == 1 {
-        return 1;
+        return StepReturn::Done;
     }
 
     // What the provider says became of a link, one whole record at a time.
@@ -780,9 +776,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         && !state.held.iter().any(|held| held.live)
     {
         state.phase = 1;
-        return 1;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

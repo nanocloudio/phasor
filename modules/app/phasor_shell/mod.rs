@@ -18,18 +18,15 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -2174,15 +2171,15 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.stdout_out < 0 {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
@@ -2190,7 +2187,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     announce_ready!(state);
 
     if state.phase == PHASE_DONE {
-        return 1;
+        return StepReturn::Done;
     }
     let drained = flush_out(&mut state.out, state.stdout_out, syscalls);
 
@@ -2204,7 +2201,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if count == 0 {
             state.waited += 1;
             if state.waited < ARGV_WAIT {
-                return 0;
+                return StepReturn::Continue;
             }
         }
         state.arec_length = count;
@@ -2213,12 +2210,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             Parsed::Help => {
                 emit(&mut state.out, HELP);
                 state.phase = PHASE_FINISH;
-                return 0;
+                return StepReturn::Continue;
             }
             Parsed::Refused => {
                 state.failed = true;
                 state.phase = PHASE_FINISH;
-                return 0;
+                return StepReturn::Continue;
             }
         }
         if state.grant_count > 0 {
@@ -2240,20 +2237,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.prompt_due = true;
         }
         state.phase = PHASE_RUN;
-        return 0;
+        return StepReturn::Continue;
     }
 
     if state.phase == PHASE_RUN {
         // Output that has not left yet is backpressure on the task: nothing
         // more is produced until the port has taken it.
         if !drained && out_room(&state.out) < OUT_CAPACITY / 4 {
-            return 0;
+            return StepReturn::Continue;
         }
         // The standard surface goes into the realm before anything a person
         // typed, as a program like any other: compiled by the same front end,
         // verified, and run under the same bounds.
         if !state.seed_done && !draw_seed(state, syscalls) {
-            return 0;
+            return StepReturn::Continue;
         }
         if !state.facade_done && !state.bare && !state.task_running {
             // The surface arrives from the module that holds it, whole, ended
@@ -2261,7 +2258,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // which is what asking for none looks like.
             if state.surface_in < 0 {
                 state.facade_done = true;
-                return 0;
+                return StepReturn::Continue;
             }
             if !state.surface_ready {
                 let staged = wire::stage_stream(
@@ -2272,19 +2269,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     &mut state.surface_overflowed,
                 );
                 if staged != wire::Staged::Complete {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 state.surface_ready = true;
                 if state.surface_overflowed {
                     emit(&mut state.out, b"phasor: surface too large\n");
                     state.failed = true;
                     state.phase = PHASE_FINISH;
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
             state.facade_done = true;
             if state.surface_length == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             // SAFETY: the surface is staged and never written while the front
             // end runs, and the front end's storage is every other field.
@@ -2302,7 +2299,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     state.phase = PHASE_FINISH;
                 }
             }
-            return 0;
+            return StepReturn::Continue;
         }
         push_calls(state, syscalls);
         pull_replies(state, syscalls);
@@ -2319,7 +2316,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // the snapshot is taken here, at the boundary, before any of the
             // program runs.
             if !state.snapshot_ready && !take_snapshot(state, syscalls) {
-                return 0;
+                return StepReturn::Continue;
             }
             if advance(state) != Advance::Running {
                 state.snapshot_ready = false;
@@ -2336,7 +2333,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     state.phase = PHASE_FINISH;
                 }
             }
-            return 0;
+            return StepReturn::Continue;
         }
         match state.mode {
             MODE_REPL => repl_idle(state, syscalls),
@@ -2350,14 +2347,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         &mut state.source_overflow,
                     );
                     if staged != wire::Staged::Complete {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     state.source_complete = true;
                     if state.source_overflow {
                         emit(&mut state.out, b"phasor: source-too-large\n");
                         state.failed = true;
                         state.phase = PHASE_FINISH;
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
                 if !start_input(state) {
@@ -2365,18 +2362,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     // PHASE_FINISH: everything written leaves, then the status.
     if !drained {
-        return 0;
+        return StepReturn::Continue;
     }
     if !wire::push_exit(syscalls, state.exit_out, state.failed) {
-        return 0;
+        return StepReturn::Continue;
     }
     state.phase = PHASE_DONE;
-    1
+    StepReturn::Done
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

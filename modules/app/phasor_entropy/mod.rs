@@ -13,17 +13,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -73,7 +69,7 @@ struct State {
     phase: u8,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     1, width, u8, 0, enum { bits32=0, bits53=1 }
@@ -145,22 +141,22 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.request_in < 0 || state.reply_out < 0 {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
     let syscalls = unsafe { &*state.syscalls };
     announce_ready!(state);
     if state.phase == 1 {
-        return 1;
+        return StepReturn::Done;
     }
 
     // One request is taken only when there is room for its answer.
@@ -198,9 +194,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
     if state.hung_up && state.staged == 0 && state.filled == 0 {
         state.phase = 1;
-        return 1;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -27,16 +27,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this fixture consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -65,7 +62,7 @@ mod value;
 #[path = "../../common/wire.rs"]
 mod wire;
 
-use arena::{Arena, Node, NodeKind};
+use arena::{Arena, Node};
 use lex::{Goal, Keyword, Lexer, Punctuator, TokenKind};
 use parse::Parser;
 use source::{Limits, LineStart, LineTable};
@@ -334,15 +331,15 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.input < 0 || state.report_out < 0 {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
@@ -350,14 +347,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     announce_ready!(state);
 
     if state.phase == 3 {
-        return 1;
+        return StepReturn::Done;
     }
 
     // Finish any report line that is still being written.
     if state.report_length > state.report_offset {
         let report = state.report.get(..state.report_length).unwrap_or(&[]);
         if !wire::push_progress(syscalls, state.report_out, report, &mut state.report_offset) {
-            return 0;
+            return StepReturn::Continue;
         }
         state.report_offset = 0;
         state.report_length = 0;
@@ -371,18 +368,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.report_length = length;
             state.report_offset = 0;
             state.line = state.line.saturating_add(1);
-            return 0;
+            return StepReturn::Continue;
         }
         state.phase = 2;
-        return 0;
+        return StepReturn::Continue;
     }
 
     if state.phase == 2 {
         if !wire::push_exit(syscalls, state.exit_out, state.unexpected != 0) {
-            return 0;
+            return StepReturn::Continue;
         }
         state.phase = 3;
-        return 1;
+        return StepReturn::Done;
     }
 
     if wire::has_input(syscalls, state.input) {
@@ -390,23 +387,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let room = state.buffer.get_mut(offset..).unwrap_or(&mut []);
         if room.is_empty() {
             drain(state);
-            return 0;
+            return StepReturn::Continue;
         }
         let read = wire::read_available(syscalls, state.input, room);
         if read > 0 {
             state.filled += read;
             drain(state);
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if !wire::hung_up(syscalls, state.input) {
-        return 0;
+        return StepReturn::Continue;
     }
 
     drain(state);
     state.phase = 1;
-    0
+    StepReturn::Continue
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -32,18 +32,66 @@ mod strings;
 mod symbols;
 #[path = "uri.rs"]
 mod uri;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use arrays::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use collections::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use functions::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use iterators::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use math::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use numbers::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use objects::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use reflect::*;
 #[cfg(not(feature = "omit_regexp"))]
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use regexps::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use strings::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use symbols::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use uri::*;
 
 impl<'a, 'u, 'h, 'atoms> Vm<'a, 'u, 'h, 'atoms> {

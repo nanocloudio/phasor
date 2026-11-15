@@ -15,17 +15,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -96,19 +92,18 @@ mod vm;
 mod wire;
 
 use binding::{
-    Answer, Binding, Bindings, BindingsSave, CallRecord, Cause, CompletionRecord, Disposition,
-    Pending, CALL_FRAME, COMPLETION_FRAME,
+    Answer, Binding, CallRecord, Cause, CompletionRecord, Disposition, Pending, CALL_FRAME,
+    COMPLETION_FRAME,
 };
-use bytecode::{Opcode, Unit};
+use bytecode::Unit;
 use closure::Closure;
 use diagnostic::{code, Diagnostic, Severity};
 use heap::Slot;
-use job::{Job, Queue, QueueSave};
+use job::Job;
 use policy::Policy;
 use realm::Realm;
 #[cfg(not(feature = "omit_regexp"))]
 use regexp::Choice;
-use string::{Atoms, AtomsSave};
 use value::{Handle, Value};
 use vm::{Completion, Frame, ModuleInstance, Progress, Saves, Vm};
 
@@ -258,7 +253,10 @@ use profile::*;
 /// running until it reaches the instruction: an image either runs whole on
 /// this build or does not run on it.
 #[cfg(feature = "omit_regexp")]
-const REFUSED: &[verify::Refused] = &[(Opcode::CreateRegExp, diagnostic::image_feature::REGEXP)];
+const REFUSED: &[verify::Refused] = &[(
+    bytecode::Opcode::CreateRegExp,
+    diagnostic::image_feature::REGEXP,
+)];
 #[cfg(not(feature = "omit_regexp"))]
 const REFUSED: &[verify::Refused] = &[];
 
@@ -1605,6 +1603,7 @@ entry! {
     inputs { completion_in = 1, control_in = 2 }
     outputs { call_out = 1, diagnostic_out = 2, exit_out = 3 }
     params apply_params
+    stack STACK_BYTES
 }
 
 // The stack this module may reach, for a part where every module steps on
@@ -1628,7 +1627,7 @@ entry! {
 // checked: the regular expression engine and JSON's nesting are not, so a
 // build carrying either declares nothing and an RP graph refuses it, rather
 // than admitting it on a figure its code can exceed.
-declare_module_stack_bytes!(if cfg!(all(
+const STACK_BYTES: u32 = if cfg!(all(
     fluxor_abi = "thumbv8m",
     feature = "omit_regexp",
     feature = "omit_json"
@@ -1636,9 +1635,9 @@ declare_module_stack_bytes!(if cfg!(all(
     38 * 1024
 } else {
     0
-});
+};
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     1, steps, u32, 20_000_000
@@ -2216,9 +2215,9 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
@@ -2227,7 +2226,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // parameter; the result goes out on `result_out` when one is wired. A
     // program that runs for the life of the board has no result to wait on.
     if state.syscalls.is_null() {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
@@ -2236,30 +2235,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     announce_ready!(state);
 
     if state.phase == 3 {
-        return 1;
+        return StepReturn::Done;
     }
     drain_control(state, syscalls);
 
     if state.phase == 0 {
         if !state.preloaded {
             match load_program(state, syscalls) {
-                Program::Pending => return 0,
+                Program::Pending => return StepReturn::Continue,
                 Program::Loaded => {}
                 Program::Refused(diagnostic) => {
                     state.diagnostic = diagnostic.encode();
                     state.has_diagnostic = true;
                     state.failed = true;
                     state.phase = 2;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // No parameter and no program: the image comes on the
                 // stream, or from nowhere.
                 Program::Absent => {
                     if state.image_in < 0 {
-                        return -2;
+                        return StepReturn::error(-2);
                     }
                     if !stage_image(state, syscalls) {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
             }
@@ -2275,7 +2274,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.has_diagnostic = true;
             state.failed = true;
             state.phase = 2;
-            return 0;
+            return StepReturn::Continue;
         }
         // Every binding the image says it requires must be one the deployment
         // granted, or the image is refused whole. A program never starts and
@@ -2288,7 +2287,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             state.has_diagnostic = true;
             state.failed = true;
             state.phase = 2;
-            return 0;
+            return StepReturn::Continue;
         }
         if image_bytes(state).map_or(0, <[u8]>::len) == 0 {
             // Zero bytes is not an image, and a hang-up on an empty stream is
@@ -2306,10 +2305,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // get an outcome rather than a hang.
             if state.empty_waited < state.empty_wait {
                 state.empty_waited = state.empty_waited.saturating_add(1);
-                return 0;
+                return StepReturn::Continue;
             }
             state.phase = 2;
-            return 0;
+            return StepReturn::Continue;
         }
         // The realm first, a stage a step, so that no step builds more of it
         // than a cooperative scheduler can wait for.
@@ -2318,13 +2317,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 state.failed = true;
                 state.phase = 2;
             }
-            return 0;
+            return StepReturn::Continue;
         }
         // Then a seed, for a surfaced task with an entropy grant: the program
         // may ask for randomness in the call, so the generator it draws from
         // is keyed before it runs.
         if !state.seed_done && !draw_seed(state, syscalls) {
-            return 0;
+            return StepReturn::Continue;
         }
         // SAFETY: the table is the loader's, live for the module's lifetime.
         let began = unsafe { dev_micros(syscalls) };
@@ -2337,10 +2336,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if !started {
             state.failed = true;
             state.phase = 2;
-            return 0;
+            return StepReturn::Continue;
         }
         state.phase = 1;
-        return 0;
+        return StepReturn::Continue;
     }
 
     if state.phase == 1 {
@@ -2378,7 +2377,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             drain_printed(state, syscalls);
         }
         match advanced {
-            Advance::Running => return 0,
+            Advance::Running => return StepReturn::Continue,
             Advance::Done => state.phase = 2,
             Advance::Rejected => {
                 state.rejected = true;
@@ -2389,7 +2388,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 state.phase = 2;
             }
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if state.phase == 2 {
@@ -2402,7 +2401,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 &mut state.result_written,
             )
         {
-            return 0;
+            return StepReturn::Continue;
         }
         if state.has_diagnostic
             && state.diagnostic_out >= 0
@@ -2413,10 +2412,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 &mut state.diagnostic_written,
             )
         {
-            return 0;
+            return StepReturn::Continue;
         }
         if !wire::push_exit(syscalls, state.exit_out, state.failed || state.rejected) {
-            return 0;
+            return StepReturn::Continue;
         }
         if state.result_out < 0 {
             log_outcome(state, syscalls);
@@ -2426,10 +2425,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // A program that stopped, threw, or was refused is an outcome: the exit
         // status says what happened and the diagnostic says why. A module error
         // would mean the isolate itself was at fault.
-        return 1;
+        return StepReturn::Done;
     }
 
-    0
+    StepReturn::Continue
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

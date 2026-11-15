@@ -62,18 +62,70 @@ mod references;
 mod scopes;
 #[path = "lower/statements.rs"]
 mod statements;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use calls::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use classes::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use constants::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use exceptions::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use expressions::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use functions::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use loops::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use modules::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use patterns::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use prologues::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use references::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use scopes::*;
+#[allow(
+    unused_imports,
+    reason = "a child file's `pub(super)` items, of which a feature-trimmed build may reference none"
+)]
 use statements::*;
 
 /// Storage the lowering writes into. Every buffer is caller-provided, so the

@@ -52,12 +52,12 @@ pub fn step(
     name: &[u8],
     count: u16,
     run: impl FnOnce(u16) -> bool,
-) -> i32 {
+) -> fluxor_rt::StepReturn {
     if progress.case == 0 && progress.failures == 0 && progress.first_failure == 0 {
         progress.first_failure = u16::MAX;
     }
     if progress.phase == 2 {
-        return 1;
+        return fluxor_rt::StepReturn::Done;
     }
     if progress.case < count {
         let case = progress.case;
@@ -68,7 +68,7 @@ pub fn step(
             }
         }
         progress.case = progress.case.saturating_add(1);
-        return 0;
+        return fluxor_rt::StepReturn::Continue;
     }
 
     if progress.phase == 0 {
@@ -84,19 +84,19 @@ pub fn step(
                 progress.first_failure,
             );
             if !wire::push_whole(sys, report_out, line.get(..length).unwrap_or(&[])) {
-                return 0;
+                return fluxor_rt::StepReturn::Continue;
             }
         }
         progress.phase = 1;
     }
 
     if !wire::push_exit(sys, exit_out, progress.failures != 0) {
-        return 0;
+        return fluxor_rt::StepReturn::Continue;
     }
     progress.phase = 2;
     if progress.failures == 0 {
-        1
+        fluxor_rt::StepReturn::Done
     } else {
-        -3
+        fluxor_rt::StepReturn::error(-3)
     }
 }

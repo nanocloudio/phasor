@@ -12,16 +12,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "the Fluxor ABI source is mounted as one surface and this module consumes a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of each"
 )]
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 #[macro_use]
 #[path = "../../common/entry.rs"]
@@ -289,15 +286,15 @@ entry! {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is the block `module_new` laid out, non-null as
     // checked above, and the loader hands it to one step at a time.
     let state = unsafe { &mut *state.cast::<State>() };
     if state.syscalls.is_null() || state.unit_in < 0 || state.closure_out < 0 {
-        return -2;
+        return StepReturn::error(-2);
     }
     // SAFETY: the table pointer was stored by `module_new` and checked
     // non-null above; the loader keeps it live for the module's lifetime.
@@ -305,7 +302,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     announce_ready!(state);
 
     if state.phase == 3 {
-        return 1;
+        return StepReturn::Done;
     }
 
     // The whole stream is staged before anything is linked: a closure is every
@@ -319,32 +316,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             &mut state.overflowed,
         );
         if staged != wire::Staged::Complete {
-            return 0;
+            return StepReturn::Continue;
         }
         state.failed = !link(state);
         state.phase = 1;
-        return 0;
+        return StepReturn::Continue;
     }
 
     if state.phase == 1 {
         if state.failed {
             state.phase = 2;
-            return 0;
+            return StepReturn::Continue;
         }
         let closure = state.closure.get(..state.closure_length).unwrap_or(&[]);
         if wire::push_progress(syscalls, state.closure_out, closure, &mut state.written) {
             state.phase = 2;
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if !wire::push_exit(syscalls, state.exit_out, state.failed) {
-        return 0;
+        return StepReturn::Continue;
     }
     state.phase = 3;
     // A stream that does not compile is an outcome, not a fault: the exit status
     // says what happened and the diagnostic says why.
-    1
+    StepReturn::Done
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();
