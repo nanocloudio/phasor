@@ -64,8 +64,11 @@ const PAYLOAD_BYTES: usize = 8 * 1024;
 const BUFFER_BYTES: usize = 32 * 1024;
 /// Completions staged for the reply port.
 const STAGE_BYTES: usize = 2 * (COMPLETION_FRAME + PAYLOAD_BYTES);
+/// The largest command frame this adapter writes, header included: one
+/// `CMD_SEND` of a program's bytes.
+const COMMAND_RECORD: usize = proto::FRAME_HDR + 8 * 1024;
 /// Commands staged for the network port.
-const COMMAND_BYTES: usize = 4 * (proto::FRAME_HDR + proto::MAX_CMD_DATA);
+const COMMAND_BYTES: usize = 4 * COMMAND_RECORD;
 /// The largest network frame this adapter reads in one piece.
 /// Room for whatever the port can deliver, rather than for the largest frame
 /// the contract describes. A producer that sends a bigger one is still within
@@ -556,10 +559,13 @@ fn serve(state: &mut State, sys: &SyscallTable, record: &CallRecord) {
             let mut payload = [0u8; proto::CONNECT_TO_MAX];
             let length = proto::write_connect_to(
                 &mut payload,
-                proto::SOCK_TYPE_STREAM,
-                port,
-                &target,
-                Some(tag),
+                &proto::ConnectTo {
+                    sock_type: proto::SOCK_TYPE_STREAM,
+                    flags: 0,
+                    port,
+                    target,
+                    requester_tag: tag,
+                },
             );
             if length == 0 {
                 refuse(state, record.request, record.trace, Cause::Malformed);
@@ -590,11 +596,11 @@ fn serve(state: &mut State, sys: &SyscallTable, record: &CallRecord) {
                 return;
             };
             let id = connection.id;
-            if rest.len() > proto::MAX_CMD_DATA - proto::CONN_ID_LEN {
+            if rest.is_empty() || rest.len() > proto::data_capacity(COMMAND_RECORD) {
                 refuse(state, record.request, record.trace, Cause::Malformed);
                 return;
             }
-            let mut payload = [0u8; proto::MAX_CMD_DATA];
+            let mut payload = [0u8; COMMAND_RECORD - proto::FRAME_HDR];
             payload[0..2].copy_from_slice(&id.to_le_bytes());
             let total = proto::CONN_ID_LEN + rest.len();
             if !copy_into(
@@ -641,9 +647,7 @@ fn serve(state: &mut State, sys: &SyscallTable, record: &CallRecord) {
                 return;
             };
             let id = connection.id;
-            let mut payload = [0u8; 2];
-            payload.copy_from_slice(&id.to_le_bytes());
-            command(state, proto::CMD_CLOSE, &payload);
+            command(state, proto::CMD_CLOSE, &proto::close(id, false));
             if let Some(connection) = state.connections.get_mut(slot) {
                 *connection = Connection::EMPTY;
             }
@@ -701,10 +705,10 @@ fn apply(state: &mut State, sys: &SyscallTable, kind: u8, payload: &[u8]) {
     let mine = unsafe { dev_requester_tag(sys) };
     match kind {
         proto::MSG_CONNECTED => {
-            if payload.len() < proto::CONN_ID_LEN {
+            let Some(connected) = proto::connected_parts(payload) else {
                 return;
-            }
-            let (_, tag) = proto::connected_parts(payload);
+            };
+            let tag = connected.requester_tag;
             if tag != proto::REQUESTER_TAG_NONE && tag != mine {
                 return;
             }
@@ -723,7 +727,7 @@ fn apply(state: &mut State, sys: &SyscallTable, kind: u8, payload: &[u8]) {
                 }
                 index += 1;
             };
-            let id = proto::conn_id(payload);
+            let id = connected.conn_id;
             let Some(slot) = state.connections.iter().position(|held| !held.live) else {
                 return;
             };
@@ -803,10 +807,9 @@ fn apply(state: &mut State, sys: &SyscallTable, kind: u8, payload: &[u8]) {
             }
         }
         proto::MSG_ERROR => {
-            if payload.len() < proto::CONN_ID_LEN + 1 {
+            let Some((_, _, tag)) = proto::error_parts(payload) else {
                 return;
-            }
-            let (_, _, tag) = proto::error_parts(payload);
+            };
             if tag != proto::REQUESTER_TAG_NONE && tag != mine {
                 return;
             }

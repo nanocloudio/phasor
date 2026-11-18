@@ -49,6 +49,9 @@ use binding::{
 const PATH_BYTES: usize = 224;
 /// Bytes one call or completion may carry.
 const PAYLOAD_BYTES: usize = 16 * 1024;
+/// Bytes one `fs` `READ` or `WRITE` moves: the contract's `arg` ceiling for
+/// both, so a larger transfer is several calls.
+const IO_BYTES: usize = 1024;
 /// Completions staged for the reply port, each with its payload behind it.
 const STAGE_BYTES: usize = 2 * (COMPLETION_FRAME + PAYLOAD_BYTES);
 /// Files this adapter may hold open at once.
@@ -348,7 +351,16 @@ unsafe fn provider_open(
     };
     // SAFETY: the path buffer is live for `length` bytes and the table is the
     // loader's own; the provider reads the name and opens it or refuses.
-    unsafe { (syscalls.provider_call)(-1, opcode, path.as_mut_ptr(), length) }
+    unsafe {
+        (syscalls.provider_call)(
+            -1,
+            opcode,
+            path.as_mut_ptr(),
+            length,
+            core::ptr::null_mut(),
+            0,
+        )
+    }
 }
 
 /// Answer one call, staging any bytes it answers with into `out`.
@@ -530,14 +542,15 @@ fn close_and_refuse(
 }
 
 fn close(syscalls: &SyscallTable, descriptor: i32) {
-    let mut nothing = [0u8; 1];
     // SAFETY: the descriptor is one the provider issued, and the table is the
     // loader's own.
     unsafe {
         (syscalls.provider_call)(
             descriptor,
             abi::contracts::storage::fs::CLOSE,
-            nothing.as_mut_ptr(),
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
             0,
         );
     }
@@ -554,26 +567,44 @@ fn read_chunk(
     if capacity == 0 {
         return Read::Took(0);
     }
-    // SAFETY: `out` is writable for `capacity` bytes and the descriptor is
-    // one the provider issued.
-    let read = unsafe {
-        (syscalls.provider_call)(
-            descriptor,
-            abi::contracts::storage::fs::READ,
-            out.as_mut_ptr(),
-            capacity,
-        )
-    };
-    if read == EAGAIN {
-        return Read::NotYet;
+    let mut taken = 0;
+    while taken < capacity {
+        let Some(piece) = out.get_mut(taken..capacity.min(taken + IO_BYTES)) else {
+            return Read::Failed;
+        };
+        let asked = piece.len();
+        // SAFETY: `piece` is writable for its length and the descriptor is
+        // one the provider issued.
+        let read = unsafe {
+            (syscalls.provider_call)(
+                descriptor,
+                abi::contracts::storage::fs::READ,
+                core::ptr::null_mut(),
+                0,
+                piece.as_mut_ptr(),
+                asked,
+            )
+        };
+        // What has come stands; "not yet" is only an answer when nothing has.
+        if read == EAGAIN {
+            return if taken == 0 {
+                Read::NotYet
+            } else {
+                Read::Took(taken)
+            };
+        }
+        let Ok(n) = usize::try_from(read) else {
+            return Read::Failed;
+        };
+        if n > asked {
+            return Read::Failed;
+        }
+        taken += n;
+        if n < asked {
+            break;
+        }
     }
-    if read < 0 {
-        return Read::Failed;
-    }
-    match usize::try_from(read) {
-        Ok(n) => Read::Took(n),
-        Err(_) => Read::Failed,
-    }
+    Read::Took(taken)
 }
 
 /// The whole-file operation a binding names, run against a descriptor the
@@ -627,62 +658,79 @@ fn write_all(syscalls: &SyscallTable, descriptor: i32, bytes: &[u8]) -> Done {
         buffer.get_mut(..length).unwrap_or(&mut []),
         bytes.get(..length).unwrap_or(&[]),
     );
-    // SAFETY: the buffer is live for `length` bytes and the descriptor is one
-    // the provider issued.
-    let written = unsafe {
-        (syscalls.provider_call)(
-            descriptor,
-            abi::contracts::storage::fs::WRITE,
-            buffer.as_mut_ptr(),
-            length,
-        )
-    };
-    if written == EAGAIN {
-        return Done::NotYet;
-    }
-    if written < 0 {
-        return Done::Failed;
+    let mut written = 0;
+    while written < length {
+        let Some(piece) = buffer.get_mut(written..length.min(written + IO_BYTES)) else {
+            return Done::Failed;
+        };
+        let asked = piece.len();
+        // SAFETY: `piece` is live for its length and the descriptor is one
+        // the provider issued.
+        let rc = unsafe {
+            (syscalls.provider_call)(
+                descriptor,
+                abi::contracts::storage::fs::WRITE,
+                core::ptr::null_mut(),
+                0,
+                piece.as_mut_ptr(),
+                asked,
+            )
+        };
+        // What went stands; "not yet" is only an answer when nothing has.
+        if rc == EAGAIN {
+            if written == 0 {
+                return Done::NotYet;
+            }
+            break;
+        }
+        let Ok(n) = usize::try_from(rc) else {
+            return Done::Failed;
+        };
+        if n == 0 || n > asked {
+            break;
+        }
+        written += n;
     }
     // The bytes are volatile until a fence, which is what the contract says:
     // a program that needs them durable asks for it.
-    let mut nothing = [0u8; 1];
     // SAFETY: as above; the fence takes no argument.
     unsafe {
         (syscalls.provider_call)(
             descriptor,
             abi::contracts::storage::fs::FSYNC,
-            nothing.as_mut_ptr(),
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
             0,
         );
     }
-    Done::Answered(Answer::Number(f64::from(written)), 0)
+    Done::Answered(Answer::Number(written as f64), 0)
 }
 
 fn size_of(syscalls: &SyscallTable, descriptor: i32) -> Done {
-    let mut stat = [0u8; 16];
-    // SAFETY: the buffer is writable for its length and the descriptor is one
-    // the provider issued; the contract selects the shape by width.
-    let written = unsafe {
+    let mut stat = [0u8; abi::contracts::storage::fs::stat::LEN];
+    // SAFETY: the record is writable for its length and the descriptor is one
+    // the provider issued.
+    let rc = unsafe {
         (syscalls.provider_call)(
             descriptor,
             abi::contracts::storage::fs::STAT,
             stat.as_mut_ptr(),
             stat.len(),
+            core::ptr::null_mut(),
+            0,
         )
     };
-    if written == EAGAIN {
+    if rc == EAGAIN {
         return Done::NotYet;
     }
-    if written < 8 {
+    if rc != 0 {
         return Done::Failed;
     }
-    let Some(head) = stat.get(..8) else {
-        return Done::Failed;
-    };
-    let Ok(bytes) = <[u8; 8]>::try_from(head) else {
-        return Done::Failed;
-    };
-    Done::Answered(Answer::Number(u64::from_le_bytes(bytes) as f64), 0)
+    match abi::contracts::storage::fs::Stat::decode(&stat) {
+        Some(answer) => Done::Answered(Answer::Number(answer.size as f64), 0),
+        None => Done::Failed,
+    }
 }
 
 entry! {

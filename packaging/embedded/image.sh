@@ -30,7 +30,7 @@ trap 'rm -rf "$work"' EXIT
 cat "$@" > "$work/source.js"
 
 compile() {
-    "$RUNTIME" --config "$GRAPH/config.bin" --modules "$GRAPH/modules.bin" \
+    "$RUNTIME" --image "$GRAPH/node.img" \
         < "$work/source.js" > "$1" 2> "$work/log"
 }
 # A compile that fails says why, rather than ending the script on `set -e`.

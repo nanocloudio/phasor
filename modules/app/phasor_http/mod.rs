@@ -79,9 +79,10 @@ mod wire;
 // could not disagree with one written there -- because neither end writes
 // one.
 use abi::contracts::exchange::{
-    self, flag, header_lines, link, parse_response, write_abort, write_credit, write_request_head,
-    ExchangeId, Record, RequestHead, HDR, RECORD_MAX,
+    abort, flag, link, meta_fields, op, outcome, parse_response, write_abort, write_credit,
+    write_request_head, ExchangeId, MetaWriter, Record, RequestHead, HDR, RECORD_MAX,
 };
+use abi::contracts::exchange_http::{self as http, header_lines, meta_from_header_lines, Http};
 // The authority a request names is parsed by the stream contract's own
 // reader, so what this module admits is exactly what a provider can dial:
 // a name, a dotted quad, or a bracketed v6 literal, with a port or without.
@@ -143,10 +144,10 @@ struct Response {
     /// Whether the provider gave the exchange up after its head: what has
     /// arrived is all there will be, and it is not the whole body.
     aborted: bool,
-    /// The status the provider raised itself, in place of an answer: no
+    /// The outcome the provider raised itself, in place of an answer: no
     /// peer answered, so there is no response to read, only a failure to
     /// report. Zero when the provider raised nothing.
-    raised: u16,
+    raised: u8,
 }
 
 impl Response {
@@ -379,12 +380,14 @@ fn granted(list: &[u8], authority: &[u8]) -> bool {
     })
 }
 
-/// The verb code a method name asks for, or none for a word that is not one.
-/// The table is the contract's; only the shape of the answer is this
-/// adapter's, which wants absence rather than a sentinel.
+/// The verb code a method name asks for, or none for a word that is not one
+/// or that opens a session rather than asking for an answer. The table is the
+/// binding's; only the shape of the answer is this adapter's, which wants
+/// absence rather than a sentinel.
 fn verb_of(name: &[u8]) -> Option<u8> {
-    match exchange::method_from_token(name) {
-        exchange::METHOD_NONE => None,
+    match http::method_from_token(name) {
+        0 => None,
+        verb if http::method::opens(verb) => None,
         verb => Some(verb),
     }
 }
@@ -752,17 +755,20 @@ fn serve(state: &mut State, record: &CallRecord) {
             }
             _ => authority,
         };
-        // `host: <authority>\r\n`, then the program's own block.
-        let mut block = [0u8; PAYLOAD_BYTES + AUTHORITY_MAX + 16];
-        let mut filled = 0usize;
-        for part in [&b"host: "[..], authority, b"\r\n", headers] {
-            let end = filled + part.len();
-            if !copy_into(block.get_mut(filled..end).unwrap_or(&mut []), part) {
-                refuse(state, record.request, record.trace, Cause::Malformed);
-                return;
-            }
-            filled = end;
-        }
+        // The `host` field, then the program's own block as fields.
+        let mut meta = [0u8; PAYLOAD_BYTES + AUTHORITY_MAX + 16];
+        let mut writer = MetaWriter::new(&mut meta);
+        writer.put(b"host", authority);
+        let Some(host) = writer.finish() else {
+            refuse(state, record.request, record.trace, Cause::Malformed);
+            return;
+        };
+        let Some(fields) = meta_from_header_lines(headers, meta.get_mut(host..).unwrap_or(&mut []))
+        else {
+            refuse(state, record.request, record.trace, Cause::Malformed);
+            return;
+        };
+        let filled = host + fields;
         state.corr = state.corr.wrapping_add(1).max(1);
         // The whole request goes in one HEAD, body inline: a call carries no
         // more than a record holds, so there is never request body to wait
@@ -770,14 +776,15 @@ fn serve(state: &mut State, record: &CallRecord) {
         let head = RequestHead {
             id: ExchangeId::from_u64(state.corr),
             flags: 0,
-            method: verb,
+            op: op::CALL,
+            verb,
             target: path,
-            headers: block.get(..filled).unwrap_or(&[]),
+            meta: meta.get(..filled).unwrap_or(&[]),
             peer: &[],
             resp_credit: BODY_BYTES as u32,
             body,
         };
-        let Some(length) = write_request_head(&head, &mut state.outbound) else {
+        let Some(length) = write_request_head::<Http>(&head, &mut state.outbound) else {
             refuse(state, record.request, record.trace, Cause::Malformed);
             return;
         };
@@ -847,17 +854,17 @@ fn serve(state: &mut State, record: &CallRecord) {
 }
 
 /// Why the response in flight will not be answered, as a program is told it.
-/// A status the provider raised keeps its meaning across the binding: a
+/// An outcome the provider raised keeps its meaning across the binding: a
 /// request it would not perform is malformed, a provider at capacity is busy,
 /// an origin that did not answer in time timed out. Anything else — an origin
 /// that could not be reached, a link that went, a body cut short — is a
 /// provider with no answer to give.
 fn failure(state: &State) -> Cause {
     match state.response.raised {
-        exchange::status::BAD_REQUEST | exchange::status::TOO_LARGE => Cause::Malformed,
-        exchange::status::BUSY => Cause::Busy,
-        exchange::status::TIMEOUT => Cause::Timeout,
-        exchange::status::FAILED => Cause::Internal,
+        outcome::REFUSED | outcome::TOO_LARGE => Cause::Malformed,
+        outcome::BUSY => Cause::Busy,
+        outcome::TIMEOUT => Cause::Timeout,
+        outcome::FAILED => Cause::Internal,
         _ => Cause::Unavailable,
     }
 }
@@ -903,41 +910,35 @@ fn take_body(state: &mut State, bytes: &[u8], more: bool) {
 }
 
 /// Take the head of the response: its status, its fields, and the first of
-/// its body.
-fn apply_head(state: &mut State, status: u16, content_type: &[u8], headers: &[u8]) {
+/// its body. A program reads one `name: value` block, so the fields go back
+/// into one, as many whole lines as the block holds; the binding's own `:`
+/// fields, and any whose value would end its line, never leave as a line.
+fn apply_head(state: &mut State, status: u16, meta: &[u8]) {
     state.response.status = u32::from(status);
-    // The provider carries the content type beside the block rather than in
-    // it; a program reads one block, so it goes back in as the first field.
     let mut kept = 0usize;
-    if !content_type.is_empty() {
-        for part in [&b"content-type: "[..], content_type, b"\r\n"] {
-            let end = kept + part.len();
-            if !copy_into(
-                state.response.headers.get_mut(kept..end).unwrap_or(&mut []),
-                part,
-            ) {
-                break;
-            }
-            kept = end;
+    for (key, value) in meta_fields(meta) {
+        if key.first() == Some(&b':') || value.iter().any(|&c| c == b'\r' || c == b'\n') {
+            continue;
         }
+        let end = kept + key.len() + 2 + value.len() + 2;
+        let Some(line) = state.response.headers.get_mut(kept..end) else {
+            break;
+        };
+        let mut at = 0usize;
+        for part in [key, &b": "[..], value, b"\r\n"] {
+            copy_into(line.get_mut(at..at + part.len()).unwrap_or(&mut []), part);
+            at += part.len();
+        }
+        kept = end;
     }
-    let rest = headers.len().min(HEAD_BYTES - kept);
-    copy_into(
-        state
-            .response
-            .headers
-            .get_mut(kept..kept + rest)
-            .unwrap_or(&mut []),
-        headers.get(..rest).unwrap_or(&[]),
-    );
-    state.response.headers_length = kept + rest;
+    state.response.headers_length = kept;
     state.response.head = true;
 }
 
 /// Take one response record. A record for any exchange but the one in
 /// flight is a closed exchange's tail, and is dropped.
 fn apply_record(state: &mut State, record: &[u8]) {
-    let Some(parsed) = parse_response(record) else {
+    let Ok(parsed) = parse_response::<Http>(record) else {
         return;
     };
     if !state.response.live || state.response.complete || state.response.aborted {
@@ -952,7 +953,7 @@ fn apply_record(state: &mut State, record: &[u8]) {
             // provider gives in a body is its own and is not read; one still
             // to come is declined, so the exchange does not wait on credit.
             give_up(state);
-            state.response.raised = head.status;
+            state.response.raised = head.outcome;
             if head.flags & flag::MORE != 0 {
                 state.abort_owed = true;
                 state.abort_id = id;
@@ -960,7 +961,7 @@ fn apply_record(state: &mut State, record: &[u8]) {
             }
         }
         Record::Head(head) if head.id == id && !state.response.head => {
-            apply_head(state, head.status, head.content_type, head.headers);
+            apply_head(state, http::status_of(&head), head.meta);
             take_body(state, head.body, head.flags & flag::MORE != 0);
         }
         Record::Body {
@@ -1061,11 +1062,9 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         {
             if state.abort_owed {
                 state.abort_owed = false;
-                if let Some(length) = write_abort(
-                    &state.abort_id,
-                    exchange::abort::UNDELIVERABLE,
-                    &mut state.control,
-                ) {
+                if let Some(length) =
+                    write_abort(&state.abort_id, abort::UNDELIVERABLE, &mut state.control)
+                {
                     state.control_port = state.abort_port;
                     state
                         .control_box

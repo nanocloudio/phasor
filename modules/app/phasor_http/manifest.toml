@@ -56,6 +56,9 @@ direction    = "output"
 content_type = "ExchangeRequest"
 buffer_size  = 16384
 max_record   = 8192
+# The requests are HTTP: methods for verbs, header fields for meta.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name         = "plain_out"
@@ -64,6 +67,9 @@ direction    = "output"
 content_type = "ExchangeRequest"
 buffer_size  = 16384
 max_record   = 8192
+# The requests are HTTP: methods for verbs, header fields for meta.
+[ports.facts]
+binding = ["http"]
 
 [observability]
 exempt = "adapter whose evidence is the completions it emits"
