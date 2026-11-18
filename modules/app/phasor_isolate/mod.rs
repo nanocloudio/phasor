@@ -2045,7 +2045,14 @@ fn load_program(state: &mut State, syscalls: &SyscallTable) -> Program {
             let mut info = [0u8; section::INFO_LEN];
             // SAFETY: `info` is valid for `INFO_LEN` bytes; slot 0 is asked.
             let answered = unsafe {
-                (syscalls.provider_call)(-1, PROGRAM_INFO, info.as_mut_ptr(), info.len())
+                (syscalls.provider_call)(
+                    -1,
+                    PROGRAM_INFO,
+                    info.as_mut_ptr(),
+                    info.len(),
+                    core::ptr::null_mut(),
+                    0,
+                )
             };
             if answered < 0 {
                 state.program_phase = PROGRAM_ABSENT;
@@ -2054,9 +2061,11 @@ fn load_program(state: &mut State, syscalls: &SyscallTable) -> Program {
             let word = |at: usize| {
                 u32::from_le_bytes([info[at], info[at + 1], info[at + 2], info[at + 3]])
             };
-            let address = u64::from(word(0)) | (u64::from(word(4)) << 32);
-            let size = word(8);
-            let kind = word(12);
+            let address = u64::from(word(section::info::ADDR))
+                | (u64::from(word(section::info::ADDR + 4)) << 32);
+            let readable = word(section::info::LEN);
+            let size = word(section::info::SIZE);
+            let kind = word(section::info::KIND);
             if kind != 0 && kind != PROGRAM_KIND {
                 state.program_phase = PROGRAM_ABSENT;
                 return Program::Refused(
@@ -2064,7 +2073,7 @@ fn load_program(state: &mut State, syscalls: &SyscallTable) -> Program {
                         .with(diagnostic::image::MAGIC),
                 );
             }
-            let format = &info[32..64];
+            let format = &info[section::info::FORMAT..section::info::FORMAT + 32];
             if format.iter().any(|byte| *byte != 0) && format != &bytecode::format_digest().0[..] {
                 state.program_phase = PROGRAM_ABSENT;
                 return Program::Refused(
@@ -2075,7 +2084,7 @@ fn load_program(state: &mut State, syscalls: &SyscallTable) -> Program {
             state.program_size = size;
             state.image_length = 0;
             if let Ok(address) = usize::try_from(address) {
-                if address != 0 {
+                if address != 0 && readable >= size {
                     state.program_addr = address;
                     state.program_phase = PROGRAM_LOADED;
                     return Program::Loaded;
@@ -2093,18 +2102,21 @@ fn load_program(state: &mut State, syscalls: &SyscallTable) -> Program {
     let at = state.image_length;
     if at < size {
         let want = core::cmp::min(PROGRAM_CHUNK, IMAGE_CAPACITY - at);
-        // The request rides at the head of the buffer it is answered in.
-        let mut small = [0u8; 8];
-        let (buffer, length): (*mut u8, usize) = match state.image.get_mut(at..at + want) {
-            Some(room) if room.len() >= 8 => (room.as_mut_ptr(), room.len()),
-            _ => (small.as_mut_ptr(), small.len()),
-        };
-        let offset = (at as u32).to_le_bytes();
-        // SAFETY: `buffer` is valid for `length` (at least 8) bytes.
+        // `[slot u8][0; 3][offset u32 LE]`: slot 0, from where the copy is.
+        let mut request = [0u8; 8];
+        request[4..].copy_from_slice(&(at as u32).to_le_bytes());
+        let room = state.image.get_mut(at..at + want).unwrap_or(&mut []);
+        // SAFETY: `request` is live for its length and `room` is writable for
+        // its own.
         let got = unsafe {
-            core::ptr::write_bytes(buffer, 0, 4);
-            core::ptr::copy_nonoverlapping(offset.as_ptr(), buffer.add(4), 4);
-            (syscalls.provider_call)(-1, PROGRAM_READ, buffer, length)
+            (syscalls.provider_call)(
+                -1,
+                PROGRAM_READ,
+                request.as_mut_ptr(),
+                request.len(),
+                room.as_mut_ptr(),
+                room.len(),
+            )
         };
         if got <= 0 {
             // Ended short of its size: what is staged is not the program.
@@ -2114,13 +2126,7 @@ fn load_program(state: &mut State, syscalls: &SyscallTable) -> Program {
                     .with(diagnostic::image::TRUNCATED),
             );
         }
-        let got = got as usize;
-        if buffer == small.as_mut_ptr() {
-            let tail = state.image.get_mut(at..at + got).filter(|_| got <= 8);
-            if !tail.is_some_and(|room| copy_into(room, &small[..got])) {
-                state.overflowed = true;
-            }
-        }
+        let got = (got as usize).min(want);
         state.image_length = at + got;
         return Program::Pending;
     }

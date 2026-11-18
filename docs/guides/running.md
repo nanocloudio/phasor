@@ -264,10 +264,8 @@ fluxor build /tmp/run.yaml
 
 RUNTIME=target/aarch64-unknown-linux-gnu/release/fluxor-linux
 printf '1 + 2 * 3' \
-  | "$RUNTIME" --config target/linux/compile/config.bin \
-               --modules target/linux/compile/modules.bin 2>/dev/null \
-  | "$RUNTIME" --config target/linux/run/config.bin \
-               --modules target/linux/run/modules.bin 2>/dev/null
+  | "$RUNTIME" --image target/linux/compile/graph.img 2>/dev/null \
+  | "$RUNTIME" --image target/linux/run/graph.img 2>/dev/null
 # 7
 ```
 

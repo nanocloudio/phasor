@@ -347,17 +347,8 @@ fn carry_image(state: &mut State, syscalls: &SyscallTable) -> bool {
     ) {
         return false;
     }
-    // SAFETY: the port is this module's own, and the command takes no
-    // argument.
-    let hung_up = unsafe {
-        dev_channel_ioctl(
-            syscalls,
-            state.record_out,
-            IOCTL_EOF,
-            core::ptr::null_mut(),
-            0,
-        )
-    };
+    // SAFETY: the port is this module's own.
+    let hung_up = unsafe { dev_channel_set_hup(syscalls, state.record_out) };
     state.record_done = hung_up >= 0;
     state.record_done
 }
@@ -463,17 +454,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         }
         // The stream is whole: the hang-up is what tells the compiler so, and
         // this module stays to read what comes back.
-        // SAFETY: the port is this module's own, and the command takes no
-        // argument.
-        let hung_up = unsafe {
-            dev_channel_ioctl(
-                syscalls,
-                state.source_out,
-                IOCTL_EOF,
-                core::ptr::null_mut(),
-                0,
-            )
-        };
+        // SAFETY: the port is this module's own.
+        let hung_up = unsafe { dev_channel_set_hup(syscalls, state.source_out) };
         if hung_up < 0 {
             return StepReturn::error(-3);
         }

@@ -81,9 +81,6 @@ const KEY_BYTES: usize = 128;
 /// the provider has its own — but the most one call or answer may carry
 /// across the seam in a single piece.
 const VALUE_BYTES: usize = 4096;
-/// The encoded durability fence a mutating call answers with. Nothing here
-/// reads it, but the contract requires somewhere to put it.
-const FENCE_BYTES: usize = 64;
 /// Bytes of payload one call or completion may carry.
 const PAYLOAD_BYTES: usize = VALUE_BYTES + KEY_BYTES + 2;
 /// Completions staged for the reply port, each with its payload behind it.
@@ -218,11 +215,6 @@ struct State {
     /// Set when the call just taken was held rather than answered, so the
     /// step knows to stage nothing for it.
     deferred: bool,
-    /// Where a `write` or `delete` has the provider put its fence. Here and
-    /// not on the stack: a write the provider has not decided is asked again
-    /// with the same bytes, which name this buffer by address, and the
-    /// provider writes the fence on whichever ask decides it.
-    fence: [u8; FENCE_BYTES],
     phase: u8,
     /// The scope this adapter presents its capability for: a key prefix
     /// ending `/`, which the namespace must lie inside. Empty for a store
@@ -339,22 +331,6 @@ fn put_u16(buf: &mut [u8], at: usize, value: u16) -> usize {
     at + 2
 }
 
-fn put_u32(buf: &mut [u8], at: usize, value: u32) -> usize {
-    copy_into(
-        buf.get_mut(at..at + 4).unwrap_or(&mut []),
-        &value.to_le_bytes(),
-    );
-    at + 4
-}
-
-fn put_u64(buf: &mut [u8], at: usize, value: u64) -> usize {
-    copy_into(
-        buf.get_mut(at..at + 8).unwrap_or(&mut []),
-        &value.to_le_bytes(),
-    );
-    at + 8
-}
-
 /// The key a program named, under the namespace the graph gave this adapter.
 ///
 /// A program's keys are its own, and the prefix is what keeps them so: two
@@ -378,9 +354,22 @@ fn object_open(state: &State, syscalls: &SyscallTable, key: &[u8]) -> i32 {
     let Some(length) = qualify(state, key, &mut name) else {
         return -1;
     };
-    // SAFETY: `name` is live for `length` bytes and the table is the loader's
+    let mut arg = [0u8; obj::key::ARG_MAX];
+    let Some(at) = obj::key::encode(&mut arg, name.get(..length).unwrap_or(&[])) else {
+        return -1;
+    };
+    // SAFETY: `arg` is live for `at` bytes and the table is the loader's
     // own; the provider reads the key and opens it or refuses.
-    unsafe { (syscalls.provider_call)(state.handle(), obj::GET, name.as_mut_ptr(), length) }
+    unsafe {
+        (syscalls.provider_call)(
+            state.handle(),
+            obj::GET,
+            arg.as_mut_ptr(),
+            at,
+            core::ptr::null_mut(),
+            0,
+        )
+    }
 }
 
 /// Present this adapter's capability for its scope, answering whether calls
@@ -417,11 +406,11 @@ fn stand(state: &mut State, syscalls: &SyscallTable) -> bool {
     } else {
         None
     };
-    let mut arg = [0u8; 1 + 2 + SCOPE_BYTES + 2 + CHAIN_BYTES];
-    let length = decoded.and_then(|length| {
-        obj::grant::encode_present(&mut arg, scope, chain.get(..length).unwrap_or(&[]))
+    let mut arg = [0u8; obj::grant::PRESENT_ARG_MAX];
+    let presented = decoded.and_then(|chain_length| {
+        obj::grant::encode_present(&mut arg, scope).map(|length| (length, chain_length))
     });
-    let Some(length) = length else {
+    let Some((length, chain_length)) = presented else {
         state.standing = STANDING_REFUSED;
         say(
             syscalls,
@@ -434,9 +423,18 @@ fn stand(state: &mut State, syscalls: &SyscallTable) -> bool {
         );
         return true;
     };
-    // SAFETY: `arg` is live for `length` bytes and carries no pointer; the
-    // table is the loader's own.
-    let rc = unsafe { (syscalls.provider_call)(-1, obj::PRESENT, arg.as_mut_ptr(), length) };
+    // SAFETY: `arg` is live for `length` bytes and the chain for
+    // `chain_length`; the table is the loader's own.
+    let rc = unsafe {
+        (syscalls.provider_call)(
+            -1,
+            obj::PRESENT,
+            arg.as_mut_ptr(),
+            length,
+            chain.as_mut_ptr(),
+            chain_length.min(chain.len()),
+        )
+    };
     if rc == EAGAIN || rc == EINPROGRESS {
         state.standing = STANDING_PRESENTING;
         return false;
@@ -475,21 +473,33 @@ fn say(syscalls: &SyscallTable, text: &[u8], detail: Option<(i32, u8)>) {
 
 /// Read through an open descriptor from `offset`, answering how much came.
 fn object_range(syscalls: &SyscallTable, descriptor: i32, offset: u64, out: &mut [u8]) -> i32 {
-    let mut arg = [0u8; 20];
-    let at = put_u64(&mut arg, 0, offset);
-    let at = put_u32(&mut arg, at, u32::try_from(out.len()).unwrap_or(0));
-    let _ = put_u64(&mut arg, at, out.as_mut_ptr() as u64);
+    let mut arg = obj::range_get::encode(offset);
     // SAFETY: `out` is writable for its own length, the descriptor is one the
     // provider issued, and `arg` is live for the call.
-    unsafe { (syscalls.provider_call)(descriptor, obj::RANGE_GET, arg.as_mut_ptr(), 20) }
+    unsafe {
+        (syscalls.provider_call)(
+            descriptor,
+            obj::RANGE_GET,
+            arg.as_mut_ptr(),
+            arg.len(),
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    }
 }
 
 /// Release a descriptor the provider issued.
 fn object_close(syscalls: &SyscallTable, descriptor: i32) {
-    let mut nothing = [0u8; 1];
     // SAFETY: the descriptor is one the provider issued.
     unsafe {
-        (syscalls.provider_call)(descriptor, obj::CLOSE, nothing.as_mut_ptr(), 0);
+        (syscalls.provider_call)(
+            descriptor,
+            obj::CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -856,50 +866,32 @@ fn answer(
             let Some(length) = qualify(state, key, &mut name) else {
                 return refuse(record, Cause::Malformed);
             };
-            // The value the provider reads is the one in the staged payload,
-            // not this step's copy of it: a write the provider has not
-            // decided is asked again with the same bytes, so the address
-            // they name has to outlive the step, and the payload stays
-            // staged until the call is answered.
-            let mut staged_parts: [&[u8]; 2] = [&[], &[]];
-            let staged = state.payload.get(..state.payload_length).unwrap_or(&[]);
-            let (_, staged_value) = key_of(staged, &mut staged_parts);
-            if staged_value.len() != value.len() {
-                return refuse(record, Cause::Internal);
-            }
-            let body = staged_value.as_ptr() as u64;
-            let mut arg = [0u8; KEY_BYTES * 2 + 32 + obj::KEPT_FIXED_LEN];
-            let at = put_u16(&mut arg, 0, u16::try_from(length).unwrap_or(0));
-            if !copy_into(
-                arg.get_mut(at..at + length).unwrap_or(&mut []),
-                name.get(..length).unwrap_or(&[]),
-            ) {
-                return refuse(record, Cause::Internal);
-            }
-            let mut at = at + length;
+            let mut arg = [0u8; obj::put::arg_len(KEY_BYTES * 2, 0, 0, 0)];
             // No content type: bytes under a key are bytes, and a store that
             // wanted a MIME tag would be describing something this capability
-            // does not promise.
-            arg[at] = 0;
-            at += 1;
-            let at = put_u64(&mut arg, at, body);
-            let at = put_u64(&mut arg, at, value.len() as u64);
-            arg[at] = obj::precondition::ANY;
-            arg[at + 1] = 0;
-            // Nothing kept: no key reference, no retention, no hold. A
-            // program's `write` asks for none of them, and a store refuses a
-            // PUT without the block.
-            let Some(kept) = obj::Kept::none().encode(arg.get_mut(at + 2..).unwrap_or(&mut []))
-            else {
+            // does not promise. Nothing kept: no key reference, no retention,
+            // no hold; a program's `write` asks for none of them.
+            let request = obj::put::Request {
+                key: name.get(..length).unwrap_or(&[]),
+                content_type: &[],
+                precondition: obj::precondition::ANY,
+                etag: &[],
+                kept: obj::Kept::none(),
+            };
+            let Some(at) = obj::put::encode(&mut arg, &request) else {
                 return refuse(record, Cause::Internal);
             };
-            let at = put_u64(&mut arg, at + 2 + kept, state.fence.as_mut_ptr() as u64);
-            let at = put_u16(&mut arg, at, FENCE_BYTES as u16);
-            // SAFETY: every pointer in `arg` names a buffer in the module's
-            // state, live until the write is decided, and the table is the
-            // loader's own.
+            // SAFETY: `arg` is live for `at` bytes and `value` is read for its
+            // own length during the call; the table is the loader's own.
             let rc = match write_answer(unsafe {
-                (syscalls.provider_call)(state.handle(), obj::PUT, arg.as_mut_ptr(), at)
+                (syscalls.provider_call)(
+                    state.handle(),
+                    obj::PUT,
+                    arg.as_mut_ptr(),
+                    at,
+                    value.as_ptr().cast_mut(),
+                    value.len(),
+                )
             }) {
                 // Taken, not yet decided. That is not a store that failed,
                 // and answering as though it were would tell a program its
@@ -930,23 +922,26 @@ fn answer(
             let Some(length) = qualify(state, key, &mut name) else {
                 return refuse(record, Cause::Malformed);
             };
-            let mut arg = [0u8; KEY_BYTES * 2 + 16];
-            let at = put_u16(&mut arg, 0, u16::try_from(length).unwrap_or(0));
-            if !copy_into(
-                arg.get_mut(at..at + length).unwrap_or(&mut []),
-                name.get(..length).unwrap_or(&[]),
-            ) {
+            let mut arg = [0u8; obj::delete::arg_len(KEY_BYTES * 2, 0)];
+            let request = obj::delete::Request {
+                key: name.get(..length).unwrap_or(&[]),
+                precondition: obj::precondition::ANY,
+                etag: &[],
+            };
+            let Some(at) = obj::delete::encode_request(&mut arg, &request) else {
                 return refuse(record, Cause::Internal);
-            }
-            let mut at = at + length;
-            arg[at] = obj::precondition::ANY;
-            arg[at + 1] = 0;
-            at += 2;
-            let at = put_u64(&mut arg, at, state.fence.as_mut_ptr() as u64);
-            let at = put_u16(&mut arg, at, FENCE_BYTES as u16);
-            // SAFETY: as for the write above.
+            };
+            // SAFETY: `arg` is live for `at` bytes; the table is the loader's
+            // own.
             let rc = match write_answer(unsafe {
-                (syscalls.provider_call)(state.handle(), obj::DELETE, arg.as_mut_ptr(), at)
+                (syscalls.provider_call)(
+                    state.handle(),
+                    obj::DELETE,
+                    arg.as_mut_ptr(),
+                    at,
+                    core::ptr::null_mut(),
+                    0,
+                )
             }) {
                 // Worse here than anywhere else: this member answers with
                 // whether the key went, so reading "not yet" as a number
@@ -983,35 +978,51 @@ fn answer(
             // begin with the prefix. So the one asks for this adapter's
             // namespace and the names are filtered here, and the other is
             // asked for the program's prefix and the namespace stripped.
-            // SAFETY: CAPS takes no argument and the table is the loader's.
-            let caps = unsafe { (syscalls.provider_call)(-1, ns::CAPS, core::ptr::null_mut(), 0) };
-            let directory = caps >= 0 && (caps as u32) & ns::caps::CHILD_NAMES != 0;
+            let mut caps = [0u8; abi::kernel_abi::caps_word::LEN];
+            // SAFETY: CAPS answers its word into `caps`, live for its length;
+            // the table is the loader's.
+            let rc = unsafe {
+                (syscalls.provider_call)(
+                    -1,
+                    ns::CAPS,
+                    caps.as_mut_ptr(),
+                    caps.len(),
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            let directory = rc == 0
+                && abi::kernel_abi::caps_word::parse(&caps)
+                    .is_some_and(|word| word & ns::caps::CHILD_NAMES != 0);
             let mut prefix = [0u8; KEY_BYTES * 2];
             let Some(plen) = qualify(state, if directory { &[][..] } else { asked }, &mut prefix)
             else {
                 return refuse(record, Cause::Malformed);
             };
             let mut page = [0u8; VALUE_BYTES];
-            let mut fence = [0u8; FENCE_BYTES];
-            let mut arg = [0u8; KEY_BYTES * 2 + 32];
-            let at = put_u16(&mut arg, 0, u16::try_from(plen).unwrap_or(0));
-            if !copy_into(
-                arg.get_mut(at..at + plen).unwrap_or(&mut []),
-                prefix.get(..plen).unwrap_or(&[]),
-            ) {
-                return refuse(record, Cause::Internal);
-            }
-            let at = at + plen;
+            let mut arg = [0u8; ns::list::arg_len(KEY_BYTES * 2, 0)];
             // First page only. A listing longer than one answer is a cursor
             // this capability does not yet carry, and stopping at a page
             // boundary is visible; guessing past it would not be.
-            let at = put_u16(&mut arg, at, 0);
-            let at = put_u64(&mut arg, at, page.as_mut_ptr() as u64);
-            let at = put_u32(&mut arg, at, VALUE_BYTES as u32);
-            let at = put_u64(&mut arg, at, fence.as_mut_ptr() as u64);
-            let at = put_u16(&mut arg, at, FENCE_BYTES as u16);
-            // SAFETY: as for the write above.
-            let written = unsafe { (syscalls.provider_call)(-1, ns::LIST, arg.as_mut_ptr(), at) };
+            let request = ns::list::Request {
+                prefix: prefix.get(..plen).unwrap_or(&[]),
+                cursor: &[],
+            };
+            let Some(at) = ns::list::encode_request(&mut arg, &request) else {
+                return refuse(record, Cause::Internal);
+            };
+            // SAFETY: `arg` is live for `at` bytes and `page` is writable for
+            // its length; the table is the loader's own.
+            let written = unsafe {
+                (syscalls.provider_call)(
+                    -1,
+                    ns::LIST,
+                    arg.as_mut_ptr(),
+                    at,
+                    page.as_mut_ptr(),
+                    page.len(),
+                )
+            };
             if written == EAGAIN {
                 return hold_from_payload(state, record);
             }
@@ -1059,26 +1070,29 @@ fn list_granted(
         return refuse(record, Cause::Malformed);
     };
     let mut page = [0u8; VALUE_BYTES];
-    let mut fence = [0u8; FENCE_BYTES];
-    let mut arg = [0u8; KEY_BYTES * 2 + 32];
+    let mut arg = [0u8; obj::list::arg_len(KEY_BYTES * 2, 0)];
     let request = obj::list::Request {
         prefix: prefix.get(..plen).unwrap_or(&[]),
         cursor: &[],
         // First page only, as the namespace listing is: a cursor is
         // something this capability does not yet carry.
         max_keys: 128,
-        out_ptr: page.as_mut_ptr() as u64,
-        out_cap: VALUE_BYTES as u32,
-        fence_out_ptr: fence.as_mut_ptr() as u64,
-        fence_out_cap: FENCE_BYTES as u16,
     };
     let Some(at) = obj::list::encode_request(&mut arg, &request) else {
         return refuse(record, Cause::Internal);
     };
-    // SAFETY: every pointer in `arg` names a buffer live for the call, and
-    // the table is the loader's own.
-    let written =
-        unsafe { (syscalls.provider_call)(state.handle(), obj::LIST, arg.as_mut_ptr(), at) };
+    // SAFETY: `arg` is live for `at` bytes and `page` is writable for its
+    // length; the table is the loader's own.
+    let written = unsafe {
+        (syscalls.provider_call)(
+            state.handle(),
+            obj::LIST,
+            arg.as_mut_ptr(),
+            at,
+            page.as_mut_ptr(),
+            page.len(),
+        )
+    };
     if written == EAGAIN {
         return hold_from_payload(state, record);
     }

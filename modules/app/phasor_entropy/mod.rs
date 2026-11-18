@@ -106,7 +106,14 @@ fn answer(state: &State, record: &CallRecord, syscalls: &SyscallTable) -> Comple
     // SAFETY: `bytes` is writable for `width` bytes, and the provider call is
     // the kernel's own, through the loader's table.
     let filled = unsafe {
-        (syscalls.provider_call)(-1, abi::kernel_abi::RANDOM_FILL, bytes.as_mut_ptr(), width)
+        (syscalls.provider_call)(
+            -1,
+            abi::kernel_abi::RANDOM_FILL,
+            core::ptr::null_mut(),
+            0,
+            bytes.as_mut_ptr(),
+            width,
+        )
     };
     // A platform answers either the count it filled or zero for success; a
     // negative answer is a source that could not produce anything.
