@@ -57,19 +57,21 @@ a promise. `store.open(key)` answers a handle the program passes back to
 `store.readAt`; one it invents is refused. The shell prints what it granted,
 and the graph is `packaging/applet/phasor/linux.yaml`.
 
-The store is the deployment's, not the program's. It is served by whatever is
-wired behind Fluxor's `storage.object` contract, which on Linux is the local
-versioned store and opens the directory `FLUXOR_STORE_DIR` names:
+The store is the deployment's, not the program's. The applet's graph
+composes Fluxor's `store` over a directory of the operator's own,
+`${applet:data_dir}/store`, which `fluxor exec` resolves for whoever runs it:
+`$XDG_DATA_HOME/phasor/store` when `XDG_DATA_HOME` is an absolute path, else
+`~/.local/share/phasor/store`, made readable by its owner alone on first use.
+The resolved path must fit in the 96 bytes `store` takes for its `dir`. What
+one run writes the next one reads:
 
 ```sh
-export FLUXOR_STORE_DIR=~/.local/share/phasor
 phasor --grant store -e 'store.write("k", "kept")'
 phasor --grant store -e 'store.read("k")'          # -> kept, a run later
 ```
 
-With none configured a write is refused rather than kept somewhere it would
-not survive, which is the honest answer: the adapter holds nothing itself, so
-there is no second place the bytes could have gone.
+The adapter holds nothing itself; the bytes are the store's, so there is no
+second place they could have gone.
 
 Files come from `--grant fs`, and reach only the directory the graph runs in:
 

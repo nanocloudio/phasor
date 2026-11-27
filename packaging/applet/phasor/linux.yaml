@@ -35,6 +35,16 @@ include:
       authority: "localhost:8080"
 
 modules:
+  # The operator's store: a durable log under the applet's own data
+  # directory, which `fluxor exec` resolves per operator, so what one run
+  # writes the next one reads.
+  - name: store
+    dir: "${applet:data_dir}/store"
+  # The key vault: the TLS leg imports the operator's key, which `fluxor
+  # exec` hands it, into it at start. Nothing in it outlives the run, so it
+  # seals nothing.
+  - name: key_vault
+    seal: none
   - name: phasor_shell
   - name: phasor_time
     params:
@@ -45,8 +55,7 @@ modules:
   - name: phasor_surface
   - name: phasor_store
     params:
-      # Where this program's keys live inside whatever store the deployment
-      # wired. A program names keys under it and cannot reach outside it.
+      # Where this program's keys live inside the store above. A program names keys under it and cannot reach outside it.
       namespace: "phasor/"
   # The filesystem the shell can reach is the directory the graph runs in,
   # and nothing above it. Reading is granted; writing is not, until a
